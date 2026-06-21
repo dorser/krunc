@@ -1,13 +1,26 @@
 =================================================================
- krunc v2 - all-Rust pipeline + kernel-applied confinement.
- The kernel, atomically before exec, sets up namespaces, chroot,
- a private /proc+/sys, drops capabilities to the OCI bounding set
- and sets no_new_privs. DEMO 1 = unconfined (text iface), DEMO 3 =
- confined OCI container. Reproduce: scripts/run-test.sh
+ krunc - all-Rust pipeline + kernel-applied confinement (QEMU/KVM).
+ The kernel, atomically before the container's first userspace
+ instruction, sets up namespaces + chroot + a private /proc+/sys,
+ masks/over-mounts sensitive paths, remounts paths read-only, drops
+ capabilities to the OCI bounding set, sets no_new_privs, and installs
+ the compiled seccomp policy. Userspace (the all-Rust krunc CLI) also
+ places the container in a cgroup v2 with pids.max. Every control below
+ is verified from OUTSIDE the container (host view).
+
+ DEMO 1 = unconfined container via the text interface.
+ DEMO 2 = launch + kill.
+ DEMO 3 = OCI lifecycle via the Rust CLI with the full confinement stack:
+          caps + no_new_privs + seccomp (Seccomp: 2) + masked/readonly
+          paths + cgroup pids (kernel denies forks past pids.max).
+ DEMO 4 = unload the runtime module cleanly.
+
+ Reproduce: scripts/run-test.sh   (builds kernel+module+CLI, runs QEMU)
 =================================================================
+
 ================ DEMO 1: launch an isolated container ================
 [vm] echo "run rootfs=/containers/demo host=krunc-demo exec=/bin/sh arg=/init.sh" > /dev/krunc
-[    2.879089] krunc: started container id=1 pid=84
+[    2.874583] krunc: started container id=1 pid=84
 ==================================================================
 [container] Hello from inside a krunc container!
 [container] hostname (UTS namespace) : krunc-demo
@@ -29,6 +42,7 @@ tmp
 1: lo: <LOOPBACK> mtu 65536 qdisc noop qlen 1000\    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00
 2: sit0@NONE: <NOARP> mtu 1480 qdisc noop qlen 1000\    link/sit 0.0.0.0 brd 0.0.0.0
 [container] sleeping briefly so the host can inspect our namespaces...
+[    3.892891] cat (94) used greatest stack depth: 13152 bytes left
 [vm] container started with host-visible pid: 84
 [vm] --- namespace isolation (host view of pid 84) ---
 [vm]   pid: ISOLATED  (host pid:[4026531836] vs container pid:[4026532167])
@@ -38,16 +52,18 @@ tmp
 [vm]   net: ISOLATED  (host net:[4026531833] vs container net:[4026532168])
 [container] goodbye (PID 1 exiting -> namespaces tear down)
 ==================================================================
+[    5.991718] sh (84) used greatest stack depth: 12616 bytes left
 
 ============ DEMO 2: launch + kill a long-running container ============
 [vm] echo "run rootfs=/containers/demo host=sleeper exec=/bin/busybox arg=sleep arg=600" > /dev/krunc
-[    6.001856] krunc: started container id=2 pid=106
+[    5.998628] krunc: started container id=2 pid=106
 [vm] container table:
 [vm]   ID    PID      STATE    HOSTNAME
 [vm]   1     84       exited   krunc-demo
 [vm]   2     106      running  sleeper
 [vm] stopping sleeper (pid 106): echo "kill 106" > /dev/krunc
-[    7.019988] krunc: killed container pid 106
+[    7.017321] krunc: killed container pid 106
+[    7.018504] busybox (106) used greatest stack depth: 12584 bytes left
 [vm] container table after kill:
 [vm]   ID    PID      STATE    HOSTNAME
 [vm]   1     84       exited   krunc-demo
@@ -58,13 +74,14 @@ tmp
 [vm]   commit: krunc-poc
 [vm]   spec: 1.0.2-dev
 [vm] krunc create oci1 --bundle /bundle   (sets up + blocks before exec)
-created oci1 (pid 117, krunc id 3)
+created oci1 (pid 118, krunc id 3)
+[    7.098786] krunc (116) used greatest stack depth: 12488 bytes left
 [vm] krunc state oci1   (expect: created)
 [vm]     "id": "oci1",
 [vm]     "status": "created",
-[vm]     "pid": 117,
+[vm]     "pid": 118,
 [vm] krunc start oci1   (releases the paused init -> execs the entrypoint)
-[    7.111206] krunc: started container id=3 pid=117
+[    7.138005] krunc: started container id=3 pid=118
 ==================================================================
 [container] Hello from inside a krunc container!
 [container] hostname (UTS namespace) : oci-demo
@@ -78,6 +95,7 @@ PID   COMMAND
 [container] filesystem root (mount ns + chroot):
 bin
 dev
+etc
 init.sh
 proc
 sys
@@ -85,25 +103,40 @@ tmp
 [container] network interfaces (NET namespace):
 1: lo: <LOOPBACK> mtu 65536 qdisc noop qlen 1000\    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00
 2: sit0@NONE: <NOARP> mtu 1480 qdisc noop qlen 1000\    link/sit 0.0.0.0 brd 0.0.0.0
-[container] sleeping briefly so the host can inspect our namespaces...
+[container] --- filesystem confinement (masked + read-only paths) ---
+[container]   masked /proc/kcore size: 0 bytes (expect 0)
+[container]   /proc/sysrq-trigger write: inert (masked by /dev/null)
+[container]   /etc: read-only, write denied (EROFS)
+[container]   /proc/sys: read-only, write denied (EROFS)
+[container] --- seccomp (sealed syscall policy) ---
+[container]   chmod /tmp: blocked by seccomp (EPERM)
+[container] my cgroup: 0::/krunc/oci1
+[container] pids test: forktest will fork until the cgroup pids.max stops it
+[    7.260604] cgroup: fork rejected by pids controller in /krunc/oci1
+[forktest] started 15 children, fork denied 3x (errno=11)
 [vm] krunc state oci1   (expect: running)
 [vm]     "status": "running",
-[vm]     "pid": 117,
-[vm] ----- kernel-applied confinement, host view of /proc/117/status -----
+[vm]     "pid": 118,
+[vm] ----- kernel-applied confinement, host view of /proc/118/status -----
 [vm]   CapPrm:	00000000200004e1
 [vm]   CapEff:	00000000200004e1
 [vm]   CapBnd:	00000000200004e1
 [vm]   NoNewPrivs:	1
-[vm]   expected: CapBnd 00000000200004e1 (the 6 bounded caps), NoNewPrivs 1
-[container] goodbye (PID 1 exiting -> namespaces tear down)
-==================================================================
-[vm] krunc state oci1   (after the entrypoint exits, expect: stopped)
+[vm]   Seccomp:	2
+[vm]   expected: CapBnd 00000000200004e1 (the 6 bounded caps), NoNewPrivs 1, Seccomp 2 (filter)
+[vm] ----- cgroup pids limit (host view of the container's cgroup) -----
+[vm]   pids.max     = 16
+[vm]   pids.current = 16   (forktest tried to fork past the limit; the kernel capped it)
+[vm]   pids.events  = max 3    (max = number of forks the kernel denied)
+[vm]   RESULT: pids cgroup ENFORCED -- kernel denied 3 forks; pids.current pinned at pids.max=16
+[vm] krunc kill oci1   (forktest is parked as PID 1; stop the whole tree)
+[vm] krunc state oci1   (after kill, expect: stopped)
 [vm]     "status": "stopped",
 [vm] krunc list:
 [vm]   ID                   STATUS     PID      BUNDLE
-[vm]   oci1                 stopped    117      /bundle
+[vm]   oci1                 stopped    118      /bundle
 [vm] krunc delete oci1
-[   10.246620] krunc: deleted container id=3
+[   11.267024] krunc: deleted container id=3
 
 ================ DEMO 4: unload the runtime cleanly ================
 [vm] krunc.ko unloaded cleanly

@@ -72,6 +72,27 @@ escape the filter); `pivot_root` before privilege drop (so the new root is
 established while still privileged); label/seccomp/caps before the untrusted
 rootfs runs.
 
+### Implementation status (verified in QEMU vs. designed)
+
+The pipeline above is the full design. What the current PoC **implements and
+verifies from the host** (see `docs/sample-v2-confinement.txt`):
+
+| Control | Status | Evidence (host-side) |
+|---|---|---|
+| New namespaces (no `CLONE_VM`), PID 1, UTS/mount/net | done | distinct ns inodes; `pid 1`; hostname |
+| In-kernel private `/proc` + `/sys` | done | container reads `/proc` while fully confined |
+| Capability bounding set + `no_new_privs` | done | `CapBnd=…200004e1`, `NoNewPrivs=1` |
+| `maskedPaths` + `readonlyPaths` | done | `/proc/kcore`→0 bytes; `/etc`,`/proc/sys` `EROFS` |
+| seccomp (OCI→BPF, installed after `no_new_privs`) | done | `chmod`→`EPERM`; `Seccomp: 2` (filter) |
+| cgroup v2 `pids` | done | kernel denies forks; `pids.current==pids.max` |
+| `pivot_root` (replacing chroot), general `mounts[]` | planned | — |
+| user-ns uid/gid mapping | planned | — |
+| Landlock seal + BPF-LSM active kill-on-escape | planned | — |
+
+Everything marked *done* is applied **atomically in kernel context before the
+first userspace instruction** and (for the sealed controls) holds for the
+container's whole life.
+
 ## 4. P2 — lifetime confinement (post-setup escapes)
 
 Setup integrity is necessary but not sufficient: the workload runs afterward and
@@ -114,10 +135,12 @@ intentional. The approved runtime mechanisms are:
   a **built-in LSM** so "may this task do X?" is answered natively by "which
   `krunc_domain` is it in?" — the FreeBSD `prison_check()` model.
 
-So: the **PoC enforces P2 via seccomp + cap bounding + Landlock + cgroup**
-(all module-applicable, all sealed/monotonic), and the domain object is the
-**unifying owner** that applies them atomically and ties them to one identity;
-**BPF-LSM** and a **built-in LSM** are the active-response / mainline extensions.
+So: the **PoC enforces P2 today via seccomp + cap bounding + cgroup +
+masked/readonly paths** (all module-applicable, all sealed/monotonic), with
+**Landlock** and a per-domain **BPF-LSM** kill-on-escape hook as the designed
+next steps; the domain object is the **unifying owner** that applies them
+atomically and ties them to one identity; **BPF-LSM** and a **built-in LSM** are
+the active-response / mainline extensions.
 
 ## 5. Tamper-proofness
 
