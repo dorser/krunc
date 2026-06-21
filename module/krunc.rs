@@ -74,6 +74,8 @@ extern "C" {
         perm: u64,
         inh: u64,
         amb: u64,
+        uid: c_uint,
+        gid: c_uint,
         no_new_privs: c_int,
     ) -> c_int;
     /// Mount `fstype` from `dev` onto `dir` in the current task's mount
@@ -189,6 +191,8 @@ struct ContainerCtx {
     readonly: KVec<KVec<u8>>,  // paths remounted read-only (each NUL-terminated)
     rlimits: KVec<RLimit>,     // resource limits applied before exec
     oom_score_adj: Option<i32>, // OOM score adjustment applied before exec
+    uid: u32,                  // target uid (process.user.uid)
+    gid: u32,                  // target gid (process.user.gid)
     ctrl: Option<Arc<ContainerControl>>, // Some -> two-phase (created) container
 }
 
@@ -420,6 +424,8 @@ fn handle_text_command(buf: &[u8]) -> Result {
         KVec::new(),
         KVec::new(),
         None,
+        0,
+        0,
     )?;
     pr_info!("started container id={} pid={}\n", id, pid);
     Ok(())
@@ -613,6 +619,8 @@ struct DecodedSpec {
     readonly: KVec<KVec<u8>>,
     rlimits: KVec<RLimit>,
     oom_score_adj: Option<i32>,
+    uid: u32,
+    gid: u32,
 }
 
 /// The five Linux capability sets applied to the container before exec.
@@ -699,6 +707,8 @@ fn decode_spec(buf: &[u8]) -> Result<DecodedSpec> {
         readonly: KVec::new(),
         rlimits: KVec::new(),
         oom_score_adj: None,
+        uid: 0,
+        gid: 0,
     };
     for _ in 0..count {
         let tag = r.u16()?;
@@ -734,6 +744,11 @@ fn decode_spec(buf: &[u8]) -> Result<DecodedSpec> {
             12 => d.readonly = read_strvec_k(&mut sr)?, // RO_PATHS
             13 => d.rlimits = read_rlimits_k(&mut sr)?, // RLIMITS
             14 => d.oom_score_adj = Some(sr.u32()? as i32), // OOM_SCORE_ADJ
+            16 => {
+                // USER: target uid, gid.
+                d.uid = sr.u32()?;
+                d.gid = sr.u32()?;
+            }
             // tags 6/7 (uid/gid maps) land in a later milestone.
             _ => {}
         }
@@ -784,6 +799,8 @@ fn create_from_blob(spec: &[u8]) -> Result<(u64, i32)> {
         d.readonly,
         d.rlimits,
         d.oom_score_adj,
+        d.uid,
+        d.gid,
     )
 }
 
@@ -803,6 +820,8 @@ fn spawn(
     readonly: KVec<KVec<u8>>,
     rlimits: KVec<RLimit>,
     oom_score_adj: Option<i32>,
+    uid: u32,
+    gid: u32,
 ) -> Result<(u64, i32)> {
     let ctrl = if paused {
         Some(Arc::new(
@@ -831,6 +850,8 @@ fn spawn(
             readonly,
             rlimits,
             oom_score_adj,
+            uid,
+            gid,
             ctrl: ctrl.as_ref().map(|a| a.clone()),
         },
         GFP_KERNEL,
@@ -1010,6 +1031,8 @@ unsafe extern "C" fn container_entry(arg: *mut c_void) -> c_int {
             ctx.cap_sets.permitted,
             ctx.cap_sets.inheritable,
             ctx.cap_sets.ambient,
+            ctx.uid as c_uint,
+            ctx.gid as c_uint,
             if ctx.no_new_privs { 1 } else { 0 },
         )
     };

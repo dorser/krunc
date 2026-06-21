@@ -45,6 +45,15 @@ cp "$REPO/examples/rootfs-skel/init.sh" "$ROOT/bundle/rootfs/init.sh"
 cp "$REPO/examples/bundle/config.json" "$ROOT/bundle/config.json"
 chmod +x "$ROOT/bundle/rootfs/init.sh" "$ROOT/bundle/rootfs/bin/busybox"
 
+# Pre-install the busybox applet symlinks at build time so the bundle works when
+# the container runs as a non-root user (config.json sets process.user), which
+# cannot write the root-owned /bin to run `busybox --install` itself. Real
+# images ship a populated /bin.
+for app in $("$BB" --list 2>/dev/null); do
+	[ "$app" = busybox ] && continue   # never clobber the real binary
+	ln -sf busybox "$ROOT/bundle/rootfs/bin/$app"
+done
+
 # deterministic cgroup pids probe (calls fork(2) directly; see krunc-forktest)
 FORKTEST="$REPO/userspace/target/x86_64-unknown-linux-musl/release/forktest"
 if [ -x "$FORKTEST" ]; then

@@ -3,7 +3,7 @@
   "hostname": "oci-demo",
   "process": {
     "terminal": false,
-    "user": { "uid": 0, "gid": 0 },
+    "user": { "uid": 65534, "gid": 65534 },
     "args": ["/bin/sh", "/init.sh"],
     "env": [
       "PATH=/bin:/sbin:/usr/bin:/usr/sbin",

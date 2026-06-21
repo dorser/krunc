@@ -168,6 +168,10 @@ pub struct DomainSpec {
     pub rlimits: Vec<Rlimit>,
     /// OOM score adjustment (`/proc/self/oom_score_adj`); `None` = leave default.
     pub oom_score_adj: Option<i32>,
+    /// Target uid the container process runs as (`process.user.uid`; 0 = root).
+    pub uid: u32,
+    /// Target gid the container process runs as (`process.user.gid`; 0 = root).
+    pub gid: u32,
 }
 
 // Section tags. Stable wire identifiers; never reuse a value.
@@ -187,6 +191,7 @@ mod tag {
     pub const RLIMITS: u16 = 13;
     pub const OOM_SCORE_ADJ: u16 = 14;
     pub const CAP_SETS: u16 = 15;
+    pub const USER: u16 = 16;
 }
 
 /// Errors from encoding or (strict) decoding.
@@ -386,6 +391,12 @@ impl DomainSpec {
         if let Some(adj) = self.oom_score_adj {
             emit(tag::OOM_SCORE_ADJ, &mut |w| w.u32(adj as u32));
         }
+        if self.uid != 0 || self.gid != 0 {
+            emit(tag::USER, &mut |w| {
+                w.u32(self.uid);
+                w.u32(self.gid);
+            });
+        }
 
         w.u32(count);
         w.bytes(&body.buf);
@@ -560,6 +571,10 @@ pub fn decode(buf: &[u8]) -> Result<(Op, DomainSpec), AbiError> {
             tag::OOM_SCORE_ADJ => {
                 spec.oom_score_adj = Some(sr.u32()? as i32);
             }
+            tag::USER => {
+                spec.uid = sr.u32()?;
+                spec.gid = sr.u32()?;
+            }
             _ => { /* unknown tag: ignore for forward-compat */ }
         }
     }
@@ -612,6 +627,8 @@ mod tests {
                 Rlimit { resource: 4, soft: 0, hard: 0 },
             ],
             oom_score_adj: Some(-500),
+            uid: 65534,
+            gid: 65534,
         }
     }
 

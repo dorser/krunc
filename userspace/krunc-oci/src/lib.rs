@@ -498,6 +498,8 @@ pub fn config_to_spec(bundle: &Path, cfg: &OciConfig) -> Result<DomainSpec, OciE
         readonly_paths,
         rlimits,
         oom_score_adj: process.oom_score_adj,
+        uid: process.user.as_ref().map(|u| u.uid).unwrap_or(0),
+        gid: process.user.as_ref().map(|u| u.gid).unwrap_or(0),
     };
     spec.validate()?;
     Ok(spec)
@@ -513,7 +515,7 @@ mod tests {
       "hostname": "oci-demo",
       "process": {
         "terminal": false,
-        "user": { "uid": 0, "gid": 0 },
+        "user": { "uid": 65534, "gid": 65534 },
         "args": ["/bin/sh", "/init.sh"],
         "env": ["PATH=/bin:/sbin", "TERM=linux"],
         "cwd": "/",
@@ -574,6 +576,8 @@ mod tests {
             ]
         );
         assert_eq!(spec.oom_score_adj, Some(-500));
+        assert_eq!(spec.uid, 65534);
+        assert_eq!(spec.gid, 65534);
     }
 
     #[test]

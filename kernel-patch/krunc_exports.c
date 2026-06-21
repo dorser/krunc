@@ -41,13 +41,14 @@
 #include <linux/string.h>
 #include <linux/resource.h>
 #include <linux/oom.h>
+#include <linux/sched/user.h>
 
 /* Prototypes (the kernel builds with -Wmissing-prototypes -Werror). */
 int krunc_set_hostname(const char *name, size_t len);
 int krunc_chroot(const char *path);
 int krunc_kill(pid_t nr, int sig);
 int krunc_apply_creds(u64 bset, u64 eff, u64 perm, u64 inh, u64 amb,
-		      int no_new_privs);
+		      u32 uid, u32 gid, int no_new_privs);
 int krunc_apply_rlimit(unsigned int resource, u64 soft, u64 hard);
 void krunc_set_oom_score_adj(int adj);
 int krunc_mount(const char *dev, const char *dir, const char *fstype,
@@ -165,10 +166,12 @@ EXPORT_SYMBOL_GPL(krunc_kill);
  * intermediate userspace process in which the capability state could leak.
  */
 int krunc_apply_creds(u64 bset, u64 eff, u64 perm, u64 inh, u64 amb,
-		      int no_new_privs)
+		      u32 uid, u32 gid, int no_new_privs)
 {
 	struct cred *new;
 	const u64 valid = (1ULL << (CAP_LAST_CAP + 1)) - 1;
+	kuid_t kuid;
+	kgid_t kgid;
 
 	if (no_new_privs)
 		task_set_no_new_privs(current);
@@ -188,6 +191,40 @@ int krunc_apply_creds(u64 bset, u64 eff, u64 perm, u64 inh, u64 amb,
 	new->cap_permitted   = (kernel_cap_t){ .val = perm & valid };
 	new->cap_inheritable = (kernel_cap_t){ .val = inh  & valid };
 	new->cap_ambient     = (kernel_cap_t){ .val = amb  & valid };
+
+	/* Drop to the target user/group (real, effective, saved and fs ids), all
+	 * in the same cred so changing uid does not clear the caps we just set
+	 * (unlike the setuid(2) path). Done while still privileged, before exec. */
+	kgid = make_kgid(new->user_ns, gid);
+	if (gid_valid(kgid)) {
+		new->gid = new->egid = new->sgid = new->fsgid = kgid;
+	}
+	kuid = make_kuid(new->user_ns, uid);
+	if (uid_valid(kuid)) {
+		struct user_struct *new_user;
+
+		new->uid = new->euid = new->suid = new->fsuid = kuid;
+		/* Mirror set_user(): switch new->user so commit_creds() performs
+		 * the RLIMIT_NPROC ucount transfer, which it only does when
+		 * new->user changes. Without this the per-user process count
+		 * underflows when the task exits (WARN in dec_rlimit_ucounts). */
+		new_user = alloc_uid(kuid);
+		if (!new_user) {
+			abort_creds(new);
+			return -EAGAIN;
+		}
+		free_uid(new->user);
+		new->user = new_user;
+	}
+
+	/* Repoint the cred's ucounts at the (possibly new) uid so commit_creds()
+	 * transfers the rlimit counters onto the correct ucounts, exactly as the
+	 * setresuid(2) path does. */
+	if (set_cred_ucounts(new) < 0) {
+		abort_creds(new);
+		return -ENOMEM;
+	}
+
 	commit_creds(new); /* consumes @new */
 	return 0;
 }
