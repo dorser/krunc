@@ -80,6 +80,10 @@ extern "C" {
     /// Install a kernel-resident classic-BPF seccomp program (`len` instructions)
     /// on the current task. Must be called after no_new_privs is set.
     fn krunc_seccomp_install(insns: *const c_void, len: c_uint) -> c_int;
+    /// Apply one resource limit (`setrlimit`) to the current task before exec.
+    fn krunc_apply_rlimit(resource: c_uint, soft: u64, hard: u64) -> c_int;
+    /// Set the current task's OOM-killer score adjustment before exec.
+    fn krunc_set_oom_score_adj(adj: c_int);
     // msleep() is exported by mainline.
     fn msleep(msecs: c_uint);
 }
@@ -115,6 +119,8 @@ const ST_STOPPED: u32 = 2;
 
 const MAX_ARGS: usize = 32;
 const MAX_SPEC: usize = 16 * 1024;
+/// Maximum number of rlimit entries accepted from the spec.
+const MAX_RLIMITS: usize = 32;
 /// Maximum length of a single string field in the binary spec.
 const MAX_STR: usize = 4096;
 /// krunc-abi wire magic and version (see the `krunc-abi` crate).
@@ -174,6 +180,8 @@ struct ContainerCtx {
     seccomp: KVec<u8>,         // compiled sock_filter[] blob (empty = no seccomp)
     masked: KVec<KVec<u8>>,    // paths over-mounted to be inaccessible (each NUL-terminated)
     readonly: KVec<KVec<u8>>,  // paths remounted read-only (each NUL-terminated)
+    rlimits: KVec<RLimit>,     // resource limits applied before exec
+    oom_score_adj: Option<i32>, // OOM score adjustment applied before exec
     ctrl: Option<Arc<ContainerControl>>, // Some -> two-phase (created) container
 }
 
@@ -403,6 +411,8 @@ fn handle_text_command(buf: &[u8]) -> Result {
         KVec::new(),
         KVec::new(),
         KVec::new(),
+        KVec::new(),
+        None,
     )?;
     pr_info!("started container id={} pid={}\n", id, pid);
     Ok(())
@@ -590,6 +600,30 @@ struct DecodedSpec {
     seccomp: KVec<u8>,
     masked: KVec<KVec<u8>>,
     readonly: KVec<KVec<u8>>,
+    rlimits: KVec<RLimit>,
+    oom_score_adj: Option<i32>,
+}
+
+/// A decoded resource limit (`setrlimit`).
+#[derive(Clone, Copy)]
+struct RLimit {
+    resource: u32,
+    soft: u64,
+    hard: u64,
+}
+
+fn read_rlimits_k(sr: &mut BReader<'_>) -> Result<KVec<RLimit>> {
+    let n = sr.u32()? as usize;
+    let mut v: KVec<RLimit> = KVec::new();
+    for _ in 0..n {
+        let resource = sr.u32()?;
+        let soft = sr.u64()?;
+        let hard = sr.u64()?;
+        if v.len() < MAX_RLIMITS {
+            v.push(RLimit { resource, soft, hard }, GFP_KERNEL)?;
+        }
+    }
+    Ok(v)
 }
 
 fn read_strvec_k(sr: &mut BReader<'_>) -> Result<KVec<KVec<u8>>> {
@@ -638,6 +672,8 @@ fn decode_spec(buf: &[u8]) -> Result<DecodedSpec> {
         seccomp: KVec::new(),
         masked: KVec::new(),
         readonly: KVec::new(),
+        rlimits: KVec::new(),
+        oom_score_adj: None,
     };
     for _ in 0..count {
         let tag = r.u16()?;
@@ -664,6 +700,8 @@ fn decode_spec(buf: &[u8]) -> Result<DecodedSpec> {
             }
             11 => d.masked = read_strvec_k(&mut sr)?, // MASKED_PATHS
             12 => d.readonly = read_strvec_k(&mut sr)?, // RO_PATHS
+            13 => d.rlimits = read_rlimits_k(&mut sr)?, // RLIMITS
+            14 => d.oom_score_adj = Some(sr.u32()? as i32), // OOM_SCORE_ADJ
             // tags 6/7 (uid/gid maps) land in a later milestone.
             _ => {}
         }
@@ -705,6 +743,8 @@ fn create_from_blob(spec: &[u8]) -> Result<(u64, i32)> {
         d.seccomp,
         d.masked,
         d.readonly,
+        d.rlimits,
+        d.oom_score_adj,
     )
 }
 
@@ -722,6 +762,8 @@ fn spawn(
     seccomp: KVec<u8>,
     masked: KVec<KVec<u8>>,
     readonly: KVec<KVec<u8>>,
+    rlimits: KVec<RLimit>,
+    oom_score_adj: Option<i32>,
 ) -> Result<(u64, i32)> {
     let ctrl = if paused {
         Some(Arc::new(
@@ -748,6 +790,8 @@ fn spawn(
             seccomp,
             masked,
             readonly,
+            rlimits,
+            oom_score_adj,
             ctrl: ctrl.as_ref().map(|a| a.clone()),
         },
         GFP_KERNEL,
@@ -898,6 +942,22 @@ unsafe extern "C" fn container_entry(arg: *mut c_void) -> c_int {
     // These neutralise classic post-setup escape vectors (e.g. writing
     // /proc/sysrq-trigger or /proc/sys/kernel/core_pattern).
     apply_path_confinement(&ctx.masked, &ctx.readonly);
+
+    // Resource limits and OOM score, applied while still privileged (so any
+    // hard limit can be set) and before exec, so they bound the workload from
+    // its first instruction.
+    for i in 0..ctx.rlimits.len() {
+        let rl = ctx.rlimits[i];
+        // SAFETY: FFI call into the vmlinux helper, operating on `current`.
+        let rc = unsafe { krunc_apply_rlimit(rl.resource as c_uint, rl.soft, rl.hard) };
+        if rc != 0 {
+            pr_err!("krunc: rlimit {} rejected: {}\n", rl.resource, rc);
+        }
+    }
+    if let Some(adj) = ctx.oom_score_adj {
+        // SAFETY: FFI call into the vmlinux helper, operating on `current`.
+        unsafe { krunc_set_oom_score_adj(adj as c_int) };
+    }
 
     // Privilege confinement, applied atomically in kernel context just before
     // exec: the capability ceiling + no_new_privs are in force for the very

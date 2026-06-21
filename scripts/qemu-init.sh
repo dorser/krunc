@@ -93,6 +93,8 @@ echo "[vm] krunc state oci1   (expect: running)"
 echo "[vm] ----- kernel-applied confinement, host view of /proc/$CPID/status -----"
 grep -E "^(CapBnd|CapPrm|CapEff|NoNewPrivs|Seccomp):" /proc/$CPID/status 2>/dev/null | sed 's/^/[vm]   /'
 echo "[vm]   expected: CapBnd 00000000200004e1 (the 6 bounded caps), NoNewPrivs 1, Seccomp 2 (filter)"
+echo "[vm]   RLIMIT_NOFILE: $(grep -E '^Max open files' /proc/$CPID/limits 2>/dev/null)   (expect soft 256 hard 512)"
+echo "[vm]   oom_score_adj = $(cat /proc/$CPID/oom_score_adj 2>/dev/null)   (expect -500)"
 # Give the container's forktest probe a moment to fork up to the cap. Its parent
 # and every survivor pause(), so this snapshot is stable until we kill them.
 sleep 3

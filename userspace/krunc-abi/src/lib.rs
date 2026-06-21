@@ -42,6 +42,9 @@ pub const MAX_SECCOMP: usize = 64 * 1024;
 /// Maximum number of masked or read-only path entries.
 pub const MAX_PATHS: usize = 256;
 
+/// Maximum number of rlimit entries (there are ~16 `RLIMIT_*` resources).
+pub const MAX_RLIMITS: usize = 32;
+
 // ---- clone(2) namespace flags (uapi/linux/sched.h) ----
 /// `CLONE_NEWNS` — mount namespace.
 pub const NS_MOUNT: u32 = 0x0002_0000;
@@ -107,6 +110,17 @@ pub struct IdMap {
     pub size: u32,
 }
 
+/// A resource limit (`setrlimit(2)`), as in `process.rlimits`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rlimit {
+    /// `RLIMIT_*` resource number (Linux ABI value, e.g. `RLIMIT_NOFILE = 7`).
+    pub resource: u32,
+    /// Soft limit.
+    pub soft: u64,
+    /// Hard limit.
+    pub hard: u64,
+}
+
 /// The decoded domain specification.
 ///
 /// This is the userspace-friendly owned form. [`encode`](DomainSpec::encode)
@@ -140,6 +154,10 @@ pub struct DomainSpec {
     pub masked_paths: Vec<String>,
     /// Paths remounted read-only inside the container. Enforced for life.
     pub readonly_paths: Vec<String>,
+    /// Resource limits (`setrlimit`) to apply before exec.
+    pub rlimits: Vec<Rlimit>,
+    /// OOM score adjustment (`/proc/self/oom_score_adj`); `None` = leave default.
+    pub oom_score_adj: Option<i32>,
 }
 
 // Section tags. Stable wire identifiers; never reuse a value.
@@ -156,6 +174,8 @@ mod tag {
     pub const SECCOMP: u16 = 10;
     pub const MASKED_PATHS: u16 = 11;
     pub const RO_PATHS: u16 = 12;
+    pub const RLIMITS: u16 = 13;
+    pub const OOM_SCORE_ADJ: u16 = 14;
 }
 
 /// Errors from encoding or (strict) decoding.
@@ -258,6 +278,15 @@ fn write_maps(w: &mut Writer, maps: &[IdMap]) {
     }
 }
 
+fn write_rlimits(w: &mut Writer, limits: &[Rlimit]) {
+    w.u32(limits.len() as u32);
+    for l in limits {
+        w.u32(l.resource);
+        w.u64(l.soft);
+        w.u64(l.hard);
+    }
+}
+
 impl DomainSpec {
     /// Validate sizes against the `MAX_*` bounds (the same bounds the decoder
     /// enforces) before encoding, so we never produce a buffer the kernel would
@@ -276,6 +305,9 @@ impl DomainSpec {
         check_len("uid_maps", self.uid_maps.len(), MAX_MAPS)?;
         check_len("gid_maps", self.gid_maps.len(), MAX_MAPS)?;
         check_len("seccomp", self.seccomp.len(), MAX_SECCOMP)?;
+        check_len("masked_paths", self.masked_paths.len(), MAX_PATHS)?;
+        check_len("readonly_paths", self.readonly_paths.len(), MAX_PATHS)?;
+        check_len("rlimits", self.rlimits.len(), MAX_RLIMITS)?;
         Ok(())
     }
 
@@ -330,6 +362,12 @@ impl DomainSpec {
         }
         if !self.readonly_paths.is_empty() {
             emit(tag::RO_PATHS, &mut |w| write_strvec(w, &self.readonly_paths));
+        }
+        if !self.rlimits.is_empty() {
+            emit(tag::RLIMITS, &mut |w| write_rlimits(w, &self.rlimits));
+        }
+        if let Some(adj) = self.oom_score_adj {
+            emit(tag::OOM_SCORE_ADJ, &mut |w| w.u32(adj as u32));
         }
 
         w.u32(count);
@@ -419,6 +457,20 @@ fn read_maps(r: &mut Reader<'_>, what: &'static str) -> Result<Vec<IdMap>, AbiEr
     Ok(v)
 }
 
+fn read_rlimits(r: &mut Reader<'_>, what: &'static str) -> Result<Vec<Rlimit>, AbiError> {
+    let n = r.u32()? as usize;
+    check_len(what, n, MAX_RLIMITS)?;
+    let mut v = Vec::with_capacity(n);
+    for _ in 0..n {
+        v.push(Rlimit {
+            resource: r.u32()?,
+            soft: r.u64()?,
+            hard: r.u64()?,
+        });
+    }
+    Ok(v)
+}
+
 /// Decode a buffer into `(op, spec)`, enforcing every bound. Total: never panics.
 pub fn decode(buf: &[u8]) -> Result<(Op, DomainSpec), AbiError> {
     if buf.len() > MAX_SPEC {
@@ -479,6 +531,12 @@ pub fn decode(buf: &[u8]) -> Result<(Op, DomainSpec), AbiError> {
             tag::RO_PATHS => {
                 spec.readonly_paths = read_strvec(&mut sr, "readonly_paths", MAX_PATHS)?;
             }
+            tag::RLIMITS => {
+                spec.rlimits = read_rlimits(&mut sr, "rlimits")?;
+            }
+            tag::OOM_SCORE_ADJ => {
+                spec.oom_score_adj = Some(sr.u32()? as i32);
+            }
             _ => { /* unknown tag: ignore for forward-compat */ }
         }
     }
@@ -522,6 +580,11 @@ mod tests {
             seccomp: vec![0xde, 0xad, 0xbe, 0xef],
             masked_paths: vec!["/proc/kcore".into(), "/proc/sysrq-trigger".into()],
             readonly_paths: vec!["/proc/sys".into(), "/bin".into()],
+            rlimits: vec![
+                Rlimit { resource: 7, soft: 1024, hard: 4096 },
+                Rlimit { resource: 4, soft: 0, hard: 0 },
+            ],
+            oom_score_adj: Some(-500),
         }
     }
 

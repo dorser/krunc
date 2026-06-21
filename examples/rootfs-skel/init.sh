@@ -70,6 +70,9 @@ if [ "$KRUNC_PIDS_TEST" = 1 ]; then
 		echo "[container]   chmod /tmp: blocked by seccomp (EPERM)"
 	fi
 
+	echo "[container] --- resource limits (rlimits / oom) ---"
+	echo "[container]   RLIMIT_NOFILE (ulimit -n) = $(ulimit -n)  (config soft=256)"
+
 	echo "[container] my cgroup: $(cat /proc/self/cgroup 2>&-)"
 	echo "[container] pids test: forktest will fork until the cgroup pids.max stops it"
 	# Hand off to the deterministic fork(2) probe. It becomes PID 1, forks until

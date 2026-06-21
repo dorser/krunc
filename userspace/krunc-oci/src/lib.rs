@@ -17,7 +17,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use krunc_abi::{
-    DomainSpec, IdMap, NS_CGROUP, NS_IPC, NS_MOUNT, NS_NET, NS_PID, NS_USER, NS_UTS,
+    DomainSpec, IdMap, Rlimit, NS_CGROUP, NS_IPC, NS_MOUNT, NS_NET, NS_PID, NS_USER, NS_UTS,
     OPT_NO_NEW_PRIVS, OPT_ROOTFS_RO,
 };
 use serde::Deserialize;
@@ -62,6 +62,26 @@ pub struct Process {
     /// Set `no_new_privs` before exec.
     #[serde(default)]
     pub no_new_privileges: bool,
+    /// Resource limits to apply to the process.
+    #[serde(default)]
+    pub rlimits: Vec<OciRlimit>,
+    /// Adjust the process OOM-killer score.
+    pub oom_score_adj: Option<i32>,
+}
+
+/// `config.json` `process.rlimits[]`.
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct OciRlimit {
+    /// `RLIMIT_*` name, e.g. `RLIMIT_NOFILE`.
+    #[serde(rename = "type")]
+    pub limit_type: String,
+    /// Soft limit.
+    #[serde(default)]
+    pub soft: u64,
+    /// Hard limit.
+    #[serde(default)]
+    pub hard: u64,
 }
 
 /// `config.json` `process.user`.
@@ -365,6 +385,30 @@ fn caps_to_mask(names: &[String]) -> Result<u64, OciError> {
     Ok(mask)
 }
 
+/// Resolve an OCI `RLIMIT_*` name to its Linux resource number
+/// (`include/uapi/asm-generic/resource.h`).
+fn rlimit_resource(name: &str) -> Option<u32> {
+    Some(match name {
+        "RLIMIT_CPU" => 0,
+        "RLIMIT_FSIZE" => 1,
+        "RLIMIT_DATA" => 2,
+        "RLIMIT_STACK" => 3,
+        "RLIMIT_CORE" => 4,
+        "RLIMIT_RSS" => 5,
+        "RLIMIT_NPROC" => 6,
+        "RLIMIT_NOFILE" => 7,
+        "RLIMIT_MEMLOCK" => 8,
+        "RLIMIT_AS" => 9,
+        "RLIMIT_LOCKS" => 10,
+        "RLIMIT_SIGPENDING" => 11,
+        "RLIMIT_MSGQUEUE" => 12,
+        "RLIMIT_NICE" => 13,
+        "RLIMIT_RTPRIO" => 14,
+        "RLIMIT_RTTIME" => 15,
+        _ => return None,
+    })
+}
+
 /// Translate a parsed OCI config (from `bundle`) into a validated [`DomainSpec`].
 pub fn config_to_spec(bundle: &Path, cfg: &OciConfig) -> Result<DomainSpec, OciError> {
     let process = cfg.process.as_ref().ok_or(OciError::Missing("process"))?;
@@ -421,6 +465,13 @@ pub fn config_to_spec(bundle: &Path, cfg: &OciConfig) -> Result<DomainSpec, OciE
         None => 0,
     };
 
+    let mut rlimits = Vec::with_capacity(process.rlimits.len());
+    for rl in &process.rlimits {
+        let resource = rlimit_resource(&rl.limit_type)
+            .ok_or(OciError::Unsupported("process.rlimits[].type"))?;
+        rlimits.push(Rlimit { resource, soft: rl.soft, hard: rl.hard });
+    }
+
     let spec = DomainSpec {
         rootfs: resolve_rootfs(bundle, &root.path),
         hostname: cfg.hostname.clone().unwrap_or_default(),
@@ -434,6 +485,8 @@ pub fn config_to_spec(bundle: &Path, cfg: &OciConfig) -> Result<DomainSpec, OciE
         seccomp,
         masked_paths,
         readonly_paths,
+        rlimits,
+        oom_score_adj: process.oom_score_adj,
     };
     spec.validate()?;
     Ok(spec)
@@ -456,7 +509,12 @@ mod tests {
         "noNewPrivileges": true,
         "capabilities": {
           "bounding": ["CAP_NET_BIND_SERVICE", "CAP_KILL", "CAP_AUDIT_WRITE"]
-        }
+        },
+        "oomScoreAdj": -500,
+        "rlimits": [
+          { "type": "RLIMIT_NOFILE", "soft": 1024, "hard": 4096 },
+          { "type": "RLIMIT_CORE", "soft": 0, "hard": 0 }
+        ]
       },
       "root": { "path": "rootfs", "readonly": true },
       "linux": {
@@ -490,6 +548,14 @@ mod tests {
         assert_eq!(spec.cap_bounding, expect_caps);
         assert_eq!(spec.masked_paths, vec!["/proc/kcore", "/proc/sysrq-trigger"]);
         assert_eq!(spec.readonly_paths, vec!["/proc/sys", "/bin"]);
+        assert_eq!(
+            spec.rlimits,
+            vec![
+                Rlimit { resource: 7, soft: 1024, hard: 4096 },
+                Rlimit { resource: 4, soft: 0, hard: 0 },
+            ]
+        );
+        assert_eq!(spec.oom_score_adj, Some(-500));
     }
 
     #[test]

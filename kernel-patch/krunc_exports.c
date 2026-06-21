@@ -39,12 +39,16 @@
 #include <linux/utsname.h>
 #include <linux/errno.h>
 #include <linux/string.h>
+#include <linux/resource.h>
+#include <linux/oom.h>
 
 /* Prototypes (the kernel builds with -Wmissing-prototypes -Werror). */
 int krunc_set_hostname(const char *name, size_t len);
 int krunc_chroot(const char *path);
 int krunc_kill(pid_t nr, int sig);
 int krunc_apply_creds(u64 cap_mask, int no_new_privs);
+int krunc_apply_rlimit(unsigned int resource, u64 soft, u64 hard);
+void krunc_set_oom_score_adj(int adj);
 int krunc_mount(const char *dev, const char *dir, const char *fstype,
 		unsigned long flags);
 pid_t krunc_spawn(int (*fn)(void *), void *arg, unsigned long flags);
@@ -181,6 +185,51 @@ int krunc_apply_creds(u64 cap_mask, int no_new_privs)
 	return 0;
 }
 EXPORT_SYMBOL_GPL(krunc_apply_creds);
+
+/*
+ * Apply one resource limit (setrlimit) to the current task before exec. This is
+ * what do_prlimit() does for the simple case (do_prlimit is static): update
+ * signal->rlim[resource] under the group-leader's task_lock. The container init
+ * is still fully privileged here, so it may set any soft/hard pair. u64 maps
+ * directly to unsigned long on the LP64 target (U64_MAX == RLIM_INFINITY).
+ */
+int krunc_apply_rlimit(unsigned int resource, u64 soft, u64 hard)
+{
+	struct rlimit *rlim;
+
+	if (resource >= RLIM_NLIMITS)
+		return -EINVAL;
+	/* A finite soft limit may not exceed the hard limit. */
+	if (soft != (u64)RLIM_INFINITY && hard != (u64)RLIM_INFINITY && soft > hard)
+		return -EINVAL;
+
+	rlim = current->signal->rlim + resource;
+	task_lock(current->group_leader);
+	rlim->rlim_cur = (unsigned long)soft;
+	rlim->rlim_max = (unsigned long)hard;
+	task_unlock(current->group_leader);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(krunc_apply_rlimit);
+
+/*
+ * Set the current task's OOM-killer score adjustment before exec. The init is
+ * privileged here, so it may set oom_score_adj_min too (lower the floor). The
+ * valid range is [OOM_SCORE_ADJ_MIN, OOM_SCORE_ADJ_MAX].
+ */
+void krunc_set_oom_score_adj(int adj)
+{
+	if (adj < OOM_SCORE_ADJ_MIN)
+		adj = OOM_SCORE_ADJ_MIN;
+	else if (adj > OOM_SCORE_ADJ_MAX)
+		adj = OOM_SCORE_ADJ_MAX;
+
+	task_lock(current->group_leader);
+	current->signal->oom_score_adj = (short)adj;
+	current->signal->oom_score_adj_min = (short)adj;
+	task_unlock(current->group_leader);
+}
+EXPORT_SYMBOL_GPL(krunc_set_oom_score_adj);
 
 /*
  * Mount @fstype (e.g. "proc", "sysfs") from source @dev onto @dir, in the
