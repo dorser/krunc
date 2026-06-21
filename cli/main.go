@@ -299,7 +299,7 @@ func doCreate(root string, flags map[string]string, args []string) {
 	if pf := flags["--pid-file"]; pf != "" {
 		os.WriteFile(pf, []byte(strconv.Itoa(int(c.Pid))), 0644)
 	}
-	fmt.Printf("created %s (pid %d, krunc id %d)\n", id, c.Pid, c.ID)
+	fmt.Fprintf(os.Stderr, "created %s (pid %d, krunc id %d)\n", id, c.Pid, c.ID)
 }
 
 func doStart(root string, args []string) {

@@ -1,7 +1,6 @@
 # build artifacts
 *.o
 *.ko
-*.mod
 *.mod.c
 *.mod.o
 *.cmd
@@ -23,3 +22,7 @@ vmlinux
 # editor
 *.swp
 *~
+
+# go binaries (built on the VM)
+cli/krunc
+conformance/krunc-conformance

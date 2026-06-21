@@ -98,7 +98,17 @@ echo "[vm] krunc delete oci1"
 
 ############################################################################
 echo
-echo "================ DEMO 4: unload the runtime cleanly ================"
+echo "===== DEMO 4: containerd runtime client (go-runc) drives krunc ====="
+echo "[vm] go-runc is the library containerd-shim-runc-v2 uses to call the runtime"
+if [ -x /bin/krunc-conformance ]; then
+	/bin/krunc-conformance /bundle 2>&1 | sed 's/^/[vm]   /'
+else
+	echo "[vm]   (krunc-conformance not built; skipping)"
+fi
+
+############################################################################
+echo
+echo "================ DEMO 5: unload the runtime cleanly ================"
 exec 3>&-                 # close the control device so the module is unused
 if rmmod krunc; then
 	echo "[vm] krunc.ko unloaded cleanly"

@@ -144,26 +144,38 @@ process trying to exit while a paused container still shares its mm. So
 container inherits the caller's stdio.
 
 **containerd.** containerd drives an OCI runtime through
-`containerd-shim-runc-v2`, which `exec`s the runtime binary (configurable via the
-runtime options' `BinaryName`, the same hook crun/youki use) with runc-style
-subcommands on a bundle the shim writes. krunc's CLI implements that surface, so
-the shim can create/start/state/kill/delete a krunc container. The remaining
-gaps are inherent to the **runc shim being coupled to runc's process model**:
+`containerd-shim-runc-v2`, which calls the runtime via the
+`github.com/containerd/go-runc` client and `exec`s the runtime binary
+(configurable via the runtime options' `BinaryName`, the same hook crun/youki
+use) with runc-style subcommands on a bundle the shim writes. krunc's CLI
+implements that surface, and this is **verified**: `conformance/main.go` uses
+`go-runc` itself to drive krunc through `Version → Create (paused) → State
+(created) → Start → State (running) → State (stopped) → Delete` successfully
+(`docs/sample-containerd-run.txt`). One subtlety surfaced and is worth noting:
+the shim/`go-runc` pass explicit task stdio to `create` (non-terminal: the task
+fifos); the container then inherits those, which is exactly what makes its
+output reach containerd. (Without explicit IO, go-runc pipe-captures the
+runtime's output and blocks because the container holds the pipe — so the IO
+must be set, as the shim does.)
 
-- *Exit notification.* The shim expects the container init to be a manageable
-  child it can reap / get a `pidfd` exit event from. A krunc container is
-  kernel-spawned and reparents away from the runtime process, so the shim's exit
-  detection does not see it without extra plumbing (a `pidfd`/exit hook, or a
-  native shim).
+Bringing up the **full containerd daemon** on top of this needs a few more
+pieces, and some remaining gaps:
+
+- *Exit notification.* The shim sets `PR_SET_CHILD_SUBREAPER`, so a krunc
+  container — a descendant of the shim that reparents when the short-lived
+  `krunc create` process exits — reparents to the shim, which can then reap it
+  and emit the task exit event. (This is promising but not yet end-to-end
+  tested with the daemon.)
 - *cgroups & stats.* The shim creates the cgroup and expects the runtime to
   place the container in it; krunc does not honor cgroups yet, so resource
   limits and `metrics`/`stats` are absent.
 - *Console/stdio* for `terminal:true` (console-socket fd passing) is not
   implemented; `terminal:false` works via inherited fds.
 
-The robust path is **Path B**: a native `containerd-shim-krunc-v2` that
-implements the Task ttRPC service and owns these semantics directly, instead of
-impersonating runc. The OCI CLI here is the foundation for either path.
+The robust long-term path is **Path B**: a native `containerd-shim-krunc-v2`
+that implements the Task ttRPC service and owns these semantics directly,
+instead of impersonating runc. The OCI CLI here is the foundation for either
+path.
 
 ## 8. Testing approach
 

@@ -29,6 +29,11 @@ cp "$REPO/scripts/qemu-init.sh" "$ROOT/init"
 cp "$REPO/module/krunc.ko" "$ROOT/krunc.ko"
 cp "$REPO/cli/krunc" "$ROOT/bin/krunc"
 chmod +x "$ROOT/init" "$ROOT/bin/busybox" "$ROOT/bin/krunc"
+# go-runc conformance tool (uses containerd's runtime client library), optional
+if [ -x "$REPO/conformance/krunc-conformance" ]; then
+	cp "$REPO/conformance/krunc-conformance" "$ROOT/bin/krunc-conformance"
+	chmod +x "$ROOT/bin/krunc-conformance"
+fi
 
 # example container rootfs (text interface)
 cp "$BB" "$ROOT/containers/demo/bin/busybox"

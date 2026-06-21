@@ -1,0 +1,45 @@
+=================================================================
+ krunc driven by github.com/containerd/go-runc — the SAME library
+ containerd-shim-runc-v2 uses to invoke an OCI runtime. Captured
+ from the QEMU serial console (DEMO 4).
+=================================================================
+===== DEMO 4: containerd runtime client (go-runc) drives krunc =====
+[vm] go-runc is the library containerd-shim-runc-v2 uses to call the runtime
+[vm]   [go-runc] using github.com/containerd/go-runc (containerd's runtime client)
+[   10.352970] krunc (189) used greatest stack depth: 12560 bytes left
+[vm]   [go-runc] runtime: "1.1.0-krunc" spec: "1.0.2-dev"
+[vm]   created ctr1 (pid 194, krunc id 4)
+[vm]   [go-runc] Create OK (container set up, paused before exec)
+[   10.389227] krunc: started container id=4 pid=194
+[vm]   [go-runc] State after Create: status="created" pid=194
+==================================================================
+[container] Hello from inside a krunc container!
+[container] hostname (UTS namespace) : oci-demo
+[container] my pid   (PID namespace) : 1        <- should be 1
+[container] mounted private /proc
+[container] processes I can see (PID namespace):
+PID   COMMAND
+    1 sh
+    6 ps
+[container] filesystem root (mount ns + chroot):
+bin
+dev
+init.sh
+proc
+sys
+tmp
+[container] network interfaces (NET namespace):
+           lo:
+           sit0@NONE:
+[container] writing a file to prove we have our own rootfs...
+[container] krunc was here
+[container] sleeping briefly so the host can inspect our namespaces...
+[vm]   [go-runc] Start OK (entrypoint exec'd)
+[container] goodbye (PID 1 exiting -> namespaces tear down)
+==================================================================
+[vm]   [go-runc] State after Start: status="running" pid=194
+[   14.426372] krunc: deleted container id=4
+[vm]   [go-runc] State after entrypoint exit: status="stopped" pid=194
+[vm]   [go-runc] Delete OK
+[vm]   [go-runc] SUCCESS: containerd's runtime client drove krunc through the OCI lifecycle
+

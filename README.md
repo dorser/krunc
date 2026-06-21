@@ -116,11 +116,14 @@ runc. A captured standalone lifecycle run is in
 [`docs/sample-oci-run.txt`](docs/sample-oci-run.txt).
 
 This is the API a higher-level runtime expects. **containerd** drives an OCI
-runtime through `containerd-shim-runc-v2`, which `exec`s the runtime binary
-(configurable via the runtime's `BinaryName`). See the *containerd* notes in
-[`docs/DESIGN.md`](docs/DESIGN.md) for how krunc plugs in and the current limits
-(the runc shim is coupled to runc's process model — exit notification, cgroups
-and stats need a native shim or further work).
+runtime through `containerd-shim-runc-v2`, which invokes it via the
+`github.com/containerd/go-runc` client (`BinaryName` selects the binary). This
+is **verified**: `conformance/` uses go-runc — the exact library the shim uses —
+to drive krunc through `Create → State → Start → State → Delete` successfully
+(see [`docs/sample-containerd-run.txt`](docs/sample-containerd-run.txt)).
+Standing up the full containerd daemon needs a bit more (and lacks cgroups/stats
+and tty console for now); see the *containerd* notes in
+[`docs/DESIGN.md`](docs/DESIGN.md).
 
 ## Repository layout
 
@@ -132,6 +135,8 @@ kernel-patch/
   krunc_exports.c      tiny vmlinux shim: krunc_spawn + the primitives krunc needs
 cli/
   main.go              runc/OCI-compatible CLI (create/start/state/kill/delete)
+conformance/
+  main.go              drives krunc via go-runc (containerd's runtime client)
 examples/
   rootfs-skel/init.sh  example container entrypoint (the "app")
   bundle/config.json   example OCI bundle config
@@ -182,10 +187,11 @@ it is not production software. Notable simplifications and known limitations:
   A subset of the OCI `config.json` is honored (args, env, root, hostname,
   namespaces); cgroups, mounts, capabilities, seccomp, devices, hooks and
   user-namespace mapping are not yet.
-- **containerd.** krunc implements the runc/OCI CLI, so the runc shim can
-  create/start/stop a container, but full containerd integration is limited by
-  the shim's coupling to runc's process model (exit notification, cgroups,
-  stats) — a native shim is the clean path. See `docs/DESIGN.md` §7.
+- **containerd.** krunc implements the runc/OCI CLI, and `go-runc` (the library
+  the containerd runc shim uses) drives it through the full lifecycle (verified,
+  see `conformance/`). Standing up the full containerd daemon additionally needs
+  cgroup placement, task-exit wiring and tty console support — or, more cleanly,
+  a native `containerd-shim-krunc-v2`. See `docs/DESIGN.md` §7.
 - **Privilege.** `run`/`create`/`kill` require the caller to be privileged
   (namespace creation needs `CAP_SYS_ADMIN`); there is no per-caller
   authorization beyond the device's file permissions.
