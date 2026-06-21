@@ -1,0 +1,10 @@
+[package]
+name = "krunc-memhog"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0"
+description = "Deterministic cgroup memory.max probe used by the krunc QEMU tests."
+
+[[bin]]
+name = "memhog"
+path = "src/main.rs"

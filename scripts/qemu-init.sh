@@ -111,6 +111,17 @@ if [ "${PEVT_MAX:-0}" -gt 0 ] && [ "$PCUR" = "$PMAX" ]; then
 else
 	echo "[vm]   RESULT: pids.current=$PCUR pids.max=$PMAX denials=${PEVT_MAX:-0} (expected current==max with denials>0)"
 fi
+echo "[vm] ----- cgroup memory limit (host view of the container's cgroup) -----"
+MMAX=$(cat /sys/fs/cgroup/krunc/oci1/memory.max 2>/dev/null)
+MEVT=$(cat /sys/fs/cgroup/krunc/oci1/memory.events 2>/dev/null | tr '\n' ' ')
+MOOMK=$(awk '/^oom_kill /{print $2}' /sys/fs/cgroup/krunc/oci1/memory.events 2>/dev/null)
+echo "[vm]   memory.max    = $MMAX   (= 64 MiB)"
+echo "[vm]   memory.events = $MEVT"
+if [ "${MOOMK:-0}" -gt 0 ]; then
+	echo "[vm]   RESULT: memory cgroup ENFORCED -- kernel OOM-killed ${MOOMK} process(es) at memory.max"
+else
+	echo "[vm]   RESULT: memory.max=$MMAX oom_kill=${MOOMK:-0} (expected oom_kill>0 from memhog)"
+fi
 echo "[vm] krunc kill oci1   (forktest is parked as PID 1; stop the whole tree)"
 /bin/krunc kill oci1 KILL
 sleep 1

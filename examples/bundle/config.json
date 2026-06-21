@@ -35,7 +35,7 @@
       { "type": "network" }
     ],
     "cgroupsPath": "krunc/oci1",
-    "resources": { "pids": { "limit": 16 } },
+    "resources": { "pids": { "limit": 16 }, "memory": { "limit": 67108864 } },
     "maskedPaths": ["/proc/kcore", "/proc/sysrq-trigger"],
     "readonlyPaths": ["/proc/sys", "/etc"],
     "seccomp": {

@@ -200,6 +200,8 @@ pub struct SeccompSyscall {
 pub struct Resources {
     /// pids controller.
     pub pids: Option<Pids>,
+    /// memory controller.
+    pub memory: Option<Memory>,
 }
 
 /// `config.json` `linux.resources.pids`.
@@ -207,6 +209,14 @@ pub struct Resources {
 pub struct Pids {
     /// Maximum number of pids (`pids.max`).
     pub limit: i64,
+}
+
+/// `config.json` `linux.resources.memory` (the subset krunc enforces).
+#[derive(Debug, Deserialize, Default)]
+pub struct Memory {
+    /// Memory usage hard limit in bytes (`memory.max`). A negative value or
+    /// `None` means unlimited.
+    pub limit: Option<i64>,
 }
 
 /// Cgroup configuration extracted for the CLI to apply (userspace configures the
@@ -217,17 +227,21 @@ pub struct CgroupConfig {
     pub path: Option<String>,
     /// `pids.max`, if set.
     pub pids_limit: Option<i64>,
+    /// `memory.max` in bytes, if set (and non-negative).
+    pub memory_limit: Option<i64>,
 }
 
 /// Extract the cgroup configuration from a parsed config.
 pub fn cgroup_config(cfg: &OciConfig) -> CgroupConfig {
     let linux = cfg.linux.as_ref();
+    let resources = linux.and_then(|l| l.resources.as_ref());
     CgroupConfig {
         path: linux.and_then(|l| l.cgroups_path.clone()),
-        pids_limit: linux
-            .and_then(|l| l.resources.as_ref())
-            .and_then(|r| r.pids.as_ref())
-            .map(|p| p.limit),
+        pids_limit: resources.and_then(|r| r.pids.as_ref()).map(|p| p.limit),
+        memory_limit: resources
+            .and_then(|r| r.memory.as_ref())
+            .and_then(|m| m.limit)
+            .filter(|&l| l >= 0),
     }
 }
 
@@ -677,12 +691,24 @@ mod tests {
     fn cgroup_config_extracted() {
         let cfg = parse_config(
             r#"{"process":{"args":["/x"]},"root":{"path":"r"},
-                "linux":{"cgroupsPath":"krunc/c1","resources":{"pids":{"limit":64}}}}"#,
+                "linux":{"cgroupsPath":"krunc/c1","resources":{"pids":{"limit":64},
+                "memory":{"limit":33554432}}}}"#,
         )
         .unwrap();
         let cg = cgroup_config(&cfg);
         assert_eq!(cg.path.as_deref(), Some("krunc/c1"));
         assert_eq!(cg.pids_limit, Some(64));
+        assert_eq!(cg.memory_limit, Some(33554432));
+    }
+
+    #[test]
+    fn cgroup_negative_memory_is_unlimited() {
+        let cfg = parse_config(
+            r#"{"process":{"args":["/x"]},"root":{"path":"r"},
+                "linux":{"resources":{"memory":{"limit":-1}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(cgroup_config(&cfg).memory_limit, None);
     }
 
     #[test]

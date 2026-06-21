@@ -19,26 +19,42 @@ impl Cgroup {
     /// Create the cgroup and apply limits if any are configured. Returns `None`
     /// when there is nothing to enforce.
     pub fn create(id: &str, cfg: &CgroupConfig) -> io::Result<Option<Cgroup>> {
-        let Some(limit) = cfg.pids_limit else {
+        if cfg.pids_limit.is_none() && cfg.memory_limit.is_none() {
             return Ok(None);
-        };
+        }
+        // The set of controllers the leaf needs delegated to it.
+        let mut controllers = String::new();
+        if cfg.pids_limit.is_some() {
+            controllers.push_str("+pids ");
+        }
+        if cfg.memory_limit.is_some() {
+            controllers.push_str("+memory ");
+        }
+        let controllers = controllers.trim_end();
+
         let dir = dir_for(id, cfg);
         fs::create_dir_all(&dir)?;
 
-        // Enable the pids controller on every ancestor's subtree_control so the
-        // leaf cgroup can carry `pids.max` (cgroup-v2 delegation; best-effort).
-        let _ = fs::write(format!("{CG_ROOT}/cgroup.subtree_control"), "+pids");
+        // Enable the controllers on every ancestor's subtree_control so the leaf
+        // cgroup can carry their interface files (cgroup-v2 delegation;
+        // best-effort — a controller absent from the kernel is simply skipped).
+        let _ = fs::write(format!("{CG_ROOT}/cgroup.subtree_control"), controllers);
         let mut cur = PathBuf::from(CG_ROOT);
         for comp in dir.strip_prefix(CG_ROOT).unwrap_or(Path::new("")).components() {
             let next = cur.join(comp);
             if next == dir {
                 break; // don't enable on the leaf itself
             }
-            let _ = fs::write(next.join("cgroup.subtree_control"), "+pids");
+            let _ = fs::write(next.join("cgroup.subtree_control"), controllers);
             cur = next;
         }
 
-        fs::write(dir.join("pids.max"), limit.to_string())?;
+        if let Some(limit) = cfg.pids_limit {
+            fs::write(dir.join("pids.max"), limit.to_string())?;
+        }
+        if let Some(limit) = cfg.memory_limit {
+            fs::write(dir.join("memory.max"), limit.to_string())?;
+        }
         Ok(Some(Cgroup { dir }))
     }
 

@@ -7,7 +7,7 @@ REPO="${REPO:-$HOME/krunc}"
 source "$HOME/.cargo/env" 2>/dev/null || true
 cd "$REPO/userspace"
 rustup target add x86_64-unknown-linux-musl >/dev/null 2>&1 || true
-cargo build --release --target x86_64-unknown-linux-musl -p krunc-cli -p krunc-forktest
+cargo build --release --target x86_64-unknown-linux-musl -p krunc-cli -p krunc-forktest -p krunc-memhog
 BIN="target/x86_64-unknown-linux-musl/release/krunc"
 echo "==> built: $BIN"
 ls -l "$BIN"
@@ -15,3 +15,6 @@ file "$BIN" 2>/dev/null || true
 FORKTEST="target/x86_64-unknown-linux-musl/release/forktest"
 echo "==> built: $FORKTEST"
 ls -l "$FORKTEST"
+MEMHOG="target/x86_64-unknown-linux-musl/release/memhog"
+echo "==> built: $MEMHOG"
+ls -l "$MEMHOG"

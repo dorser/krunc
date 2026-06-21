@@ -61,6 +61,13 @@ if [ -x "$FORKTEST" ]; then
 	chmod +x "$ROOT/bundle/rootfs/bin/forktest"
 fi
 
+# deterministic cgroup memory.max probe (allocates until OOM-killed; see krunc-memhog)
+MEMHOG="$REPO/userspace/target/x86_64-unknown-linux-musl/release/memhog"
+if [ -x "$MEMHOG" ]; then
+	cp "$MEMHOG" "$ROOT/bundle/rootfs/bin/memhog"
+	chmod +x "$ROOT/bundle/rootfs/bin/memhog"
+fi
+
 # device nodes (need root)
 sudo mknod -m 600 "$ROOT/dev/console" c 5 1
 sudo mknod -m 666 "$ROOT/dev/null"    c 1 3
