@@ -69,6 +69,14 @@ extern "C" {
     /// capability sets to `cap_mask` (0 = leave untouched) and optionally set
     /// no_new_privs.
     fn krunc_apply_creds(cap_mask: u64, no_new_privs: c_int) -> c_int;
+    /// Mount `fstype` from `dev` onto `dir` in the current task's mount
+    /// namespace (e.g. a fresh /proc for the container).
+    fn krunc_mount(
+        dev: *const c_char,
+        dir: *const c_char,
+        fstype: *const c_char,
+        flags: c_ulong,
+    ) -> c_int;
     // msleep() is exported by mainline.
     fn msleep(msecs: c_uint);
 }
@@ -753,6 +761,26 @@ unsafe extern "C" fn container_entry(arg: *mut c_void) -> c_int {
                 _ => break,
             }
         }
+    }
+
+    // Mount a private /proc (and best-effort /sys) for the container, while
+    // still privileged, in its CLONE_NEWNS mount namespace. The confined
+    // container itself cannot do this once capabilities are dropped, so the
+    // kernel sets it up here.
+    // SAFETY: FFI calls into the vmlinux helper with NUL-terminated C strings.
+    unsafe {
+        krunc_mount(
+            c"proc".as_ptr() as *const c_char,
+            c"/proc".as_ptr() as *const c_char,
+            c"proc".as_ptr() as *const c_char,
+            0,
+        );
+        krunc_mount(
+            c"sysfs".as_ptr() as *const c_char,
+            c"/sys".as_ptr() as *const c_char,
+            c"sysfs".as_ptr() as *const c_char,
+            0,
+        );
     }
 
     // Privilege confinement, applied atomically in kernel context just before

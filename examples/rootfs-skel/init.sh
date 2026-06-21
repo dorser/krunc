@@ -13,17 +13,17 @@ echo "[container] Hello from inside a krunc container!"
 echo "[container] hostname (UTS namespace) : $(hostname)"
 echo "[container] my pid   (PID namespace) : $$        <- should be 1"
 
-# Mounting /proc needs CAP_SYS_ADMIN. In a confined container it will (correctly)
-# fail - which itself demonstrates the capability drop.
-if mount -t proc proc /proc 2>&-; then
-	echo "[container] mounted private /proc"
+# The kernel mounts a private /proc for us (before dropping privileges), so even
+# a fully confined container has one without needing CAP_SYS_ADMIN itself.
+if [ -r /proc/self/status ]; then
+	echo "[container] /proc available (kernel-mounted)"
 	echo "[container] CapBnd=$(awk '/^CapBnd:/{print $2}' /proc/self/status)" \
 	     "CapEff=$(awk '/^CapEff:/{print $2}' /proc/self/status)" \
 	     "NoNewPrivs=$(awk '/^NoNewPrivs:/{print $2}' /proc/self/status)"
 	echo "[container] processes I can see (PID namespace):"
 	ps -o pid,comm 2>&- || ps 2>&-
 else
-	echo "[container] /proc mount denied -> no CAP_SYS_ADMIN: we are confined"
+	echo "[container] /proc not available"
 fi
 
 echo "[container] filesystem root (mount ns + chroot):"

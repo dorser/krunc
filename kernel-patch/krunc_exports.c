@@ -45,7 +45,14 @@ int krunc_set_hostname(const char *name, size_t len);
 int krunc_chroot(const char *path);
 int krunc_kill(pid_t nr, int sig);
 int krunc_apply_creds(u64 cap_mask, int no_new_privs);
+int krunc_mount(const char *dev, const char *dir, const char *fstype,
+		unsigned long flags);
 pid_t krunc_spawn(int (*fn)(void *), void *arg, unsigned long flags);
+
+/* path_mount() is non-static (fs/internal.h) but not in a public header; declare
+ * it here. The shim is built into vmlinux, so it may call non-exported symbols. */
+int path_mount(const char *dev_name, const struct path *path,
+	       const char *type_page, unsigned long flags, void *data_page);
 
 /* Re-export existing primitives that mainline keeps internal. */
 EXPORT_SYMBOL_GPL(user_mode_thread);
@@ -174,3 +181,24 @@ int krunc_apply_creds(u64 cap_mask, int no_new_privs)
 	return 0;
 }
 EXPORT_SYMBOL_GPL(krunc_apply_creds);
+
+/*
+ * Mount @fstype (e.g. "proc", "sysfs") from source @dev onto @dir, in the
+ * *current* task's mount namespace. Used by the container init (which has a
+ * private CLONE_NEWNS mount namespace) to set up a fresh /proc and /sys before
+ * dropping privileges. @dir is resolved relative to the (already chrooted) root.
+ */
+int krunc_mount(const char *dev, const char *dir, const char *fstype,
+		unsigned long flags)
+{
+	struct path target;
+	int err;
+
+	err = kern_path(dir, LOOKUP_FOLLOW | LOOKUP_DIRECTORY, &target);
+	if (err)
+		return err;
+	err = path_mount(dev, &target, fstype, flags, NULL);
+	path_put(&target);
+	return err;
+}
+EXPORT_SYMBOL_GPL(krunc_mount);
