@@ -95,11 +95,16 @@ not in one shot.
 - **M2 (partial) done** — the kernel consumes the versioned **binary** ABI
   (strict, bounds-checked, no JSON in kernel); two-phase create/start. (The full
   `Domain` typestate object + `domainfd` handle are still to come.)
-- **M4 (partial) done** — the kernel applies the **capability bounding set +
-  `no_new_privs`** atomically before exec. Host-verified in QEMU: the OCI
-  container has `CapBnd=CapEff=CapPrm=00000000200004e1` (exactly the 6 bounded
-  caps) and `NoNewPrivs=1`, vs `000001ffffffffff`/`0` for the unconfined
-  text-interface container. See `docs/sample-v2-confinement.txt`.
+- **M4 (done) — privilege confinement.** The kernel applies the **five capability
+  sets + `no_new_privs`** atomically before exec, plus **rlimits and
+  `oomScoreAdj`**. Each capability set is applied *exactly* as the OCI config
+  specifies — effective/permitted/inheritable/ambient default to empty rather
+  than silently equalling the bounding set. Host-verified in QEMU: the OCI
+  container shows `CapBnd=00000000200004e1` (6 bounded) with
+  `CapEff=CapPrm=0` (none granted) and `NoNewPrivs=1`, vs `000001ffffffffff`/`0`
+  for the unconfined text container; `RLIMIT_NOFILE=256/512` and
+  `oom_score_adj=-500` confirmed via `/proc/<pid>/{limits,oom_score_adj}`. See
+  `docs/sample-v2-confinement.txt`.
 - **M3 (partial) done** — the kernel mounts a private `/proc` + `/sys` for the
   container in-kernel (via `path_mount`) before dropping privileges, so even a
   confined container has them. **maskedPaths + readonlyPaths** are now also
@@ -125,6 +130,8 @@ not in one shot.
   Host-verified in QEMU: a `chmod` (needs no capability on an owned path) returns
   `EPERM`, and `/proc/<pid>/status` shows `Seccomp: 2` (filter mode), with no
   kernel warnings.
-- **Next:** M3 remainder (pivot_root + general `mounts[]`), M7 user-ns mapping +
-  Landlock, M8 lifetime enforcement, M9 conformance, M10 containerd, then the
-  full `Domain` typestate object + domainfd.
+- **Next:** M3 remainder — **`pivot_root`** (replacing chroot; also the prerequisite
+  for enforcing `root.readonly`, which a chroot-based bind cannot do safely) and
+  the general `mounts[]` list; then M7 user-ns mapping + Landlock, M8 lifetime
+  enforcement (BPF-LSM), M9 conformance, M10 containerd, and the full `Domain`
+  typestate object + domainfd.
