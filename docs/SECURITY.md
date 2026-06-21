@@ -91,9 +91,10 @@ verifies from the host** (see `docs/sample-v2-confinement.txt`):
 | cgroup v2 `pids` | done | kernel denies forks; `pids.current==pids.max` |
 | cgroup v2 `memory` | done | memhog past `memory.max` → memcg OOM kill; `memory.events oom_kill 1` |
 | cgroup v2 `cpu` | done | cpuhog under `cpu.max` throttled; `cpu.stat nr_throttled` climbs |
-| `pivot_root` (replacing chroot) + `root.readonly` + sysctls | planned | (chroot-based read-only rootfs leaks the shared superblock; needs `pivot_root`) |
+| `pivot_root` (replacing chroot) + sysctls | planned | (chroot-based read-only rootfs leaks the shared superblock; superseded for immutability by Landlock) |
 | user-ns uid/gid mapping | planned | — |
-| Landlock seal + BPF-LSM active kill-on-escape | planned | — |
+| **Landlock** sealed fs domain (immutable rootfs) | done | container: `write to /`→DENIED, `write to /tmp`→ALLOWED |
+| BPF-LSM active kill-on-escape | planned | — |
 
 Everything marked *done* is applied **atomically in kernel context before the
 first userspace instruction** and (for the sealed controls) holds for the

@@ -137,8 +137,17 @@ not in one shot.
   Host-verified in QEMU: a `chmod` (needs no capability on an owned path) returns
   `EPERM`, and `/proc/<pid>/status` shows `Seccomp: 2` (filter mode), with no
   kernel warnings.
-- **Next:** M3 remainder — **`pivot_root`** (replacing chroot; also the prerequisite
-  for enforcing `root.readonly`, which a chroot-based bind cannot do safely) and
-  the general `mounts[]` list; then M7 user-ns mapping + Landlock, M8 lifetime
-  enforcement (BPF-LSM), M9 conformance, M10 containerd, and the full `Domain`
-  typestate object + domainfd.
+- **M7 (done) — Landlock sealed fs domain.** When `root.readonly` is set, krunc
+  derives a Landlock policy that handles the write/create/remove access rights but
+  grants them only beneath the writable mounts (tmpfs/rw binds) plus `/dev`, and
+  seals it on the container via an in-tree helper (`krunc_landlock_restrict_writes`
+  in `security/landlock/syscalls.c`, applied by `scripts/patch-kernel-seccomp.sh`),
+  after `no_new_privs`. Read/execute stay unrestricted, so the container has an
+  **immutable rootfs with writable scratch** — the kernel's own sealed,
+  inherited-across-exec, monotonic domain (the closest existing analog to the
+  `krunc_domain` vision), and it achieves the immutability that a chroot-based
+  `root.readonly` cannot. Host-verified in QEMU: the container's `touch /` is
+  **denied**, `touch /tmp` is **allowed**.
+- **Next:** M3 remainder (`pivot_root`, sysctls); M7 user-ns id mapping; M8 lifetime
+  enforcement (BPF-LSM kill-on-escape); M9 conformance; M10 containerd; and the full
+  `Domain` typestate object + domainfd.
