@@ -115,12 +115,13 @@ not in one shot.
   Host-verified in QEMU: `/proc/kcore` reads 0 bytes, `/proc/sysrq-trigger`
   writes are inert, and writes to `/etc` and `/proc/sys` fail with `EROFS`.
   (Full `pivot_root` and the general `mounts[]` list are still to come.)
-- **M6 (partial) done** — **cgroup v2 `pids`** controller: the CLI creates the
-  cgroup, sets `pids.max`, and places the container; the kernel enforces it.
-  Host-verified deterministically with `krunc-forktest` (a `fork(2)` probe):
-  `pids.current` pins at `pids.max=16`, the kernel denies further forks
-  (`pids.events max > 0`). Memory/cpu controllers and `MEMCG` (needs a kernel
-  rebuild) are still to come.
+- **M6 (done) — cgroup v2.** The CLI creates the cgroup, sets limits, and places
+  the container; the kernel enforces them. Two controllers, each verified
+  deterministically: **pids** (`krunc-forktest` — `pids.current` pins at
+  `pids.max=16`, the kernel denies further forks) and **memory** (`krunc-memhog`
+  — allocating past `memory.max=64 MiB` triggers the memcg OOM killer:
+  `Memory cgroup out of memory: Killed process … (memhog)`, `memory.events
+  oom_kill 1`). cpu/io controllers are still to come.
 - **M5 (done) — seccomp.** The CLI compiles the OCI `linux.seccomp` policy into a
   classic-BPF `sock_filter[]` program (`krunc-oci::seccomp`, full x86-64 syscall
   table, 4 unit tests); the kernel installs it on the container **after**

@@ -88,6 +88,7 @@ verifies from the host** (see `docs/sample-v2-confinement.txt`):
 | `maskedPaths` + `readonlyPaths` | done | `/proc/kcore`→0 bytes; `/etc`,`/proc/sys` `EROFS` |
 | seccomp (OCI→BPF, installed after `no_new_privs`) | done | `chmod`→`EPERM`; `Seccomp: 2` (filter) |
 | cgroup v2 `pids` | done | kernel denies forks; `pids.current==pids.max` |
+| cgroup v2 `memory` | done | memhog past `memory.max` → memcg OOM kill; `memory.events oom_kill 1` |
 | `pivot_root` (replacing chroot) + `root.readonly` + general `mounts[]` | planned | (chroot-based read-only rootfs leaks the shared superblock; needs `pivot_root`) |
 | user-ns uid/gid mapping | planned | — |
 | Landlock seal + BPF-LSM active kill-on-escape | planned | — |

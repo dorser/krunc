@@ -20,7 +20,7 @@
 
 ================ DEMO 1: launch an isolated container ================
 [vm] echo "run rootfs=/containers/demo host=krunc-demo exec=/bin/sh arg=/init.sh" > /dev/krunc
-[    2.981397] krunc: started container id=1 pid=85
+[    2.937786] krunc: started container id=1 pid=84
 ==================================================================
 [container] Hello from inside a krunc container!
 [container] hostname (UTS namespace) : krunc-demo
@@ -42,30 +42,28 @@ tmp
 1: lo: <LOOPBACK> mtu 65536 qdisc noop qlen 1000\    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00
 2: sit0@NONE: <NOARP> mtu 1480 qdisc noop qlen 1000\    link/sit 0.0.0.0 brd 0.0.0.0
 [container] sleeping briefly so the host can inspect our namespaces...
-[    3.996019] cat (95) used greatest stack depth: 13152 bytes left
-[vm] container started with host-visible pid: 85
-[vm] --- namespace isolation (host view of pid 85) ---
-[vm]   pid: ISOLATED  (host pid:[4026531836] vs container pid:[4026532167])
-[vm]   mnt: ISOLATED  (host mnt:[4026531832] vs container mnt:[4026532164])
-[vm]   uts: ISOLATED  (host uts:[4026531838] vs container uts:[4026532165])
-[vm]   ipc: ISOLATED  (host ipc:[4026531839] vs container ipc:[4026532166])
-[vm]   net: ISOLATED  (host net:[4026531833] vs container net:[4026532168])
+[vm] container started with host-visible pid: 84
+[vm] --- namespace isolation (host view of pid 84) ---
+[vm]   pid: ISOLATED  (host pid:[4026531836] vs container pid:[4026532168])
+[vm]   mnt: ISOLATED  (host mnt:[4026531832] vs container mnt:[4026532165])
+[vm]   uts: ISOLATED  (host uts:[4026531838] vs container uts:[4026532166])
+[vm]   ipc: ISOLATED  (host ipc:[4026531839] vs container ipc:[4026532167])
+[vm]   net: ISOLATED  (host net:[4026531833] vs container net:[4026532169])
 [container] goodbye (PID 1 exiting -> namespaces tear down)
 ==================================================================
-[    6.095860] sh (85) used greatest stack depth: 12552 bytes left
 
 ============ DEMO 2: launch + kill a long-running container ============
 [vm] echo "run rootfs=/containers/demo host=sleeper exec=/bin/busybox arg=sleep arg=600" > /dev/krunc
-[    6.103537] krunc: started container id=2 pid=107
+[    6.062448] krunc: started container id=2 pid=107
 [vm] container table:
 [vm]   ID    PID      STATE    HOSTNAME
-[vm]   1     85       exited   krunc-demo
+[vm]   1     84       exited   krunc-demo
 [vm]   2     107      running  sleeper
 [vm] stopping sleeper (pid 107): echo "kill 107" > /dev/krunc
-[    7.123132] krunc: killed container pid 107
+[    7.083394] krunc: killed container pid 107
 [vm] container table after kill:
 [vm]   ID    PID      STATE    HOSTNAME
-[vm]   1     85       exited   krunc-demo
+[vm]   1     84       exited   krunc-demo
 
 ====== DEMO 3: OCI lifecycle via the all-Rust krunc CLI + confinement ======
 [vm] krunc --version:
@@ -73,14 +71,14 @@ tmp
 [vm]   commit: krunc-poc
 [vm]   spec: 1.0.2-dev
 [vm] krunc create oci1 --bundle /bundle   (sets up + blocks before exec)
-created oci1 (pid 119, krunc id 3)
-[    7.204857] krunc (118) used greatest stack depth: 11584 bytes left
+created oci1 (pid 118, krunc id 3)
+[    7.189474] krunc (117) used greatest stack depth: 11592 bytes left
 [vm] krunc state oci1   (expect: created)
 [vm]     "id": "oci1",
 [vm]     "status": "created",
-[vm]     "pid": 119,
+[vm]     "pid": 118,
 [vm] krunc start oci1   (releases the paused init -> execs the entrypoint)
-[    7.242385] krunc: started container id=3 pid=119
+[    7.229685] krunc: started container id=3 pid=118
 ==================================================================
 [container] Hello from inside a krunc container!
 [container] hostname (UTS namespace) : oci-demo
@@ -113,14 +111,113 @@ tmp
 [container]   RLIMIT_NOFILE (ulimit -n) = 256  (config soft=256)
 [container] --- user (process.user) ---
 [container]   running as uid:gid = 65534:65534  (config requests 65534:65534)
+[container] --- memory cgroup limit (memory.max) ---
+[container]   memhog allocates until the cgroup OOM-kills it (config max=64 MiB):
+[memhog] resident 8 MiB
+[memhog] resident 16 MiB
+[memhog] resident 24 MiB
+[memhog] resident 32 MiB
+[memhog] resident 40 MiB
+[memhog] resident 48 MiB
+[memhog] resident 56 MiB
+[    7.507868] memhog invoked oom-killer: gfp_mask=0xcc0(GFP_KERNEL), order=0, oom_score_adj=-500
+[    7.508894] CPU: 0 UID: 65534 PID: 139 Comm: memhog Tainted: G           O        6.18.0 #14 PREEMPT(voluntary) 
+[    7.509068] Tainted: [O]=OOT_MODULE
+[    7.509083] Hardware name: QEMU Ubuntu 24.04 PC v2 (i440FX + PIIX, arch_caps fix, 1996), BIOS 1.16.3-debian-1.16.3-2 04/01/2014
+[    7.509212] Call Trace:
+[    7.509840]  <TASK>
+[    7.510018]  dump_stack_lvl+0x3e/0xb0
+[    7.510435]  dump_header+0x43/0x190
+[    7.510458]  oom_kill_process+0x1e2/0x2c0
+[    7.510470]  out_of_memory+0x3a9/0x570
+[    7.510482]  try_charge_memcg+0x466/0x670
+[    7.510505]  __mem_cgroup_charge+0x3d/0xc0
+[    7.510516]  handle_mm_fault+0x9c1/0x1410
+[    7.510540]  do_user_addr_fault+0x1f6/0x7d0
+[    7.510556]  exc_page_fault+0x62/0xa0
+[    7.510570]  asm_exc_page_fault+0x26/0x30
+[    7.510685] RIP: 0033:0x7ff5fd69e6c0
+[    7.510885] Code: 00 80 00 be 01 00 00 00 ff 15 4c 55 06 00 48 85 c0 0f 84 e3 01 00 00 49 89 c5 48 c7 c0 00 f0 ff ff 66 0f 1f 84 00 00 00 00 00 <41> c6 84 05 00 10 00 00 a5 41 c6 84 05 00 20 00 00 a5 41 c6 84 05
+[    7.510963] RSP: 002b:00007ffc58412ea0 EFLAGS: 00000287
+[    7.511000] RAX: 0000000000777000 RBX: 0000000000000007 RCX: 000000000000003f
+[    7.511014] RDX: 00000000000800ff RSI: 0000000000800fc0 RDI: 0000555570edf2e8
+[    7.511027] RBP: 00007ffc58412ed8 R08: 0000000000000fec R09: 0000000000800000
+[    7.511039] R10: 00007ff5f9e83ffc R11: 0000000000000009 R12: 00007ff5fd68ba40
+[    7.511052] R13: 00007ff5f96830a0 R14: 0000000003800000 R15: 0000000003800000
+[    7.511100]  </TASK>
+[    7.514823] memory: usage 65536kB, limit 65536kB, failcnt 19
+[    7.514996] swap: usage 0kB, limit 9007199254740988kB, failcnt 0
+[    7.515161] Memory cgroup stats for /krunc/oci1:
+[    7.516184] anon 66695168
+[    7.516502] file 0
+[    7.516566] kernel 278528
+[    7.516638] kernel_stack 16384
+[    7.516719] pagetables 0
+[    7.516788] sec_pagetables 0
+[    7.516865] percpu 600
+[    7.516929] sock 0
+[    7.516985] vmalloc 4096
+[    7.517055] shmem 0
+[    7.517113] file_mapped 0
+[    7.517184] file_dirty 0
+[    7.517312] file_writeback 0
+[    7.517399] swapcached 0
+[    7.517469] inactive_anon 66629632
+[    7.517558] active_anon 8192
+[    7.517635] inactive_file 0
+[    7.517710] active_file 0
+[    7.517780] unevictable 0
+[    7.517850] slab_reclaimable 6400
+[    7.517937] slab_unreclaimable 26760
+[    7.518030] slab 33160
+[    7.518094] workingset_refault_anon 0
+[    7.518190] workingset_refault_file 0
+[    7.518370] workingset_activate_anon 0
+[    7.518474] workingset_activate_file 0
+[    7.518576] workingset_restore_anon 0
+[    7.518672] workingset_restore_file 0
+[    7.518767] workingset_nodereclaim 0
+[    7.518860] pgdemote_kswapd 0
+[    7.518939] pgdemote_direct 0
+[    7.519019] pgdemote_khugepaged 0
+[    7.519105] pgdemote_proactive 0
+[    7.519190] pgscan 0
+[    7.519311] pgsteal 0
+[    7.519384] pswpin 0
+[    7.519446] pswpout 0
+[    7.519508] pgscan_kswapd 0
+[    7.519583] pgscan_direct 0
+[    7.519657] pgscan_khugepaged 0
+[    7.519739] pgscan_proactive 0
+[    7.519820] pgsteal_kswapd 0
+[    7.519897] pgsteal_direct 0
+[    7.519973] pgsteal_khugepaged 0
+[    7.520059] pgsteal_proactive 0
+[    7.520141] pgfault 17131
+[    7.520212] pgmajfault 0
+[    7.520346] pgrefill 0
+[    7.520417] pgactivate 0
+[    7.520486] pgdeactivate 0
+[    7.520558] pglazyfree 0
+[    7.520627] pglazyfreed 0
+[    7.520697] swpin_zero 0
+[    7.520766] swpout_zero 0
+[    7.520894] Tasks state (memory values in pages):
+[    7.521024] [  pid  ]   uid  tgid total_vm      rss rss_anon rss_file rss_shmem pgtables_bytes swapents oom_score_adj name
+[    7.521528] [    118] 65534   118      601      418        0        0       418    40960        0          -500 sh
+[    7.521854] [    139] 65534   139    16550    16292    16256        0        36   163840        0          -500 memhog
+[    7.522147] oom-kill:constraint=CONSTRAINT_MEMCG,nodemask=(null),cpuset=/,mems_allowed=0,oom_memcg=/krunc/oci1,task_memcg=/krunc/oci1,task=memhog,pid=139,uid=65534
+[    7.523216] Memory cgroup out of memory: Killed process 139 (memhog) total-vm:66200kB, anon-rss:65024kB, file-rss:0kB, shmem-rss:144kB, UID:65534 pgtables:160kB oom_score_adj:-500
+Killed
+[container]   memhog returned -- it was OOM-killed by the cgroup at memory.max
 [container] my cgroup: 0::/krunc/oci1
 [container] pids test: forktest will fork until the cgroup pids.max stops it
-[    7.374888] cgroup: fork rejected by pids controller in /krunc/oci1
+[    7.565028] cgroup: fork rejected by pids controller in /krunc/oci1
 [forktest] started 15 children, fork denied 3x (errno=11)
 [vm] krunc state oci1   (expect: running)
 [vm]     "status": "running",
-[vm]     "pid": 119,
-[vm] ----- kernel-applied confinement, host view of /proc/119/status -----
+[vm]     "pid": 118,
+[vm] ----- kernel-applied confinement, host view of /proc/118/status -----
 [vm]   Uid:	65534	65534	65534	65534
 [vm]   Gid:	65534	65534	65534	65534
 [vm]   CapPrm:	0000000000000000
@@ -136,14 +233,18 @@ tmp
 [vm]   pids.current = 16   (forktest tried to fork past the limit; the kernel capped it)
 [vm]   pids.events  = max 3    (max = number of forks the kernel denied)
 [vm]   RESULT: pids cgroup ENFORCED -- kernel denied 3 forks; pids.current pinned at pids.max=16
+[vm] ----- cgroup memory limit (host view of the container's cgroup) -----
+[vm]   memory.max    = 67108864   (= 64 MiB)
+[vm]   memory.events = low 0 high 0 max 19 oom 1 oom_kill 1 oom_group_kill 0 
+[vm]   RESULT: memory cgroup ENFORCED -- kernel OOM-killed 1 process(es) at memory.max
 [vm] krunc kill oci1   (forktest is parked as PID 1; stop the whole tree)
 [vm] krunc state oci1   (after kill, expect: stopped)
 [vm]     "status": "stopped",
 [vm] krunc list:
 [vm]   ID                   STATUS     PID      BUNDLE
-[vm]   oci1                 stopped    119      /bundle
+[vm]   oci1                 stopped    118      /bundle
 [vm] krunc delete oci1
-[   11.373833] krunc: deleted container id=3
+[   11.386412] krunc: deleted container id=3
 
 ================ DEMO 4: unload the runtime cleanly ================
 [vm] krunc.ko unloaded cleanly
