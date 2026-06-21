@@ -90,6 +90,11 @@ const CLONE_NEWNET: c_ulong = 0x4000_0000;
 const SIGCHLD: c_ulong = 17;
 const SIGKILL: c_int = 9;
 
+// mount(2) flags (uapi/linux/mount.h) used for path confinement.
+const MS_RDONLY: c_ulong = 1;
+const MS_REMOUNT: c_ulong = 32;
+const MS_BIND: c_ulong = 4096;
+
 const ALL_NS: c_ulong =
     CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWNET;
 
@@ -161,6 +166,8 @@ struct ContainerCtx {
     envp: KVec<KVec<u8>>,      // each NUL-terminated; empty -> default env
     cap_bounding: u64,         // capability ceiling to apply (0 = leave untouched)
     no_new_privs: bool,        // set no_new_privs before exec
+    masked: KVec<KVec<u8>>,    // paths over-mounted to be inaccessible (each NUL-terminated)
+    readonly: KVec<KVec<u8>>,  // paths remounted read-only (each NUL-terminated)
     ctrl: Option<Arc<ContainerControl>>, // Some -> two-phase (created) container
 }
 
@@ -378,7 +385,18 @@ fn handle_text_command(buf: &[u8]) -> Result {
     }
     // `run …` (one-shot: created and started immediately)
     let (hostname, rootfs, argv, envp, flags) = parse_run_line(line)?;
-    let (id, pid) = spawn(hostname, rootfs, argv, envp, flags, false, 0, false)?;
+    let (id, pid) = spawn(
+        hostname,
+        rootfs,
+        argv,
+        envp,
+        flags,
+        false,
+        0,
+        false,
+        KVec::new(),
+        KVec::new(),
+    )?;
     pr_info!("started container id={} pid={}\n", id, pid);
     Ok(())
 }
@@ -562,6 +580,8 @@ struct DecodedSpec {
     ns: u32,
     cap_bounding: u64,
     flags: u64,
+    masked: KVec<KVec<u8>>,
+    readonly: KVec<KVec<u8>>,
 }
 
 fn read_strvec_k(sr: &mut BReader<'_>) -> Result<KVec<KVec<u8>>> {
@@ -607,6 +627,8 @@ fn decode_spec(buf: &[u8]) -> Result<DecodedSpec> {
         ns: 0,
         cap_bounding: 0,
         flags: 0,
+        masked: KVec::new(),
+        readonly: KVec::new(),
     };
     for _ in 0..count {
         let tag = r.u16()?;
@@ -625,6 +647,8 @@ fn decode_spec(buf: &[u8]) -> Result<DecodedSpec> {
             5 => d.ns = sr.u32()?,                 // NAMESPACES
             8 => d.flags = sr.u64()?,              // FLAGS
             9 => d.cap_bounding = sr.u64()?,       // CAP_BOUNDING
+            11 => d.masked = read_strvec_k(&mut sr)?, // MASKED_PATHS
+            12 => d.readonly = read_strvec_k(&mut sr)?, // RO_PATHS
             // tags 6/7 (uid/gid maps) and 10 (seccomp) land in later milestones.
             _ => {}
         }
@@ -663,6 +687,8 @@ fn create_from_blob(spec: &[u8]) -> Result<(u64, i32)> {
         true,
         d.cap_bounding,
         no_new_privs,
+        d.masked,
+        d.readonly,
     )
 }
 
@@ -677,6 +703,8 @@ fn spawn(
     paused: bool,
     cap_bounding: u64,
     no_new_privs: bool,
+    masked: KVec<KVec<u8>>,
+    readonly: KVec<KVec<u8>>,
 ) -> Result<(u64, i32)> {
     let ctrl = if paused {
         Some(Arc::new(
@@ -700,6 +728,8 @@ fn spawn(
             envp,
             cap_bounding,
             no_new_privs,
+            masked,
+            readonly,
             ctrl: ctrl.as_ref().map(|a| a.clone()),
         },
         GFP_KERNEL,
@@ -729,6 +759,52 @@ fn spawn(
         GFP_KERNEL,
     )?;
     Ok((id, pid))
+}
+
+/// Apply filesystem confinement in the container's (CLONE_NEWNS) mount
+/// namespace: mask each `masked` path and remount each `readonly` path
+/// read-only. Best-effort and total — a path that does not exist is skipped,
+/// matching the OCI runtime semantics. Because the over-mounts live in the
+/// container's own mount namespace and are installed while privileged, a later
+/// compromised workload (with dropped capabilities) cannot remove them.
+fn apply_path_confinement(masked: &KVec<KVec<u8>>, readonly: &KVec<KVec<u8>>) {
+    let devnull = c"/dev/null".as_ptr() as *const c_char;
+    let tmpfs = c"tmpfs".as_ptr() as *const c_char;
+
+    for i in 0..masked.len() {
+        let p = &masked[i];
+        if p.len() <= 1 {
+            continue; // empty / just the NUL terminator
+        }
+        let path = p.as_ptr() as *const c_char;
+        // Bind /dev/null over the target (the file case: reads see nothing,
+        // writes are inert). SAFETY: all pointers are NUL-terminated C strings
+        // valid for the call; the helper only reads them.
+        let rc = unsafe { krunc_mount(devnull, path, ptr::null(), MS_BIND) };
+        if rc != 0 {
+            // The target is likely a directory: overlay an empty read-only
+            // tmpfs instead. SAFETY: as above.
+            unsafe { krunc_mount(tmpfs, path, tmpfs, MS_RDONLY) };
+        }
+    }
+
+    for i in 0..readonly.len() {
+        let p = &readonly[i];
+        if p.len() <= 1 {
+            continue;
+        }
+        let path = p.as_ptr() as *const c_char;
+        // A bind and a flag change cannot be combined in one mount(2): first
+        // bind the path onto itself, then remount it read-only.
+        // SAFETY: `path` is a NUL-terminated C string valid for both calls.
+        let rc = unsafe { krunc_mount(path, path, ptr::null(), MS_BIND) };
+        if rc == 0 {
+            // SAFETY: as above.
+            unsafe {
+                krunc_mount(ptr::null(), path, ptr::null(), MS_REMOUNT | MS_BIND | MS_RDONLY)
+            };
+        }
+    }
 }
 
 /// The container's PID 1, run in kernel context inside the new namespaces.
@@ -782,6 +858,13 @@ unsafe extern "C" fn container_entry(arg: *mut c_void) -> c_int {
             0,
         );
     }
+
+    // Filesystem confinement, applied while still privileged so a compromised
+    // workload cannot undo it later (it lives in the container's mount namespace
+    // and outlives setup): mask sensitive paths and remount others read-only.
+    // These neutralise classic post-setup escape vectors (e.g. writing
+    // /proc/sysrq-trigger or /proc/sys/kernel/core_pattern).
+    apply_path_confinement(&ctx.masked, &ctx.readonly);
 
     // Privilege confinement, applied atomically in kernel context just before
     // exec: the capability ceiling + no_new_privs are in force for the very

@@ -39,6 +39,9 @@ pub const MAX_MAPS: usize = 340;
 /// Maximum size of an opaque seccomp program blob.
 pub const MAX_SECCOMP: usize = 64 * 1024;
 
+/// Maximum number of masked or read-only path entries.
+pub const MAX_PATHS: usize = 256;
+
 // ---- clone(2) namespace flags (uapi/linux/sched.h) ----
 /// `CLONE_NEWNS` — mount namespace.
 pub const NS_MOUNT: u32 = 0x0002_0000;
@@ -131,6 +134,12 @@ pub struct DomainSpec {
     /// Opaque compiled seccomp program (a `struct sock_filter[]` blob). Empty =
     /// no seccomp.
     pub seccomp: Vec<u8>,
+    /// Paths made inaccessible inside the container (over-mounted so reads see
+    /// nothing and writes are inert). Enforced for the container's whole life by
+    /// its mount namespace.
+    pub masked_paths: Vec<String>,
+    /// Paths remounted read-only inside the container. Enforced for life.
+    pub readonly_paths: Vec<String>,
 }
 
 // Section tags. Stable wire identifiers; never reuse a value.
@@ -145,6 +154,8 @@ mod tag {
     pub const FLAGS: u16 = 8;
     pub const CAP_BOUNDING: u16 = 9;
     pub const SECCOMP: u16 = 10;
+    pub const MASKED_PATHS: u16 = 11;
+    pub const RO_PATHS: u16 = 12;
 }
 
 /// Errors from encoding or (strict) decoding.
@@ -314,6 +325,12 @@ impl DomainSpec {
         if !self.seccomp.is_empty() {
             emit(tag::SECCOMP, &mut |w| w.bytes(&self.seccomp));
         }
+        if !self.masked_paths.is_empty() {
+            emit(tag::MASKED_PATHS, &mut |w| write_strvec(w, &self.masked_paths));
+        }
+        if !self.readonly_paths.is_empty() {
+            emit(tag::RO_PATHS, &mut |w| write_strvec(w, &self.readonly_paths));
+        }
 
         w.u32(count);
         w.bytes(&body.buf);
@@ -456,6 +473,12 @@ pub fn decode(buf: &[u8]) -> Result<(Op, DomainSpec), AbiError> {
                 check_len("seccomp", payload.len(), MAX_SECCOMP)?;
                 spec.seccomp = payload.to_vec();
             }
+            tag::MASKED_PATHS => {
+                spec.masked_paths = read_strvec(&mut sr, "masked_paths", MAX_PATHS)?;
+            }
+            tag::RO_PATHS => {
+                spec.readonly_paths = read_strvec(&mut sr, "readonly_paths", MAX_PATHS)?;
+            }
             _ => { /* unknown tag: ignore for forward-compat */ }
         }
     }
@@ -497,6 +520,8 @@ mod tests {
             flags: OPT_NO_NEW_PRIVS | OPT_ROOTFS_RO,
             cap_bounding: 0x0000_0000_a80c_25fb,
             seccomp: vec![0xde, 0xad, 0xbe, 0xef],
+            masked_paths: vec!["/proc/kcore".into(), "/proc/sysrq-trigger".into()],
+            readonly_paths: vec!["/proc/sys".into(), "/bin".into()],
         }
     }
 

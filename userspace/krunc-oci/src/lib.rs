@@ -126,6 +126,12 @@ pub struct Linux {
     pub resources: Option<Resources>,
     /// cgroups path (relative to the cgroup mount).
     pub cgroups_path: Option<String>,
+    /// Paths to make inaccessible inside the container.
+    #[serde(default)]
+    pub masked_paths: Vec<String>,
+    /// Paths to remount read-only inside the container.
+    #[serde(default)]
+    pub readonly_paths: Vec<String>,
 }
 
 /// `config.json` `linux.resources` (the subset krunc enforces via cgroup v2).
@@ -333,6 +339,8 @@ pub fn config_to_spec(bundle: &Path, cfg: &OciConfig) -> Result<DomainSpec, OciE
     let mut namespaces = 0u32;
     let mut uid_maps = Vec::new();
     let mut gid_maps = Vec::new();
+    let mut masked_paths = Vec::new();
+    let mut readonly_paths = Vec::new();
     if let Some(linux) = &cfg.linux {
         for ns in &linux.namespaces {
             if ns.path.is_some() {
@@ -352,6 +360,8 @@ pub fn config_to_spec(bundle: &Path, cfg: &OciConfig) -> Result<DomainSpec, OciE
             .iter()
             .map(|m| IdMap { container_id: m.container_id, host_id: m.host_id, size: m.size })
             .collect();
+        masked_paths = linux.masked_paths.clone();
+        readonly_paths = linux.readonly_paths.clone();
     }
 
     let mut flags = 0u64;
@@ -379,6 +389,8 @@ pub fn config_to_spec(bundle: &Path, cfg: &OciConfig) -> Result<DomainSpec, OciE
         cap_bounding,
         // seccomp compilation (config.json linux.seccomp -> sock_filter[]) is M5.
         seccomp: Vec::new(),
+        masked_paths,
+        readonly_paths,
     };
     spec.validate()?;
     Ok(spec)
@@ -410,7 +422,9 @@ mod tests {
           { "type": "ipc" }, { "type": "network" }
         ],
         "uidMappings": [ { "containerID": 0, "hostID": 100000, "size": 65536 } ],
-        "gidMappings": [ { "containerID": 0, "hostID": 100000, "size": 65536 } ]
+        "gidMappings": [ { "containerID": 0, "hostID": 100000, "size": 65536 } ],
+        "maskedPaths": ["/proc/kcore", "/proc/sysrq-trigger"],
+        "readonlyPaths": ["/proc/sys", "/bin"]
       }
     }"#;
 
@@ -431,6 +445,8 @@ mod tests {
         );
         let expect_caps = (1u64 << 10) | (1u64 << 5) | (1u64 << 29);
         assert_eq!(spec.cap_bounding, expect_caps);
+        assert_eq!(spec.masked_paths, vec!["/proc/kcore", "/proc/sysrq-trigger"]);
+        assert_eq!(spec.readonly_paths, vec!["/proc/sys", "/bin"]);
     }
 
     #[test]

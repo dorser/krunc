@@ -21,7 +21,8 @@ mkdir -p "$ROOT"/containers/demo/bin "$ROOT"/containers/demo/proc \
          "$ROOT"/containers/demo/tmp
 # OCI bundle (config.json + rootfs) for the runc-compatible CLI demo
 mkdir -p "$ROOT"/bundle/rootfs/bin "$ROOT"/bundle/rootfs/proc \
-         "$ROOT"/bundle/rootfs/sys "$ROOT"/bundle/rootfs/dev "$ROOT"/bundle/rootfs/tmp
+         "$ROOT"/bundle/rootfs/sys "$ROOT"/bundle/rootfs/dev "$ROOT"/bundle/rootfs/tmp \
+         "$ROOT"/bundle/rootfs/etc
 
 # initramfs userland
 cp "$BB" "$ROOT/bin/busybox"

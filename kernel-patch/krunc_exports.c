@@ -194,7 +194,10 @@ int krunc_mount(const char *dev, const char *dir, const char *fstype,
 	struct path target;
 	int err;
 
-	err = kern_path(dir, LOOKUP_FOLLOW | LOOKUP_DIRECTORY, &target);
+	/* LOOKUP_FOLLOW only (no LOOKUP_DIRECTORY): the mountpoint may be a file
+	 * (e.g. masking /proc/sysrq-trigger by bind-mounting /dev/null over it)
+	 * as well as a directory. */
+	err = kern_path(dir, LOOKUP_FOLLOW, &target);
 	if (err)
 		return err;
 	err = path_mount(dev, &target, fstype, flags, NULL);

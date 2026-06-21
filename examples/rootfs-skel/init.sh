@@ -35,6 +35,32 @@ if ip -o link 2>&-; then :; else ls /sys/class/net 2>&-; fi
 # pids.max is enforced, only that many will start. They stay alive (sleep) so the
 # host can read pids.current.
 if [ "$KRUNC_PIDS_TEST" = 1 ]; then
+	echo "[container] --- filesystem confinement (masked + read-only paths) ---"
+	# masked: /proc/kcore is normally a full image of kernel memory; krunc
+	# over-mounts it with /dev/null so it reads as empty (no info leak).
+	echo "[container]   masked /proc/kcore size: $(wc -c < /proc/kcore 2>&-) bytes (expect 0)"
+	# masked: writing 'c' to /proc/sysrq-trigger crashes the host -- a classic
+	# escape. It is masked, so the write lands in /dev/null and is inert.
+	if echo 0 >/proc/sysrq-trigger 2>/dev/null; then
+		echo "[container]   /proc/sysrq-trigger write: inert (masked by /dev/null)"
+	else
+		echo "[container]   /proc/sysrq-trigger write: denied"
+	fi
+	# read-only: writes fail with EROFS even though we are uid 0. /proc/sys being
+	# read-only blocks core_pattern-style escapes; /etc shows a plain write deny.
+	touch /etc/should-not-exist 2>/dev/null
+	if [ -e /etc/should-not-exist ]; then
+		echo "[container]   /etc: WRITABLE (unexpected)"
+	else
+		echo "[container]   /etc: read-only, write denied (EROFS)"
+	fi
+	touch /proc/sys/kernel/should-not-exist 2>/dev/null
+	if [ -e /proc/sys/kernel/should-not-exist ]; then
+		echo "[container]   /proc/sys: WRITABLE (unexpected)"
+	else
+		echo "[container]   /proc/sys: read-only, write denied (EROFS)"
+	fi
+
 	echo "[container] my cgroup: $(cat /proc/self/cgroup 2>&-)"
 	echo "[container] pids test: forktest will fork until the cgroup pids.max stops it"
 	# Hand off to the deterministic fork(2) probe. It becomes PID 1, forks until
