@@ -103,7 +103,8 @@ not in one shot.
   container shows `CapBnd=00000000200004e1` (6 bounded) with
   `CapEff=CapPrm=0` (none granted) and `NoNewPrivs=1`, vs `000001ffffffffff`/`0`
   for the unconfined text container; `RLIMIT_NOFILE=256/512` and
-  `oom_score_adj=-500` confirmed via `/proc/<pid>/{limits,oom_score_adj}`. See
+  `oom_score_adj=-500` confirmed via `/proc/<pid>/{limits,oom_score_adj}`, and
+  the OCI container runs as the requested non-root user (`Uid/Gid 65534`). See
   `docs/sample-v2-confinement.txt`.
 - **M3 (partial) done** — the kernel mounts a private `/proc` + `/sys` for the
   container in-kernel (via `path_mount`) before dropping privileges, so even a

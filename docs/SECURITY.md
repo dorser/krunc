@@ -84,6 +84,7 @@ verifies from the host** (see `docs/sample-v2-confinement.txt`):
 | Capability bounding set + `no_new_privs` | done | `CapBnd=…200004e1`, `NoNewPrivs=1` |
 | Effective/permitted/inheritable/ambient caps applied exactly | done | `CapEff=CapPrm=0` (only bounded, none granted) |
 | rlimits + `oomScoreAdj` | done | `Max open files 256 512`; `oom_score_adj -500` |
+| `process.user` uid/gid (runs as the requested non-root user) | done | `Uid: 65534`, `Gid: 65534` (host view) |
 | `maskedPaths` + `readonlyPaths` | done | `/proc/kcore`→0 bytes; `/etc`,`/proc/sys` `EROFS` |
 | seccomp (OCI→BPF, installed after `no_new_privs`) | done | `chmod`→`EPERM`; `Seccomp: 2` (filter) |
 | cgroup v2 `pids` | done | kernel denies forks; `pids.current==pids.max` |
