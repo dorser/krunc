@@ -84,6 +84,10 @@ if [ "$KRUNC_PIDS_TEST" = 1 ]; then
 	/bin/memhog
 	echo "[container]   memhog returned -- it was OOM-killed by the cgroup at memory.max"
 
+	echo "[container] --- cpu cgroup limit (cpu.max) ---"
+	echo "[container]   cpuhog runs a CPU-bound loop; the cgroup throttles it to the quota (10%):"
+	/bin/cpuhog
+
 	echo "[container] my cgroup: $(cat /proc/self/cgroup 2>&-)"
 	echo "[container] pids test: forktest will fork until the cgroup pids.max stops it"
 	# Hand off to the deterministic fork(2) probe. It becomes PID 1, forks until

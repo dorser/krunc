@@ -68,6 +68,13 @@ if [ -x "$MEMHOG" ]; then
 	chmod +x "$ROOT/bundle/rootfs/bin/memhog"
 fi
 
+# deterministic cgroup cpu.max throttling probe (CPU-bound loop; see krunc-cpuhog)
+CPUHOG="$REPO/userspace/target/x86_64-unknown-linux-musl/release/cpuhog"
+if [ -x "$CPUHOG" ]; then
+	cp "$CPUHOG" "$ROOT/bundle/rootfs/bin/cpuhog"
+	chmod +x "$ROOT/bundle/rootfs/bin/cpuhog"
+fi
+
 # device nodes (need root)
 sudo mknod -m 600 "$ROOT/dev/console" c 5 1
 sudo mknod -m 666 "$ROOT/dev/null"    c 1 3

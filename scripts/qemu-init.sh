@@ -95,9 +95,11 @@ grep -E "^(CapBnd|CapPrm|CapEff|NoNewPrivs|Seccomp|Uid|Gid):" /proc/$CPID/status
 echo "[vm]   expected: CapBnd 00000000200004e1 (6 bounded), CapEff/CapPrm 0 (none granted), NoNewPrivs 1, Seccomp 2, Uid/Gid 65534"
 echo "[vm]   RLIMIT_NOFILE: $(grep -E '^Max open files' /proc/$CPID/limits 2>/dev/null)   (expect soft 256 hard 512)"
 echo "[vm]   oom_score_adj = $(cat /proc/$CPID/oom_score_adj 2>/dev/null)   (expect -500)"
-# Give the container's forktest probe a moment to fork up to the cap. Its parent
-# and every survivor pause(), so this snapshot is stable until we kill them.
-sleep 3
+# Give the container's probes time to run (memhog OOM ~1s, cpuhog ~3s) and the
+# forktest probe to fork up to the cap and park. Its parent and every survivor
+# pause(), so this snapshot is stable. The cgroup event counters (memory
+# oom_kill, cpu throttling) are cumulative and persist after the probes exit.
+sleep 7
 echo "[vm] ----- cgroup pids limit (host view of the container's cgroup) -----"
 PMAX=$(cat /sys/fs/cgroup/krunc/oci1/pids.max 2>/dev/null)
 PCUR=$(cat /sys/fs/cgroup/krunc/oci1/pids.current 2>/dev/null)
@@ -121,6 +123,17 @@ if [ "${MOOMK:-0}" -gt 0 ]; then
 	echo "[vm]   RESULT: memory cgroup ENFORCED -- kernel OOM-killed ${MOOMK} process(es) at memory.max"
 else
 	echo "[vm]   RESULT: memory.max=$MMAX oom_kill=${MOOMK:-0} (expected oom_kill>0 from memhog)"
+fi
+echo "[vm] ----- cgroup cpu limit (host view of the container's cgroup) -----"
+CMAX=$(cat /sys/fs/cgroup/krunc/oci1/cpu.max 2>/dev/null)
+CTHR=$(awk '/^nr_throttled /{print $2}' /sys/fs/cgroup/krunc/oci1/cpu.stat 2>/dev/null)
+CTUS=$(awk '/^throttled_usec /{print $2}' /sys/fs/cgroup/krunc/oci1/cpu.stat 2>/dev/null)
+echo "[vm]   cpu.max = $CMAX   (= 10% of one CPU: 10000us quota / 100000us period)"
+echo "[vm]   cpu.stat: nr_throttled=$CTHR throttled_usec=$CTUS"
+if [ "${CTHR:-0}" -gt 0 ]; then
+	echo "[vm]   RESULT: cpu cgroup ENFORCED -- the kernel throttled the cgroup ${CTHR} time(s)"
+else
+	echo "[vm]   RESULT: nr_throttled=${CTHR:-0} (expected >0 from cpuhog)"
 fi
 echo "[vm] krunc kill oci1   (forktest is parked as PID 1; stop the whole tree)"
 /bin/krunc kill oci1 KILL

@@ -19,7 +19,11 @@ impl Cgroup {
     /// Create the cgroup and apply limits if any are configured. Returns `None`
     /// when there is nothing to enforce.
     pub fn create(id: &str, cfg: &CgroupConfig) -> io::Result<Option<Cgroup>> {
-        if cfg.pids_limit.is_none() && cfg.memory_limit.is_none() {
+        if cfg.pids_limit.is_none()
+            && cfg.memory_limit.is_none()
+            && cfg.cpu_max.is_none()
+            && cfg.cpu_weight.is_none()
+        {
             return Ok(None);
         }
         // The set of controllers the leaf needs delegated to it.
@@ -29,6 +33,9 @@ impl Cgroup {
         }
         if cfg.memory_limit.is_some() {
             controllers.push_str("+memory ");
+        }
+        if cfg.cpu_max.is_some() || cfg.cpu_weight.is_some() {
+            controllers.push_str("+cpu ");
         }
         let controllers = controllers.trim_end();
 
@@ -54,6 +61,12 @@ impl Cgroup {
         }
         if let Some(limit) = cfg.memory_limit {
             fs::write(dir.join("memory.max"), limit.to_string())?;
+        }
+        if let Some(max) = &cfg.cpu_max {
+            fs::write(dir.join("cpu.max"), max)?;
+        }
+        if let Some(weight) = cfg.cpu_weight {
+            fs::write(dir.join("cpu.weight"), weight.to_string())?;
         }
         Ok(Some(Cgroup { dir }))
     }

@@ -221,6 +221,19 @@ pub struct Resources {
     pub pids: Option<Pids>,
     /// memory controller.
     pub memory: Option<Memory>,
+    /// cpu controller.
+    pub cpu: Option<Cpu>,
+}
+
+/// `config.json` `linux.resources.cpu` (the subset krunc enforces).
+#[derive(Debug, Deserialize, Default)]
+pub struct Cpu {
+    /// CFS quota in microseconds per `period` (`<= 0` means unlimited).
+    pub quota: Option<i64>,
+    /// CFS period in microseconds (default 100000).
+    pub period: Option<u64>,
+    /// Relative CPU weight (OCI `shares`, 2..=262144).
+    pub shares: Option<u64>,
 }
 
 /// `config.json` `linux.resources.pids`.
@@ -248,12 +261,35 @@ pub struct CgroupConfig {
     pub pids_limit: Option<i64>,
     /// `memory.max` in bytes, if set (and non-negative).
     pub memory_limit: Option<i64>,
+    /// `cpu.max` value (`"<quota> <period>"`), if a positive quota is set.
+    pub cpu_max: Option<String>,
+    /// `cpu.weight` (1..=10000), mapped from OCI `shares`, if set.
+    pub cpu_weight: Option<u64>,
+}
+
+/// Map an OCI cpu `shares` value (2..=262144) to a cgroup-v2 `cpu.weight`
+/// (1..=10000), the same conversion runc/crun use.
+fn shares_to_weight(shares: u64) -> u64 {
+    if shares == 0 {
+        return 0;
+    }
+    let w = 1 + ((shares.clamp(2, 262_144) - 2) * 9999) / 262_142;
+    w.clamp(1, 10_000)
 }
 
 /// Extract the cgroup configuration from a parsed config.
 pub fn cgroup_config(cfg: &OciConfig) -> CgroupConfig {
     let linux = cfg.linux.as_ref();
     let resources = linux.and_then(|l| l.resources.as_ref());
+    let cpu = resources.and_then(|r| r.cpu.as_ref());
+    let cpu_max = cpu.and_then(|c| match c.quota {
+        Some(q) if q > 0 => Some(format!("{} {}", q, c.period.unwrap_or(100_000))),
+        _ => None,
+    });
+    let cpu_weight = cpu
+        .and_then(|c| c.shares)
+        .filter(|&s| s != 0)
+        .map(shares_to_weight);
     CgroupConfig {
         path: linux.and_then(|l| l.cgroups_path.clone()),
         pids_limit: resources.and_then(|r| r.pids.as_ref()).map(|p| p.limit),
@@ -261,6 +297,8 @@ pub fn cgroup_config(cfg: &OciConfig) -> CgroupConfig {
             .and_then(|r| r.memory.as_ref())
             .and_then(|m| m.limit)
             .filter(|&l| l >= 0),
+        cpu_max,
+        cpu_weight,
     }
 }
 
@@ -794,13 +832,16 @@ mod tests {
         let cfg = parse_config(
             r#"{"process":{"args":["/x"]},"root":{"path":"r"},
                 "linux":{"cgroupsPath":"krunc/c1","resources":{"pids":{"limit":64},
-                "memory":{"limit":33554432}}}}"#,
+                "memory":{"limit":33554432},"cpu":{"quota":20000,"period":100000,"shares":512}}}}"#,
         )
         .unwrap();
         let cg = cgroup_config(&cfg);
         assert_eq!(cg.path.as_deref(), Some("krunc/c1"));
         assert_eq!(cg.pids_limit, Some(64));
         assert_eq!(cg.memory_limit, Some(33554432));
+        assert_eq!(cg.cpu_max.as_deref(), Some("20000 100000"));
+        // shares 512 maps into the cgroup-v2 weight range (1..=10000).
+        assert!(matches!(cg.cpu_weight, Some(w) if (1..=10000).contains(&w)));
     }
 
     #[test]

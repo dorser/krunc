@@ -1,0 +1,10 @@
+[package]
+name = "krunc-cpuhog"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0"
+description = "Deterministic cgroup cpu.max throttling probe used by the krunc QEMU tests."
+
+[[bin]]
+name = "cpuhog"
+path = "src/main.rs"
