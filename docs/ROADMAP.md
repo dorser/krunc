@@ -89,5 +89,17 @@ graduation target. This roadmap is large and is executed in verified increments,
 not in one shot.
 
 ## Status
-- M0 done. v1 PoC (3 commits) is the working foundation. M1+ pending build/test
-  access (the Azure test VM under QEMU).
+- M0 (design) done. v1 PoC is the working foundation.
+- **M1 done** — all-Rust userspace: `krunc-abi` (13 tests), `krunc-oci` (11 tests),
+  `krunc-cli` (static musl binary). The Go CLI/conformance tool were removed.
+- **M2 (partial) done** — the kernel consumes the versioned **binary** ABI
+  (strict, bounds-checked, no JSON in kernel); two-phase create/start. (The full
+  `Domain` typestate object + `domainfd` handle are still to come.)
+- **M4 (partial) done** — the kernel applies the **capability bounding set +
+  `no_new_privs`** atomically before exec. Host-verified in QEMU: the OCI
+  container has `CapBnd=CapEff=CapPrm=00000000200004e1` (exactly the 6 bounded
+  caps) and `NoNewPrivs=1`, vs `000001ffffffffff`/`0` for the unconfined
+  text-interface container. See `docs/sample-v2-confinement.txt`.
+- **Next:** M3 mounts/pivot_root + masked/ro paths, M5 seccomp, M6 cgroups,
+  M7 user-ns mapping, M7/M8 Landlock + lifetime enforcement, M9 conformance,
+  M10 containerd, then the full `Domain` object (M2 remainder).
