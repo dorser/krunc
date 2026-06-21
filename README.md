@@ -7,6 +7,18 @@ krunc performs the entire container **orchestration inside the kernel**:
 namespace creation, rootfs entry, hostname, and process exec all happen in
 kernel context. Userspace only submits a one-line spec.
 
+> **Direction (v2 — see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)).** This
+> PoC is the foundation for a larger idea: give the Linux kernel a **first-class
+> workload / security-domain object** (`krunc_domain`), in the spirit of a
+> FreeBSD jail — a durable object that *represents* a workload after creation and
+> enforces **sealed, monotonic, inherited** invariants on it for its whole
+> lifetime. The point is not to move OCI/containerd into the kernel (those stay
+> in userspace); it is to add the missing kernel *noun* so containers gain a
+> tamper-proof, kernel-owned security domain that closes both the setup-escape
+> window **and** post-setup escapes. Design: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md);
+> threat model + honest limits: [`docs/SECURITY.md`](docs/SECURITY.md); plan:
+> [`docs/ROADMAP.md`](docs/ROADMAP.md); cited research: [`docs/research-notes/`](docs/research-notes/).
+
 ```
             userspace                    |            kernel
                                          |
