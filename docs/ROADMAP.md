@@ -119,12 +119,14 @@ not in one shot.
   `tmpfs` `/tmp` mounted `nosuid,nodev,noexec`. (Full `pivot_root` + `root.readonly`
   and sysctls are still to come.)
 - **M6 (done) — cgroup v2.** The CLI creates the cgroup, sets limits, and places
-  the container; the kernel enforces them. Two controllers, each verified
+  the container; the kernel enforces them. Three controllers, each verified
   deterministically: **pids** (`krunc-forktest` — `pids.current` pins at
-  `pids.max=16`, the kernel denies further forks) and **memory** (`krunc-memhog`
+  `pids.max=16`, the kernel denies further forks), **memory** (`krunc-memhog`
   — allocating past `memory.max=64 MiB` triggers the memcg OOM killer:
   `Memory cgroup out of memory: Killed process … (memhog)`, `memory.events
-  oom_kill 1`). cpu/io controllers are still to come.
+  oom_kill 1`), and **cpu** (`krunc-cpuhog` — a CPU-bound loop under
+  `cpu.max=10000 100000` is throttled: `cpu.stat nr_throttled=69`). io is still
+  to come.
 - **M5 (done) — seccomp.** The CLI compiles the OCI `linux.seccomp` policy into a
   classic-BPF `sock_filter[]` program (`krunc-oci::seccomp`, full x86-64 syscall
   table, 4 unit tests); the kernel installs it on the container **after**

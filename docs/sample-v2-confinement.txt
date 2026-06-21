@@ -20,7 +20,6 @@
 
 ================ DEMO 1: launch an isolated container ================
 [vm] echo "run rootfs=/containers/demo host=krunc-demo exec=/bin/sh arg=/init.sh" > /dev/krunc
-[    2.858291] krunc: started container id=1 pid=85
 ==================================================================
 [container] Hello from inside a krunc container!
 [container] hostname (UTS namespace) : krunc-demo
@@ -42,9 +41,8 @@ tmp
 1: lo: <LOOPBACK> mtu 65536 qdisc noop qlen 1000\    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00
 2: sit0@NONE: <NOARP> mtu 1480 qdisc noop qlen 1000\    link/sit 0.0.0.0 brd 0.0.0.0
 [container] sleeping briefly so the host can inspect our namespaces...
-[    3.872985] cat (95) used greatest stack depth: 13152 bytes left
-[vm] container started with host-visible pid: 85
-[vm] --- namespace isolation (host view of pid 85) ---
+[vm] container started with host-visible pid: 86
+[vm] --- namespace isolation (host view of pid 86) ---
 [vm]   pid: ISOLATED  (host pid:[4026531836] vs container pid:[4026532168])
 [vm]   mnt: ISOLATED  (host mnt:[4026531832] vs container mnt:[4026532165])
 [vm]   uts: ISOLATED  (host uts:[4026531838] vs container uts:[4026532166])
@@ -52,21 +50,17 @@ tmp
 [vm]   net: ISOLATED  (host net:[4026531833] vs container net:[4026532169])
 [container] goodbye (PID 1 exiting -> namespaces tear down)
 ==================================================================
-[    5.977578] sh (85) used greatest stack depth: 12552 bytes left
 
 ============ DEMO 2: launch + kill a long-running container ============
 [vm] echo "run rootfs=/containers/demo host=sleeper exec=/bin/busybox arg=sleep arg=600" > /dev/krunc
-[    5.984156] krunc: started container id=2 pid=107
 [vm] container table:
 [vm]   ID    PID      STATE    HOSTNAME
-[vm]   1     85       exited   krunc-demo
-[vm]   2     107      running  sleeper
-[vm] stopping sleeper (pid 107): echo "kill 107" > /dev/krunc
-[    7.003355] krunc: killed container pid 107
-[    7.004409] busybox (107) used greatest stack depth: 12536 bytes left
+[vm]   1     86       exited   krunc-demo
+[vm]   2     108      running  sleeper
+[vm] stopping sleeper (pid 108): echo "kill 108" > /dev/krunc
 [vm] container table after kill:
 [vm]   ID    PID      STATE    HOSTNAME
-[vm]   1     85       exited   krunc-demo
+[vm]   1     86       exited   krunc-demo
 
 ====== DEMO 3: OCI lifecycle via the all-Rust krunc CLI + confinement ======
 [vm] krunc --version:
@@ -74,14 +68,12 @@ tmp
 [vm]   commit: krunc-poc
 [vm]   spec: 1.0.2-dev
 [vm] krunc create oci1 --bundle /bundle   (sets up + blocks before exec)
-created oci1 (pid 118, krunc id 3)
-[    7.104629] krunc (117) used greatest stack depth: 11464 bytes left
+created oci1 (pid 119, krunc id 3)
 [vm] krunc state oci1   (expect: created)
 [vm]     "id": "oci1",
 [vm]     "status": "created",
-[vm]     "pid": 118,
+[vm]     "pid": 119,
 [vm] krunc start oci1   (releases the paused init -> execs the entrypoint)
-[    7.142523] krunc: started container id=3 pid=118
 ==================================================================
 [container] Hello from inside a krunc container!
 [container] hostname (UTS namespace) : oci-demo
@@ -104,9 +96,23 @@ tmp
 1: lo: <LOOPBACK> mtu 65536 qdisc noop qlen 1000\    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00
 2: sit0@NONE: <NOARP> mtu 1480 qdisc noop qlen 1000\    link/sit 0.0.0.0 brd 0.0.0.0
 [container] --- filesystem confinement (masked + read-only paths) ---
+[vm] krunc state oci1   (expect: running)
+[vm]     "status": "running",
+[vm]     "pid": 119,
+[vm] ----- kernel-applied confinement, host view of /proc/119/status -----
 [container]   masked /proc/kcore size: 0 bytes (expect 0)
 [container]   /proc/sysrq-trigger write: inert (masked by /dev/null)
 [container]   /etc: read-only, write denied (EROFS)
+[vm]   Uid:	65534	65534	65534	65534
+[vm]   Gid:	65534	65534	65534	65534
+[vm]   CapPrm:	0000000000000000
+[vm]   CapEff:	0000000000000000
+[vm]   CapBnd:	00000000200004e1
+[vm]   NoNewPrivs:	1
+[vm]   Seccomp:	2
+[vm]   expected: CapBnd 00000000200004e1 (6 bounded), CapEff/CapPrm 0 (none granted), NoNewPrivs 1, Seccomp 2, Uid/Gid 65534
+[vm]   RLIMIT_NOFILE: Max open files            256                  512                  files        (expect soft 256 hard 512)
+[vm]   oom_score_adj = -500   (expect -500)
 [container]   /proc/sys: read-only, write denied (EROFS)
 [container] --- seccomp (sealed syscall policy) ---
 [container]   chmod /tmp: blocked by seccomp (EPERM)
@@ -125,114 +131,14 @@ tmp
 [memhog] resident 40 MiB
 [memhog] resident 48 MiB
 [memhog] resident 56 MiB
-[    7.419936] memhog invoked oom-killer: gfp_mask=0xcc0(GFP_KERNEL), order=0, oom_score_adj=-500
-[    7.420884] CPU: 1 UID: 65534 PID: 140 Comm: memhog Tainted: G           O        6.18.0 #14 PREEMPT(voluntary) 
-[    7.421054] Tainted: [O]=OOT_MODULE
-[    7.421068] Hardware name: QEMU Ubuntu 24.04 PC v2 (i440FX + PIIX, arch_caps fix, 1996), BIOS 1.16.3-debian-1.16.3-2 04/01/2014
-[    7.421194] Call Trace:
-[    7.421817]  <TASK>
-[    7.421993]  dump_stack_lvl+0x3e/0xb0
-[    7.422401]  dump_header+0x43/0x190
-[    7.422428]  oom_kill_process+0x1e2/0x2c0
-[    7.422440]  out_of_memory+0x3a9/0x570
-[    7.422452]  try_charge_memcg+0x466/0x670
-[    7.422475]  __mem_cgroup_charge+0x3d/0xc0
-[    7.422487]  handle_mm_fault+0x9c1/0x1410
-[    7.422511]  do_user_addr_fault+0x1f6/0x7d0
-[    7.422527]  exc_page_fault+0x62/0xa0
-[    7.422541]  asm_exc_page_fault+0x26/0x30
-[    7.422658] RIP: 0033:0x7f0498c276c0
-[    7.422861] Code: 00 80 00 be 01 00 00 00 ff 15 4c 55 06 00 48 85 c0 0f 84 e3 01 00 00 49 89 c5 48 c7 c0 00 f0 ff ff 66 0f 1f 84 00 00 00 00 00 <41> c6 84 05 00 10 00 00 a5 41 c6 84 05 00 20 00 00 a5 41 c6 84 05
-[    7.422940] RSP: 002b:00007ffcea962c00 EFLAGS: 00000287
-[    7.422975] RAX: 0000000000787000 RBX: 0000000000000007 RCX: 000000000000003f
-[    7.422989] RDX: 00000000000800ff RSI: 0000000000800fc0 RDI: 00005555764c42e8
-[    7.423002] RBP: 00007ffcea962c38 R08: 0000000000000fec R09: 0000000000800000
-[    7.423014] R10: 00007f049540cffc R11: 0000000000000009 R12: 00007f0498c14a40
-[    7.423026] R13: 00007f0494c0c0a0 R14: 0000000003800000 R15: 0000000003800000
-[    7.423073]  </TASK>
-[    7.426811] memory: usage 65536kB, limit 65536kB, failcnt 19
-[    7.426985] swap: usage 0kB, limit 9007199254740988kB, failcnt 0
-[    7.427151] Memory cgroup stats for /krunc/oci1:
-[    7.428175] anon 66760704
-[    7.428476] file 0
-[    7.428541] kernel 282624
-[    7.428613] kernel_stack 16384
-[    7.428694] pagetables 0
-[    7.428763] sec_pagetables 0
-[    7.428839] percpu 600
-[    7.428905] sock 0
-[    7.428961] vmalloc 4096
-[    7.429029] shmem 0
-[    7.429088] file_mapped 0
-[    7.429158] file_dirty 0
-[    7.429278] file_writeback 0
-[    7.429364] swapcached 0
-[    7.429456] inactive_anon 66629632
-[    7.429548] active_anon 4096
-[    7.429625] inactive_file 0
-[    7.429699] active_file 0
-[    7.429770] unevictable 0
-[    7.429840] slab_reclaimable 7496
-[    7.429927] slab_unreclaimable 27920
-[    7.430020] slab 35416
-[    7.430084] workingset_refault_anon 0
-[    7.430179] workingset_refault_file 0
-[    7.430347] workingset_activate_anon 0
-[    7.430485] workingset_activate_file 0
-[    7.430586] workingset_restore_anon 0
-[    7.430681] workingset_restore_file 0
-[    7.430777] workingset_nodereclaim 0
-[    7.430869] pgdemote_kswapd 0
-[    7.430948] pgdemote_direct 0
-[    7.431027] pgdemote_khugepaged 0
-[    7.431113] pgdemote_proactive 0
-[    7.431238] pgscan 0
-[    7.431306] pgsteal 0
-[    7.431369] pswpin 0
-[    7.431449] pswpout 0
-[    7.431514] pgscan_kswapd 0
-[    7.431589] pgscan_direct 0
-[    7.431663] pgscan_khugepaged 0
-[    7.431746] pgscan_proactive 0
-[    7.431827] pgsteal_kswapd 0
-[    7.431903] pgsteal_direct 0
-[    7.431980] pgsteal_khugepaged 0
-[    7.432064] pgsteal_proactive 0
-[    7.432148] pgfault 17197
-[    7.432257] pgmajfault 0
-[    7.432332] pgrefill 0
-[    7.432419] pgactivate 0
-[    7.432490] pgdeactivate 0
-[    7.432562] pglazyfree 0
-[    7.432630] pglazyfreed 0
-[    7.432700] swpin_zero 0
-[    7.432769] swpout_zero 0
-[    7.432907] Tasks state (memory values in pages):
-[    7.433038] [  pid  ]   uid  tgid total_vm      rss rss_anon rss_file rss_shmem pgtables_bytes swapents oom_score_adj name
-[    7.433525] [    118] 65534   118      601      418        0        0       418    40960        0          -500 sh
-[    7.433847] [    140] 65534   140    16550    16346    16256        0        90   167936        0          -500 memhog
-[    7.434140] oom-kill:constraint=CONSTRAINT_MEMCG,nodemask=(null),cpuset=/,mems_allowed=0,oom_memcg=/krunc/oci1,task_memcg=/krunc/oci1,task=memhog,pid=140,uid=65534
-[    7.435262] Memory cgroup out of memory: Killed process 140 (memhog) total-vm:66200kB, anon-rss:65024kB, file-rss:0kB, shmem-rss:360kB, UID:65534 pgtables:164kB oom_score_adj:-500
 Killed
 [container]   memhog returned -- it was OOM-killed by the cgroup at memory.max
+[container] --- cpu cgroup limit (cpu.max) ---
+[container]   cpuhog runs a CPU-bound loop; the cgroup throttles it to the quota (10%):
+[cpuhog] ran 3.0s wall doing 997 Mloops (sink=64) -- the cgroup cpu.max throttled this if set
 [container] my cgroup: 0::/krunc/oci1
 [container] pids test: forktest will fork until the cgroup pids.max stops it
-[    7.475363] cgroup: fork rejected by pids controller in /krunc/oci1
 [forktest] started 15 children, fork denied 3x (errno=11)
-[vm] krunc state oci1   (expect: running)
-[vm]     "status": "running",
-[vm]     "pid": 118,
-[vm] ----- kernel-applied confinement, host view of /proc/118/status -----
-[vm]   Uid:	65534	65534	65534	65534
-[vm]   Gid:	65534	65534	65534	65534
-[vm]   CapPrm:	0000000000000000
-[vm]   CapEff:	0000000000000000
-[vm]   CapBnd:	00000000200004e1
-[vm]   NoNewPrivs:	1
-[vm]   Seccomp:	2
-[vm]   expected: CapBnd 00000000200004e1 (6 bounded), CapEff/CapPrm 0 (none granted), NoNewPrivs 1, Seccomp 2, Uid/Gid 65534
-[vm]   RLIMIT_NOFILE: Max open files            256                  512                  files        (expect soft 256 hard 512)
-[vm]   oom_score_adj = -500   (expect -500)
 [vm] ----- cgroup pids limit (host view of the container's cgroup) -----
 [vm]   pids.max     = 16
 [vm]   pids.current = 16   (forktest tried to fork past the limit; the kernel capped it)
@@ -240,16 +146,19 @@ Killed
 [vm]   RESULT: pids cgroup ENFORCED -- kernel denied 3 forks; pids.current pinned at pids.max=16
 [vm] ----- cgroup memory limit (host view of the container's cgroup) -----
 [vm]   memory.max    = 67108864   (= 64 MiB)
-[vm]   memory.events = low 0 high 0 max 19 oom 1 oom_kill 1 oom_group_kill 0 
+[vm]   memory.events = low 0 high 0 max 36 oom 1 oom_kill 1 oom_group_kill 0 
 [vm]   RESULT: memory cgroup ENFORCED -- kernel OOM-killed 1 process(es) at memory.max
+[vm] ----- cgroup cpu limit (host view of the container's cgroup) -----
+[vm]   cpu.max = 10000 100000   (= 10% of one CPU: 10000us quota / 100000us period)
+[vm]   cpu.stat: nr_throttled=69 throttled_usec=6314651
+[vm]   RESULT: cpu cgroup ENFORCED -- the kernel throttled the cgroup 69 time(s)
 [vm] krunc kill oci1   (forktest is parked as PID 1; stop the whole tree)
 [vm] krunc state oci1   (after kill, expect: stopped)
 [vm]     "status": "stopped",
 [vm] krunc list:
 [vm]   ID                   STATUS     PID      BUNDLE
-[vm]   oci1                 stopped    118      /bundle
+[vm]   oci1                 stopped    119      /bundle
 [vm] krunc delete oci1
-[   11.288465] krunc: deleted container id=3
 
 ================ DEMO 4: unload the runtime cleanly ================
 [vm] krunc.ko unloaded cleanly
