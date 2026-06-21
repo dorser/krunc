@@ -88,13 +88,14 @@ verifies from the host** (see `docs/sample-v2-confinement.txt`):
 | `maskedPaths` + `readonlyPaths` | done | `/proc/kcore`→0 bytes; `/etc`,`/proc/sys` `EROFS` |
 | OCI `mounts[]` (config-driven, with `nosuid/nodev/noexec/ro`) | done | `/tmp` = `tmpfs rw,nosuid,nodev,noexec` |
 | seccomp (OCI→BPF, installed after `no_new_privs`) | done | `chmod`→`EPERM`; `Seccomp: 2` (filter) |
+| **active kill-on-escape** (seccomp `SCMP_ACT_KILL_PROCESS`) | done | `insmod` (module load) → process **killed** (`sig=31`, `code=0x80000000`) |
 | cgroup v2 `pids` | done | kernel denies forks; `pids.current==pids.max` |
 | cgroup v2 `memory` | done | memhog past `memory.max` → memcg OOM kill; `memory.events oom_kill 1` |
 | cgroup v2 `cpu` | done | cpuhog under `cpu.max` throttled; `cpu.stat nr_throttled` climbs |
 | `pivot_root` (replacing chroot) + sysctls | planned | (chroot-based read-only rootfs leaks the shared superblock; superseded for immutability by Landlock) |
 | user-ns uid/gid mapping | planned | — |
 | **Landlock** sealed fs domain (immutable rootfs) | done | container: `write to /`→DENIED, `write to /tmp`→ALLOWED |
-| BPF-LSM active kill-on-escape | planned | — |
+| BPF-LSM rich-context active kill-on-escape | planned | (seccomp `SCMP_ACT_KILL_PROCESS` already kills on a forbidden *syscall*; BPF-LSM adds path/mount-aware policy) |
 
 Everything marked *done* is applied **atomically in kernel context before the
 first userspace instruction** and (for the sealed controls) holds for the

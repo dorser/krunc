@@ -41,8 +41,8 @@ tmp
 1: lo: <LOOPBACK> mtu 65536 qdisc noop qlen 1000\    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00
 2: sit0@NONE: <NOARP> mtu 1480 qdisc noop qlen 1000\    link/sit 0.0.0.0 brd 0.0.0.0
 [container] sleeping briefly so the host can inspect our namespaces...
-[vm] container started with host-visible pid: 86
-[vm] --- namespace isolation (host view of pid 86) ---
+[vm] container started with host-visible pid: 85
+[vm] --- namespace isolation (host view of pid 85) ---
 [vm]   pid: ISOLATED  (host pid:[4026531836] vs container pid:[4026532168])
 [vm]   mnt: ISOLATED  (host mnt:[4026531832] vs container mnt:[4026532165])
 [vm]   uts: ISOLATED  (host uts:[4026531838] vs container uts:[4026532166])
@@ -55,12 +55,12 @@ tmp
 [vm] echo "run rootfs=/containers/demo host=sleeper exec=/bin/busybox arg=sleep arg=600" > /dev/krunc
 [vm] container table:
 [vm]   ID    PID      STATE    HOSTNAME
-[vm]   1     86       exited   krunc-demo
-[vm]   2     108      running  sleeper
-[vm] stopping sleeper (pid 108): echo "kill 108" > /dev/krunc
+[vm]   1     85       exited   krunc-demo
+[vm]   2     107      running  sleeper
+[vm] stopping sleeper (pid 107): echo "kill 107" > /dev/krunc
 [vm] container table after kill:
 [vm]   ID    PID      STATE    HOSTNAME
-[vm]   1     86       exited   krunc-demo
+[vm]   1     85       exited   krunc-demo
 
 ====== DEMO 3: OCI lifecycle via the all-Rust krunc CLI + confinement ======
 [vm] krunc --version:
@@ -68,11 +68,11 @@ tmp
 [vm]   commit: krunc-poc
 [vm]   spec: 1.0.2-dev
 [vm] krunc create oci1 --bundle /bundle   (sets up + blocks before exec)
-created oci1 (pid 119, krunc id 3)
+created oci1 (pid 118, krunc id 3)
 [vm] krunc state oci1   (expect: created)
 [vm]     "id": "oci1",
 [vm]     "status": "created",
-[vm]     "pid": 119,
+[vm]     "pid": 118,
 [vm] krunc start oci1   (releases the paused init -> execs the entrypoint)
 ==================================================================
 [container] Hello from inside a krunc container!
@@ -93,10 +93,12 @@ proc
 sys
 tmp
 [container] network interfaces (NET namespace):
+1: lo: <LOOPBACK> mtu 65536 qdisc noop qlen 1000\    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00
+2: sit0@NONE: <NOARP> mtu 1480 qdisc noop qlen 1000\    link/sit 0.0.0.0 brd 0.0.0.0
 [vm] krunc state oci1   (expect: running)
 [vm]     "status": "running",
-[vm]     "pid": 119,
-[vm] ----- kernel-applied confinement, host view of /proc/119/status -----
+[vm]     "pid": 118,
+[vm] ----- kernel-applied confinement, host view of /proc/118/status -----
 [vm]   Uid:	65534	65534	65534	65534
 [vm]   Gid:	65534	65534	65534	65534
 [vm]   CapPrm:	0000000000000000
@@ -106,10 +108,8 @@ tmp
 [vm]   Seccomp:	2
 [vm]   expected: CapBnd 00000000200004e1 (6 bounded), CapEff/CapPrm 0 (none granted), NoNewPrivs 1, Seccomp 2, Uid/Gid 65534
 [vm]   RLIMIT_NOFILE: Max open files            256                  512                  files        (expect soft 256 hard 512)
-[vm]   oom_score_adj = -500   (expect -500)
-1: lo: <LOOPBACK> mtu 65536 qdisc noop qlen 1000\    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00
-2: sit0@NONE: <NOARP> mtu 1480 qdisc noop qlen 1000\    link/sit 0.0.0.0 brd 0.0.0.0
 [container] --- filesystem confinement (masked + read-only paths) ---
+[vm]   oom_score_adj = -500   (expect -500)
 [container]   masked /proc/kcore size: 0 bytes (expect 0)
 /init.sh: line 44: can't create /proc/sysrq-trigger: Permission denied
 [container]   /proc/sysrq-trigger write: denied
@@ -117,6 +117,7 @@ tmp
 [container]   /proc/sys: read-only, write denied (EROFS)
 [container] --- seccomp (sealed syscall policy) ---
 [container]   chmod /tmp: blocked by seccomp (EPERM)
+[container]   insmod (module load): KILLED by seccomp, signal 31 (active kill-on-escape)
 [container] --- resource limits (rlimits / oom) ---
 [container]   RLIMIT_NOFILE (ulimit -n) = 256  (config soft=256)
 [container] --- user (process.user) ---
@@ -139,7 +140,7 @@ Killed
 [container]   memhog returned -- it was OOM-killed by the cgroup at memory.max
 [container] --- cpu cgroup limit (cpu.max) ---
 [container]   cpuhog runs a CPU-bound loop; the cgroup throttles it to the quota (10%):
-[cpuhog] ran 3.0s wall doing 997 Mloops (sink=64) -- the cgroup cpu.max throttled this if set
+[cpuhog] ran 3.0s wall doing 903 Mloops (sink=192) -- the cgroup cpu.max throttled this if set
 [container] my cgroup: 0::/krunc/oci1
 [container] pids test: forktest will fork until the cgroup pids.max stops it
 [forktest] started 15 children, fork denied 3x (errno=11)
@@ -150,18 +151,18 @@ Killed
 [vm]   RESULT: pids cgroup ENFORCED -- kernel denied 3 forks; pids.current pinned at pids.max=16
 [vm] ----- cgroup memory limit (host view of the container's cgroup) -----
 [vm]   memory.max    = 67108864   (= 64 MiB)
-[vm]   memory.events = low 0 high 0 max 19 oom 1 oom_kill 1 oom_group_kill 0 
+[vm]   memory.events = low 0 high 0 max 23 oom 1 oom_kill 1 oom_group_kill 0 
 [vm]   RESULT: memory cgroup ENFORCED -- kernel OOM-killed 1 process(es) at memory.max
 [vm] ----- cgroup cpu limit (host view of the container's cgroup) -----
 [vm]   cpu.max = 10000 100000   (= 10% of one CPU: 10000us quota / 100000us period)
-[vm]   cpu.stat: nr_throttled=71 throttled_usec=6425785
-[vm]   RESULT: cpu cgroup ENFORCED -- the kernel throttled the cgroup 71 time(s)
+[vm]   cpu.stat: nr_throttled=70 throttled_usec=6679102
+[vm]   RESULT: cpu cgroup ENFORCED -- the kernel throttled the cgroup 70 time(s)
 [vm] krunc kill oci1   (forktest is parked as PID 1; stop the whole tree)
 [vm] krunc state oci1   (after kill, expect: stopped)
 [vm]     "status": "stopped",
 [vm] krunc list:
 [vm]   ID                   STATUS     PID      BUNDLE
-[vm]   oci1                 stopped    119      /bundle
+[vm]   oci1                 stopped    118      /bundle
 [vm] krunc delete oci1
 
 ================ DEMO 4: unload the runtime cleanly ================
