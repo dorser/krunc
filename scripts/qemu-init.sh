@@ -18,6 +18,7 @@ mount -t proc     proc /proc 2>/dev/null
 mount -t sysfs    sys  /sys  2>/dev/null
 mount -t devtmpfs dev  /dev  2>/dev/null
 mount -t tmpfs    tmp  /tmp  2>/dev/null
+mount -t cgroup2  cgrp /sys/fs/cgroup 2>/dev/null
 
 echo
 echo "##################################################################"
@@ -92,8 +93,26 @@ echo "[vm] krunc state oci1   (expect: running)"
 echo "[vm] ----- kernel-applied confinement, host view of /proc/$CPID/status -----"
 grep -E "^(CapBnd|CapPrm|CapEff|NoNewPrivs):" /proc/$CPID/status 2>/dev/null | sed 's/^/[vm]   /'
 echo "[vm]   expected: CapBnd 00000000200004e1 (the 6 bounded caps), NoNewPrivs 1"
+# Give the container's forktest probe a moment to fork up to the cap. Its parent
+# and every survivor pause(), so this snapshot is stable until we kill them.
 sleep 3
-echo "[vm] krunc state oci1   (after the entrypoint exits, expect: stopped)"
+echo "[vm] ----- cgroup pids limit (host view of the container's cgroup) -----"
+PMAX=$(cat /sys/fs/cgroup/krunc/oci1/pids.max 2>/dev/null)
+PCUR=$(cat /sys/fs/cgroup/krunc/oci1/pids.current 2>/dev/null)
+PEVT=$(cat /sys/fs/cgroup/krunc/oci1/pids.events 2>/dev/null | tr '\n' ' ')
+PEVT_MAX=$(awk '/^max /{print $2}' /sys/fs/cgroup/krunc/oci1/pids.events 2>/dev/null)
+echo "[vm]   pids.max     = $PMAX"
+echo "[vm]   pids.current = $PCUR   (forktest tried to fork past the limit; the kernel capped it)"
+echo "[vm]   pids.events  = $PEVT   (max = number of forks the kernel denied)"
+if [ "${PEVT_MAX:-0}" -gt 0 ] && [ "$PCUR" = "$PMAX" ]; then
+	echo "[vm]   RESULT: pids cgroup ENFORCED -- kernel denied ${PEVT_MAX} forks; pids.current pinned at pids.max=$PMAX"
+else
+	echo "[vm]   RESULT: pids.current=$PCUR pids.max=$PMAX denials=${PEVT_MAX:-0} (expected current==max with denials>0)"
+fi
+echo "[vm] krunc kill oci1   (forktest is parked as PID 1; stop the whole tree)"
+/bin/krunc kill oci1 KILL
+sleep 1
+echo "[vm] krunc state oci1   (after kill, expect: stopped)"
 /bin/krunc state oci1 | grep -E '"status"' | sed 's/^/[vm]   /'
 echo "[vm] krunc list:"
 /bin/krunc list | sed 's/^/[vm]   /'

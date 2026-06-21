@@ -5,6 +5,7 @@
 //! to `/dev/krunc`. Per-id state is persisted under `--root` (default
 //! `/run/krunc`) like runc, so each subcommand is a separate process.
 
+mod cgroup;
 mod device;
 
 use std::collections::HashMap;
@@ -15,7 +16,7 @@ use std::process::exit;
 use serde::{Deserialize, Serialize};
 
 use device::{Device, KState};
-use krunc_oci::{config_to_spec, parse_config};
+use krunc_oci::{cgroup_config, config_to_spec, parse_config};
 
 const VERSION: &str = "1.1.0-krunc";
 const OCI_VERSION: &str = "1.0.2-dev";
@@ -36,6 +37,9 @@ struct State {
     bundle: String,
     #[serde(rename = "kruncId")]
     krunc_id: u64,
+    /// cgroup directory created for this container (for cleanup), if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cgroup: Option<String>,
 }
 
 fn main() {
@@ -147,6 +151,22 @@ fn do_create(root: &str, flags: &HashMap<String, String>, args: &[String]) {
     let dev = Device::open().unwrap_or_else(|e| die(format!("open /dev/krunc: {e}")));
     let (kid, pid) = dev.create(&spec).unwrap_or_else(|e| die(format!("create: {e}")));
 
+    // cgroup placement (userspace configures; the kernel enforces).
+    let cg = cgroup_config(&cfg);
+    let cgroup_dir = match cgroup::Cgroup::create(id, &cg) {
+        Ok(Some(c)) => {
+            if let Err(e) = c.place(pid) {
+                eprintln!("krunc: warning: cgroup placement: {e}");
+            }
+            Some(c.dir().to_string_lossy().into_owned())
+        }
+        Ok(None) => None,
+        Err(e) => {
+            eprintln!("krunc: warning: cgroup setup: {e}");
+            None
+        }
+    };
+
     save_state(
         root,
         &State {
@@ -156,6 +176,7 @@ fn do_create(root: &str, flags: &HashMap<String, String>, args: &[String]) {
             pid,
             bundle: bundle.to_string_lossy().into_owned(),
             krunc_id: kid,
+            cgroup: cgroup_dir,
         },
     );
     if let Some(pf) = flags.get("--pid-file") {
@@ -205,6 +226,9 @@ fn do_delete(root: &str, flags: &HashMap<String, String>, args: &[String]) {
     let st = load_state(root, id);
     if let Ok(dev) = Device::open() {
         let _ = dev.delete(st.krunc_id);
+    }
+    if let Some(cg) = &st.cgroup {
+        cgroup::remove(Path::new(cg));
     }
     let _ = fs::remove_dir_all(state_dir(root, id));
 }

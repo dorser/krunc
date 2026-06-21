@@ -44,9 +44,22 @@ cp "$REPO/examples/rootfs-skel/init.sh" "$ROOT/bundle/rootfs/init.sh"
 cp "$REPO/examples/bundle/config.json" "$ROOT/bundle/config.json"
 chmod +x "$ROOT/bundle/rootfs/init.sh" "$ROOT/bundle/rootfs/bin/busybox"
 
+# deterministic cgroup pids probe (calls fork(2) directly; see krunc-forktest)
+FORKTEST="$REPO/userspace/target/x86_64-unknown-linux-musl/release/forktest"
+if [ -x "$FORKTEST" ]; then
+	cp "$FORKTEST" "$ROOT/bundle/rootfs/bin/forktest"
+	chmod +x "$ROOT/bundle/rootfs/bin/forktest"
+fi
+
 # device nodes (need root)
 sudo mknod -m 600 "$ROOT/dev/console" c 5 1
 sudo mknod -m 666 "$ROOT/dev/null"    c 1 3
+
+# minimal /dev for the container rootfs so ordinary workloads (e.g. shells that
+# redirect background jobs from /dev/null) behave; a hardened deployment would
+# have the runtime build this from a tmpfs rather than shipping it in the image.
+sudo mknod -m 666 "$ROOT/bundle/rootfs/dev/null" c 1 3
+sudo mknod -m 666 "$ROOT/bundle/rootfs/dev/zero" c 1 5
 
 # pack (root, to preserve nodes/ownership)
 ( cd "$ROOT" && sudo find . | sudo cpio -o -H newc --quiet ) | gzip -9 > "$OUT"

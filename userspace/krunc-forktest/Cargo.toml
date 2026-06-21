@@ -1,0 +1,13 @@
+[package]
+name = "krunc-forktest"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0"
+description = "Deterministic cgroup pids.max probe used by the krunc QEMU tests."
+
+[[bin]]
+name = "forktest"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"

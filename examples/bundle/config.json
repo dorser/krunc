@@ -8,7 +8,8 @@
     "env": [
       "PATH=/bin:/sbin:/usr/bin:/usr/sbin",
       "TERM=linux",
-      "container=krunc"
+      "container=krunc",
+      "KRUNC_PIDS_TEST=1"
     ],
     "cwd": "/",
     "noNewPrivileges": true,
@@ -27,6 +28,8 @@
       { "type": "uts" },
       { "type": "ipc" },
       { "type": "network" }
-    ]
+    ],
+    "cgroupsPath": "krunc/oci1",
+    "resources": { "pids": { "limit": 16 } }
   }
 }

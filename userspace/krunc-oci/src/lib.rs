@@ -122,6 +122,47 @@ pub struct Linux {
     /// gid mappings for a user namespace.
     #[serde(default)]
     pub gid_mappings: Vec<LinuxIdMapping>,
+    /// cgroup resource limits.
+    pub resources: Option<Resources>,
+    /// cgroups path (relative to the cgroup mount).
+    pub cgroups_path: Option<String>,
+}
+
+/// `config.json` `linux.resources` (the subset krunc enforces via cgroup v2).
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct Resources {
+    /// pids controller.
+    pub pids: Option<Pids>,
+}
+
+/// `config.json` `linux.resources.pids`.
+#[derive(Debug, Deserialize, Default)]
+pub struct Pids {
+    /// Maximum number of pids (`pids.max`).
+    pub limit: i64,
+}
+
+/// Cgroup configuration extracted for the CLI to apply (userspace configures the
+/// cgroup; the kernel enforces it).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct CgroupConfig {
+    /// Path relative to the cgroup-v2 mount (default `krunc/<id>` if absent).
+    pub path: Option<String>,
+    /// `pids.max`, if set.
+    pub pids_limit: Option<i64>,
+}
+
+/// Extract the cgroup configuration from a parsed config.
+pub fn cgroup_config(cfg: &OciConfig) -> CgroupConfig {
+    let linux = cfg.linux.as_ref();
+    CgroupConfig {
+        path: linux.and_then(|l| l.cgroups_path.clone()),
+        pids_limit: linux
+            .and_then(|l| l.resources.as_ref())
+            .and_then(|r| r.pids.as_ref())
+            .map(|p| p.limit),
+    }
 }
 
 /// A `linux.namespaces` entry.
@@ -483,5 +524,23 @@ mod tests {
     #[test]
     fn invalid_json_rejected() {
         assert!(matches!(parse_config("{not json"), Err(OciError::Json(_))));
+    }
+
+    #[test]
+    fn cgroup_config_extracted() {
+        let cfg = parse_config(
+            r#"{"process":{"args":["/x"]},"root":{"path":"r"},
+                "linux":{"cgroupsPath":"krunc/c1","resources":{"pids":{"limit":64}}}}"#,
+        )
+        .unwrap();
+        let cg = cgroup_config(&cfg);
+        assert_eq!(cg.path.as_deref(), Some("krunc/c1"));
+        assert_eq!(cg.pids_limit, Some(64));
+    }
+
+    #[test]
+    fn cgroup_config_absent() {
+        let cfg = parse_config(r#"{"process":{"args":["/x"]},"root":{"path":"r"}}"#).unwrap();
+        assert_eq!(cgroup_config(&cfg), CgroupConfig::default());
     }
 }

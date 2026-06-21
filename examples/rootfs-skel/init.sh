@@ -31,6 +31,18 @@ ls -1 / 2>&-
 echo "[container] network interfaces (NET namespace):"
 if ip -o link 2>&-; then :; else ls /sys/class/net 2>&-; fi
 
+# pids cgroup limit test: try to spawn many background processes. If the cgroup
+# pids.max is enforced, only that many will start. They stay alive (sleep) so the
+# host can read pids.current.
+if [ "$KRUNC_PIDS_TEST" = 1 ]; then
+	echo "[container] my cgroup: $(cat /proc/self/cgroup 2>&-)"
+	echo "[container] pids test: forktest will fork until the cgroup pids.max stops it"
+	# Hand off to the deterministic fork(2) probe. It becomes PID 1, forks until
+	# the cgroup denies it, then keeps every survivor alive (each pause(2)s) so
+	# the host can read pids.current == pids.max; the host stops us via 'krunc kill'.
+	exec /bin/forktest
+fi
+
 echo "[container] sleeping briefly so the host can inspect our namespaces..."
 sleep 3
 echo "[container] goodbye (PID 1 exiting -> namespaces tear down)"
