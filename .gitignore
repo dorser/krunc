@@ -1,0 +1,25 @@
+# build artifacts
+*.o
+*.ko
+*.mod
+*.mod.c
+*.mod.o
+*.cmd
+.*.cmd
+*.symvers
+*.order
+.tmp_versions/
+module/.cache.mk
+module/*.rs.orig
+
+# kernel trees / images / initramfs (built on the test VM, never committed)
+linux-*/
+*.tar.xz
+*.cpio
+*.cpio.gz
+bzImage
+vmlinux
+
+# editor
+*.swp
+*~

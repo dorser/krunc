@@ -1,0 +1,70 @@
+=================================================================
+ Captured serial console of the krunc QEMU/KVM demo.
+ Reproduce with: scripts/run-test.sh  (after scripts/build-kernel.sh)
+ Lines like "[    2.76...] krunc: ..." are kernel log (dmesg);
+ "[vm] ..." is the host-side driver; "[container] ..." is the app
+ running inside the kernel-orchestrated container.
+=================================================================
+# krunc - a container runtime in the kernel
+# kernel        : 6.18.0
+# host hostname : (none)
+##################################################################
+[vm] loading krunc.ko ...
+[    2.769419] krunc: loading out-of-tree module taints kernel.
+[    2.776546] krunc: loading kernel container runtime; control device /dev/krunc
+[vm] loaded; control device: crw-------    1 0        0          10, 258 Jun 21 13:16 /dev/krunc
+
+================ DEMO 1: launch an isolated container ================
+[vm] echo "run rootfs=/containers/demo host=krunc-demo exec=/bin/sh arg=/init.sh" > /dev/krunc
+[    2.798698] krunc: started container id=1 pid=83
+==================================================================
+[container] Hello from inside a krunc container!
+[container] hostname (UTS namespace) : krunc-demo
+[container] my pid   (PID namespace) : 1        <- should be 1
+[container] mounted private /proc
+[container] processes I can see (PID namespace):
+PID   COMMAND
+    1 sh
+    6 ps
+[container] filesystem root (mount ns + chroot):
+bin
+dev
+init.sh
+proc
+sys
+tmp
+[container] network interfaces (NET namespace):
+           lo:
+           sit0@NONE:
+[container] writing a file to prove we have our own rootfs...
+[container] krunc was here
+[container] sleeping briefly so the host can inspect our namespaces...
+[vm] container started with host-visible pid: 83
+[vm] --- namespace isolation (host view of pid 83) ---
+[vm]   pid: ISOLATED  (host pid:[4026531836] vs container pid:[4026532167])
+[vm]   mnt: ISOLATED  (host mnt:[4026531832] vs container mnt:[4026532164])
+[vm]   uts: ISOLATED  (host uts:[4026531838] vs container uts:[4026532165])
+[vm]   ipc: ISOLATED  (host ipc:[4026531839] vs container ipc:[4026532166])
+[vm]   net: ISOLATED  (host net:[4026531833] vs container net:[4026532168])
+[container] goodbye (PID 1 exiting -> namespaces tear down)
+==================================================================
+[    5.908211] sh (83) used greatest stack depth: 11064 bytes left
+
+============ DEMO 2: launch + kill a long-running container ============
+[vm] echo "run rootfs=/containers/demo host=sleeper exec=/bin/busybox arg=sleep arg=600" > /dev/krunc
+[    5.915773] krunc: started container id=2 pid=108
+[vm] container table:
+[vm]   ID    PID      STATE    HOSTNAME
+[vm]   1     83       exited   krunc-demo
+[vm]   2     108      running  sleeper
+[vm] stopping sleeper (pid 108): echo "kill 108" > /dev/krunc
+[    6.933196] krunc: killed container pid 108
+[vm] container table after kill:
+[vm]   ID    PID      STATE    HOSTNAME
+[vm]   1     83       exited   krunc-demo
+
+================ DEMO 3: unload the runtime cleanly ================
+[vm] krunc.ko unloaded cleanly
+[vm]   /dev/krunc removed
+
+[vm] all demos complete; powering off.
