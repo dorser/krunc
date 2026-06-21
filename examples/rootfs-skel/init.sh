@@ -69,6 +69,17 @@ if [ "$KRUNC_PIDS_TEST" = 1 ]; then
 	else
 		echo "[container]   chmod /tmp: blocked by seccomp (EPERM)"
 	fi
+	# Active kill-on-escape: a workload that *attempts* to load a kernel module
+	# (a classic privilege-escalation / escape vector) is KILLED by the policy
+	# (SCMP_ACT_KILL_PROCESS), not merely denied. insmod is run as a child so the
+	# kill takes only it; the container's PID 1 keeps running.
+	insmod /init.sh 2>/dev/null
+	rc=$?
+	if [ "$rc" -ge 128 ]; then
+		echo "[container]   insmod (module load): KILLED by seccomp, signal $((rc - 128)) (active kill-on-escape)"
+	else
+		echo "[container]   insmod (module load): exited rc=$rc (expected SIGKILL/137)"
+	fi
 
 	echo "[container] --- resource limits (rlimits / oom) ---"
 	echo "[container]   RLIMIT_NOFILE (ulimit -n) = $(ulimit -n)  (config soft=256)"

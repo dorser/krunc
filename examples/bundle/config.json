@@ -51,11 +51,17 @@
         {
           "names": [
             "ptrace", "keyctl", "add_key", "request_key", "bpf",
-            "userfaultfd", "perf_event_open", "kexec_load",
-            "init_module", "finit_module", "setns"
+            "userfaultfd", "perf_event_open", "setns"
           ],
           "action": "SCMP_ACT_ERRNO",
           "errnoRet": 1
+        },
+        {
+          "names": [
+            "init_module", "finit_module", "delete_module",
+            "kexec_load", "kexec_file_load"
+          ],
+          "action": "SCMP_ACT_KILL_PROCESS"
         }
       ]
     }
