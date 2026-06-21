@@ -100,6 +100,10 @@ not in one shot.
   container has `CapBnd=CapEff=CapPrm=00000000200004e1` (exactly the 6 bounded
   caps) and `NoNewPrivs=1`, vs `000001ffffffffff`/`0` for the unconfined
   text-interface container. See `docs/sample-v2-confinement.txt`.
-- **Next:** M3 mounts/pivot_root + masked/ro paths, M5 seccomp, M6 cgroups,
-  M7 user-ns mapping, M7/M8 Landlock + lifetime enforcement, M9 conformance,
-  M10 containerd, then the full `Domain` object (M2 remainder).
+- **M3 (partial) done** — the kernel mounts a private `/proc` + `/sys` for the
+  container in-kernel (via `path_mount`) before dropping privileges, so even a
+  confined container has them. (Full `pivot_root`, the `mounts[]` list, and
+  masked/readonly paths are still to come.)
+- **Next:** M3 remainder (pivot_root + masked/ro paths + mounts[]), M5 seccomp,
+  M6 cgroups, M7 user-ns mapping + Landlock, M8 lifetime enforcement, M9
+  conformance, M10 containerd, then the full `Domain` typestate object + domainfd.
