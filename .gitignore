@@ -26,3 +26,7 @@ vmlinux
 # go binaries (built on the VM)
 cli/krunc
 conformance/krunc-conformance
+
+# rust build output
+userspace/target/
+Cargo.lock

@@ -1,0 +1,9 @@
+[package]
+name = "krunc-abi"
+version = "0.1.0"
+edition = "2021"
+description = "Versioned, bounds-checked binary ABI for the krunc userspace <-> kernel boundary"
+license = "GPL-2.0"
+
+[lints.rust]
+unsafe_code = "forbid"

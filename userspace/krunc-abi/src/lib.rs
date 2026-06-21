@@ -1,0 +1,633 @@
+//! `krunc-abi` — the versioned, bounds-checked binary spec that crosses the
+//! krunc userspace ↔ kernel boundary.
+//!
+//! Untrusted parsing (OCI `config.json`) happens in userspace; the kernel must
+//! never parse JSON. Instead, userspace compiles a [`DomainSpec`] and encodes it
+//! with [`DomainSpec::encode`] into a flat, length-prefixed, little-endian byte
+//! buffer. The kernel mirrors [`decode`] with the *same* strict bounds-checking,
+//! so a malformed or oversized buffer is rejected before any field is used.
+//!
+//! The format is a fixed header followed by tagged, length-prefixed sections
+//! (TLV). Every length and count is bounded by a `MAX_*` constant; decoding is
+//! total (it returns [`AbiError`] rather than panicking) and performs no
+//! allocation proportional to an unvalidated length.
+//!
+//! This crate is `#![forbid(unsafe_code)]`: the ABI is defined in safe Rust on
+//! both sides; the kernel module mirrors this logic (also without `unsafe` for
+//! the parse itself).
+
+#![forbid(unsafe_code)]
+#![deny(missing_docs)]
+
+use std::fmt;
+
+/// Magic at the start of every encoded spec: `b"KRNC"`.
+pub const MAGIC: [u8; 4] = *b"KRNC";
+/// ABI version understood by this crate. The kernel rejects any other value.
+pub const ABI_VERSION: u32 = 1;
+
+/// Maximum size of a whole encoded spec (defends the single `copy_from_user`).
+pub const MAX_SPEC: usize = 256 * 1024;
+/// Maximum length of a single string field (path, hostname, arg, env entry).
+pub const MAX_STR: usize = 4096;
+/// Maximum number of argv entries.
+pub const MAX_ARGV: usize = 1024;
+/// Maximum number of env entries.
+pub const MAX_ENV: usize = 1024;
+/// Maximum number of id-map entries.
+pub const MAX_MAPS: usize = 340;
+/// Maximum size of an opaque seccomp program blob.
+pub const MAX_SECCOMP: usize = 64 * 1024;
+
+// ---- clone(2) namespace flags (uapi/linux/sched.h) ----
+/// `CLONE_NEWNS` — mount namespace.
+pub const NS_MOUNT: u32 = 0x0002_0000;
+/// `CLONE_NEWUTS` — UTS namespace.
+pub const NS_UTS: u32 = 0x0400_0000;
+/// `CLONE_NEWIPC` — IPC namespace.
+pub const NS_IPC: u32 = 0x0800_0000;
+/// `CLONE_NEWUSER` — user namespace.
+pub const NS_USER: u32 = 0x1000_0000;
+/// `CLONE_NEWPID` — PID namespace.
+pub const NS_PID: u32 = 0x2000_0000;
+/// `CLONE_NEWNET` — network namespace.
+pub const NS_NET: u32 = 0x4000_0000;
+/// `CLONE_NEWCGROUP` — cgroup namespace.
+pub const NS_CGROUP: u32 = 0x0200_0000;
+
+/// The set of namespaces a standard container isolates.
+pub const NS_DEFAULT: u32 = NS_MOUNT | NS_UTS | NS_IPC | NS_PID | NS_NET;
+
+// ---- boolean option flags (the `Flags` section, a u64 bitset) ----
+/// Set `no_new_privs` on the domain before exec (required for seccomp).
+pub const OPT_NO_NEW_PRIVS: u64 = 1 << 0;
+/// Make the rootfs read-only.
+pub const OPT_ROOTFS_RO: u64 = 1 << 1;
+
+/// The lifecycle operation a request carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum Op {
+    /// Create a domain + container, paused before exec.
+    Create = 1,
+    /// Release a created domain so its entrypoint execs.
+    Start = 2,
+    /// Query a domain's state.
+    State = 3,
+    /// Signal a domain's init.
+    Kill = 4,
+    /// Destroy a domain.
+    Delete = 5,
+}
+
+impl Op {
+    fn from_u32(v: u32) -> Result<Self, AbiError> {
+        Ok(match v {
+            1 => Op::Create,
+            2 => Op::Start,
+            3 => Op::State,
+            4 => Op::Kill,
+            5 => Op::Delete,
+            other => return Err(AbiError::BadOp(other)),
+        })
+    }
+}
+
+/// A uid/gid mapping line (`containerID hostID size`), as in `linux.uidMappings`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IdMap {
+    /// First id inside the container.
+    pub container_id: u32,
+    /// First id on the host.
+    pub host_id: u32,
+    /// Number of ids mapped.
+    pub size: u32,
+}
+
+/// The decoded domain specification.
+///
+/// This is the userspace-friendly owned form. [`encode`](DomainSpec::encode)
+/// turns it into the wire format; [`decode`] reconstructs it with validation.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DomainSpec {
+    /// Absolute host path of the container rootfs.
+    pub rootfs: String,
+    /// Container hostname (UTS namespace nodename). Empty = default.
+    pub hostname: String,
+    /// argv; `argv[0]` is the binary to exec.
+    pub argv: Vec<String>,
+    /// Environment, each `KEY=VALUE`.
+    pub env: Vec<String>,
+    /// Namespaces to create (bitmask of `NS_*`).
+    pub namespaces: u32,
+    /// uid mappings (for a user namespace).
+    pub uid_maps: Vec<IdMap>,
+    /// gid mappings (for a user namespace).
+    pub gid_maps: Vec<IdMap>,
+    /// Boolean options (`OPT_*`).
+    pub flags: u64,
+    /// Capability bounding set kept (a Linux capability bitmask).
+    pub cap_bounding: u64,
+    /// Opaque compiled seccomp program (a `struct sock_filter[]` blob). Empty =
+    /// no seccomp.
+    pub seccomp: Vec<u8>,
+}
+
+// Section tags. Stable wire identifiers; never reuse a value.
+mod tag {
+    pub const ROOTFS: u16 = 1;
+    pub const HOSTNAME: u16 = 2;
+    pub const ARGV: u16 = 3;
+    pub const ENV: u16 = 4;
+    pub const NAMESPACES: u16 = 5;
+    pub const UID_MAPS: u16 = 6;
+    pub const GID_MAPS: u16 = 7;
+    pub const FLAGS: u16 = 8;
+    pub const CAP_BOUNDING: u16 = 9;
+    pub const SECCOMP: u16 = 10;
+}
+
+/// Errors from encoding or (strict) decoding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AbiError {
+    /// Buffer does not start with [`MAGIC`].
+    BadMagic,
+    /// `abi_version` is not [`ABI_VERSION`].
+    UnsupportedVersion(u32),
+    /// `op` field is not a known [`Op`].
+    BadOp(u32),
+    /// Buffer ended before a field was fully read.
+    Truncated,
+    /// A length/count exceeded its `MAX_*` bound.
+    TooLarge {
+        /// What was being read.
+        what: &'static str,
+        /// The offending value.
+        value: usize,
+        /// The limit.
+        limit: usize,
+    },
+    /// A section tag appeared more than once.
+    Duplicate(u16),
+    /// A required section was absent for the given op.
+    Missing(&'static str),
+    /// A string field was not valid UTF-8.
+    Utf8,
+    /// Trailing bytes remained after the declared sections.
+    TrailingBytes,
+}
+
+impl fmt::Display for AbiError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AbiError::BadMagic => write!(f, "bad magic"),
+            AbiError::UnsupportedVersion(v) => write!(f, "unsupported abi version {v}"),
+            AbiError::BadOp(v) => write!(f, "invalid op {v}"),
+            AbiError::Truncated => write!(f, "truncated buffer"),
+            AbiError::TooLarge { what, value, limit } => {
+                write!(f, "{what} too large: {value} > {limit}")
+            }
+            AbiError::Duplicate(t) => write!(f, "duplicate section tag {t}"),
+            AbiError::Missing(s) => write!(f, "missing required section {s}"),
+            AbiError::Utf8 => write!(f, "invalid utf-8 in string field"),
+            AbiError::TrailingBytes => write!(f, "trailing bytes after sections"),
+        }
+    }
+}
+
+impl std::error::Error for AbiError {}
+
+// ============================ encoding ============================
+
+struct Writer {
+    buf: Vec<u8>,
+}
+
+impl Writer {
+    fn new() -> Self {
+        Self { buf: Vec::new() }
+    }
+    fn u16(&mut self, v: u16) {
+        self.buf.extend_from_slice(&v.to_le_bytes());
+    }
+    fn u32(&mut self, v: u32) {
+        self.buf.extend_from_slice(&v.to_le_bytes());
+    }
+    fn u64(&mut self, v: u64) {
+        self.buf.extend_from_slice(&v.to_le_bytes());
+    }
+    fn bytes(&mut self, b: &[u8]) {
+        self.buf.extend_from_slice(b);
+    }
+    /// Write a section header `[tag][pad][len]` then the payload built by `body`.
+    fn section(&mut self, tag: u16, body: impl FnOnce(&mut Writer)) {
+        let mut inner = Writer::new();
+        body(&mut inner);
+        self.u16(tag);
+        self.u16(0); // reserved/pad (keeps payload 4-aligned start)
+        self.u32(inner.buf.len() as u32);
+        self.bytes(&inner.buf);
+    }
+}
+
+fn write_strvec(w: &mut Writer, items: &[String]) {
+    w.u32(items.len() as u32);
+    for s in items {
+        w.u32(s.len() as u32);
+        w.bytes(s.as_bytes());
+    }
+}
+
+fn write_maps(w: &mut Writer, maps: &[IdMap]) {
+    w.u32(maps.len() as u32);
+    for m in maps {
+        w.u32(m.container_id);
+        w.u32(m.host_id);
+        w.u32(m.size);
+    }
+}
+
+impl DomainSpec {
+    /// Validate sizes against the `MAX_*` bounds (the same bounds the decoder
+    /// enforces) before encoding, so we never produce a buffer the kernel would
+    /// reject.
+    pub fn validate(&self) -> Result<(), AbiError> {
+        check_len("rootfs", self.rootfs.len(), MAX_STR)?;
+        check_len("hostname", self.hostname.len(), MAX_STR)?;
+        check_len("argv", self.argv.len(), MAX_ARGV)?;
+        for a in &self.argv {
+            check_len("arg", a.len(), MAX_STR)?;
+        }
+        check_len("env", self.env.len(), MAX_ENV)?;
+        for e in &self.env {
+            check_len("env-entry", e.len(), MAX_STR)?;
+        }
+        check_len("uid_maps", self.uid_maps.len(), MAX_MAPS)?;
+        check_len("gid_maps", self.gid_maps.len(), MAX_MAPS)?;
+        check_len("seccomp", self.seccomp.len(), MAX_SECCOMP)?;
+        Ok(())
+    }
+
+    /// Encode `self` for operation `op` into the wire format.
+    pub fn encode(&self, op: Op) -> Result<Vec<u8>, AbiError> {
+        self.validate()?;
+        let mut w = Writer::new();
+        w.bytes(&MAGIC);
+        w.u32(ABI_VERSION);
+        w.u32(op as u32);
+
+        // sections (only emit the non-default ones)
+        let mut count: u32 = 0;
+        let mut body = Writer::new();
+        let mut emit = |tag: u16, f: &mut dyn FnMut(&mut Writer)| {
+            body.section(tag, |w| f(w));
+            count += 1;
+        };
+
+        if !self.rootfs.is_empty() {
+            emit(tag::ROOTFS, &mut |w| w.bytes(self.rootfs.as_bytes()));
+        }
+        if !self.hostname.is_empty() {
+            emit(tag::HOSTNAME, &mut |w| w.bytes(self.hostname.as_bytes()));
+        }
+        if !self.argv.is_empty() {
+            emit(tag::ARGV, &mut |w| write_strvec(w, &self.argv));
+        }
+        if !self.env.is_empty() {
+            emit(tag::ENV, &mut |w| write_strvec(w, &self.env));
+        }
+        if self.namespaces != 0 {
+            emit(tag::NAMESPACES, &mut |w| w.u32(self.namespaces));
+        }
+        if !self.uid_maps.is_empty() {
+            emit(tag::UID_MAPS, &mut |w| write_maps(w, &self.uid_maps));
+        }
+        if !self.gid_maps.is_empty() {
+            emit(tag::GID_MAPS, &mut |w| write_maps(w, &self.gid_maps));
+        }
+        if self.flags != 0 {
+            emit(tag::FLAGS, &mut |w| w.u64(self.flags));
+        }
+        if self.cap_bounding != 0 {
+            emit(tag::CAP_BOUNDING, &mut |w| w.u64(self.cap_bounding));
+        }
+        if !self.seccomp.is_empty() {
+            emit(tag::SECCOMP, &mut |w| w.bytes(&self.seccomp));
+        }
+
+        w.u32(count);
+        w.bytes(&body.buf);
+
+        if w.buf.len() > MAX_SPEC {
+            return Err(AbiError::TooLarge {
+                what: "spec",
+                value: w.buf.len(),
+                limit: MAX_SPEC,
+            });
+        }
+        Ok(w.buf)
+    }
+}
+
+fn check_len(what: &'static str, value: usize, limit: usize) -> Result<(), AbiError> {
+    if value > limit {
+        Err(AbiError::TooLarge { what, value, limit })
+    } else {
+        Ok(())
+    }
+}
+
+// ============================ decoding ============================
+
+/// A bounds-checked, panic-free cursor over the input buffer.
+struct Reader<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Reader<'a> {
+    fn new(buf: &'a [u8]) -> Self {
+        Self { buf, pos: 0 }
+    }
+    fn remaining(&self) -> usize {
+        self.buf.len() - self.pos
+    }
+    fn take(&mut self, n: usize) -> Result<&'a [u8], AbiError> {
+        if n > self.remaining() {
+            return Err(AbiError::Truncated);
+        }
+        let s = &self.buf[self.pos..self.pos + n];
+        self.pos += n;
+        Ok(s)
+    }
+    fn u16(&mut self) -> Result<u16, AbiError> {
+        Ok(u16::from_le_bytes(self.take(2)?.try_into().unwrap()))
+    }
+    fn u32(&mut self) -> Result<u32, AbiError> {
+        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+    }
+    fn u64(&mut self) -> Result<u64, AbiError> {
+        Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+    }
+}
+
+fn read_string(r: &mut Reader<'_>, what: &'static str, limit: usize) -> Result<String, AbiError> {
+    let len = r.u32()? as usize;
+    check_len(what, len, limit)?;
+    let bytes = r.take(len)?;
+    String::from_utf8(bytes.to_vec()).map_err(|_| AbiError::Utf8)
+}
+
+fn read_strvec(r: &mut Reader<'_>, what: &'static str, max: usize) -> Result<Vec<String>, AbiError> {
+    let n = r.u32()? as usize;
+    check_len(what, n, max)?;
+    let mut v = Vec::with_capacity(n);
+    for _ in 0..n {
+        v.push(read_string(r, "string", MAX_STR)?);
+    }
+    Ok(v)
+}
+
+fn read_maps(r: &mut Reader<'_>, what: &'static str) -> Result<Vec<IdMap>, AbiError> {
+    let n = r.u32()? as usize;
+    check_len(what, n, MAX_MAPS)?;
+    let mut v = Vec::with_capacity(n);
+    for _ in 0..n {
+        v.push(IdMap {
+            container_id: r.u32()?,
+            host_id: r.u32()?,
+            size: r.u32()?,
+        });
+    }
+    Ok(v)
+}
+
+/// Decode a buffer into `(op, spec)`, enforcing every bound. Total: never panics.
+pub fn decode(buf: &[u8]) -> Result<(Op, DomainSpec), AbiError> {
+    if buf.len() > MAX_SPEC {
+        return Err(AbiError::TooLarge {
+            what: "spec",
+            value: buf.len(),
+            limit: MAX_SPEC,
+        });
+    }
+    let mut r = Reader::new(buf);
+    if r.take(4)? != MAGIC {
+        return Err(AbiError::BadMagic);
+    }
+    let version = r.u32()?;
+    if version != ABI_VERSION {
+        return Err(AbiError::UnsupportedVersion(version));
+    }
+    let op = Op::from_u32(r.u32()?)?;
+    let section_count = r.u32()? as usize;
+    // A section header is 8 bytes; a buffer can't claim more sections than fit.
+    check_len("section_count", section_count, MAX_SPEC / 8)?;
+
+    let mut spec = DomainSpec::default();
+    let mut seen: u64 = 0; // bitset of tags already parsed
+    for _ in 0..section_count {
+        let t = r.u16()?;
+        let _pad = r.u16()?;
+        let len = r.u32()? as usize;
+        if len > r.remaining() {
+            return Err(AbiError::Truncated);
+        }
+        let payload = r.take(len)?;
+        if t < 64 {
+            let bit = 1u64 << t;
+            if seen & bit != 0 {
+                return Err(AbiError::Duplicate(t));
+            }
+            seen |= bit;
+        }
+        let mut sr = Reader::new(payload);
+        match t {
+            tag::ROOTFS => spec.rootfs = utf8(payload, MAX_STR, "rootfs")?,
+            tag::HOSTNAME => spec.hostname = utf8(payload, MAX_STR, "hostname")?,
+            tag::ARGV => spec.argv = read_strvec(&mut sr, "argv", MAX_ARGV)?,
+            tag::ENV => spec.env = read_strvec(&mut sr, "env", MAX_ENV)?,
+            tag::NAMESPACES => spec.namespaces = sr.u32()?,
+            tag::UID_MAPS => spec.uid_maps = read_maps(&mut sr, "uid_maps")?,
+            tag::GID_MAPS => spec.gid_maps = read_maps(&mut sr, "gid_maps")?,
+            tag::FLAGS => spec.flags = sr.u64()?,
+            tag::CAP_BOUNDING => spec.cap_bounding = sr.u64()?,
+            tag::SECCOMP => {
+                check_len("seccomp", payload.len(), MAX_SECCOMP)?;
+                spec.seccomp = payload.to_vec();
+            }
+            _ => { /* unknown tag: ignore for forward-compat */ }
+        }
+    }
+    if r.remaining() != 0 {
+        return Err(AbiError::TrailingBytes);
+    }
+
+    if op == Op::Create {
+        if spec.rootfs.is_empty() {
+            return Err(AbiError::Missing("rootfs"));
+        }
+        if spec.argv.is_empty() {
+            return Err(AbiError::Missing("argv"));
+        }
+    }
+    Ok((op, spec))
+}
+
+fn utf8(b: &[u8], limit: usize, what: &'static str) -> Result<String, AbiError> {
+    check_len(what, b.len(), limit)?;
+    String::from_utf8(b.to_vec()).map_err(|_| AbiError::Utf8)
+}
+
+// ============================ tests ============================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample() -> DomainSpec {
+        DomainSpec {
+            rootfs: "/containers/demo/rootfs".into(),
+            hostname: "oci-demo".into(),
+            argv: vec!["/bin/sh".into(), "/init.sh".into()],
+            env: vec!["PATH=/bin".into(), "TERM=linux".into()],
+            namespaces: NS_DEFAULT | NS_USER,
+            uid_maps: vec![IdMap { container_id: 0, host_id: 100000, size: 65536 }],
+            gid_maps: vec![IdMap { container_id: 0, host_id: 100000, size: 65536 }],
+            flags: OPT_NO_NEW_PRIVS | OPT_ROOTFS_RO,
+            cap_bounding: 0x0000_0000_a80c_25fb,
+            seccomp: vec![0xde, 0xad, 0xbe, 0xef],
+        }
+    }
+
+    #[test]
+    fn round_trip_full() {
+        let s = sample();
+        let buf = s.encode(Op::Create).unwrap();
+        let (op, decoded) = decode(&buf).unwrap();
+        assert_eq!(op, Op::Create);
+        assert_eq!(decoded, s);
+    }
+
+    #[test]
+    fn round_trip_minimal() {
+        let s = DomainSpec {
+            rootfs: "/r".into(),
+            argv: vec!["/bin/true".into()],
+            namespaces: NS_DEFAULT,
+            ..Default::default()
+        };
+        let buf = s.encode(Op::Create).unwrap();
+        let (_op, d) = decode(&buf).unwrap();
+        assert_eq!(d, s);
+    }
+
+    #[test]
+    fn all_ops_round_trip() {
+        for op in [Op::Create, Op::Start, Op::State, Op::Kill, Op::Delete] {
+            // Start/State/Kill/Delete don't require rootfs/argv.
+            let s = if op == Op::Create { sample() } else { DomainSpec::default() };
+            let buf = s.encode(op).unwrap();
+            let (got, _d) = decode(&buf).unwrap();
+            assert_eq!(got, op);
+        }
+    }
+
+    #[test]
+    fn rejects_bad_magic() {
+        let mut buf = sample().encode(Op::Create).unwrap();
+        buf[0] ^= 0xff;
+        assert_eq!(decode(&buf), Err(AbiError::BadMagic));
+    }
+
+    #[test]
+    fn rejects_bad_version() {
+        let mut buf = sample().encode(Op::Create).unwrap();
+        buf[4] = 0xff; // bump version low byte
+        assert!(matches!(decode(&buf), Err(AbiError::UnsupportedVersion(_))));
+    }
+
+    #[test]
+    fn rejects_bad_op() {
+        let mut buf = sample().encode(Op::Create).unwrap();
+        // op is at offset 8..12
+        buf[8] = 99;
+        assert!(matches!(decode(&buf), Err(AbiError::BadOp(_))));
+    }
+
+    #[test]
+    fn rejects_every_truncation() {
+        let buf = sample().encode(Op::Create).unwrap();
+        for n in 0..buf.len() {
+            // Every strict prefix must be rejected, never panic, never accepted.
+            assert!(decode(&buf[..n]).is_err(), "prefix len {n} was accepted");
+        }
+    }
+
+    #[test]
+    fn rejects_create_without_rootfs() {
+        let s = DomainSpec {
+            argv: vec!["/bin/true".into()],
+            ..Default::default()
+        };
+        assert_eq!(s.encode(Op::Create).and_then(|b| decode(&b).map(|_| ())), Err(AbiError::Missing("rootfs")));
+    }
+
+    #[test]
+    fn rejects_create_without_argv() {
+        let s = DomainSpec { rootfs: "/r".into(), ..Default::default() };
+        assert_eq!(decode(&s.encode(Op::Create).unwrap()), Err(AbiError::Missing("argv")));
+    }
+
+    #[test]
+    fn validate_rejects_oversized_argv() {
+        let s = DomainSpec {
+            rootfs: "/r".into(),
+            argv: vec!["x".into(); MAX_ARGV + 1],
+            ..Default::default()
+        };
+        assert!(matches!(s.encode(Op::Create), Err(AbiError::TooLarge { .. })));
+    }
+
+    #[test]
+    fn validate_rejects_oversized_string() {
+        let s = DomainSpec {
+            rootfs: "x".repeat(MAX_STR + 1),
+            argv: vec!["/bin/true".into()],
+            ..Default::default()
+        };
+        assert!(matches!(s.encode(Op::Create), Err(AbiError::TooLarge { .. })));
+    }
+
+    #[test]
+    fn trailing_bytes_rejected() {
+        let mut buf = sample().encode(Op::Create).unwrap();
+        buf.push(0);
+        assert_eq!(decode(&buf), Err(AbiError::TrailingBytes));
+    }
+
+    #[test]
+    fn unknown_tag_ignored_forward_compat() {
+        // Hand-craft a buffer with one unknown high tag plus the required ones.
+        let mut w = Writer::new();
+        w.bytes(&MAGIC);
+        w.u32(ABI_VERSION);
+        w.u32(Op::Create as u32);
+        w.u32(3); // rootfs, argv, unknown
+        let mut body = Writer::new();
+        body.section(tag::ROOTFS, |w| w.bytes(b"/r"));
+        body.section(tag::ARGV, |w| write_strvec(w, &["/bin/true".to_string()]));
+        body.section(0xfff0, |w| w.bytes(b"future")); // unknown, must be ignored
+        w.u32(3);
+        // Note: count already written above; rebuild cleanly instead.
+        let mut w2 = Writer::new();
+        w2.bytes(&MAGIC);
+        w2.u32(ABI_VERSION);
+        w2.u32(Op::Create as u32);
+        w2.u32(3);
+        w2.bytes(&body.buf);
+        let (_op, d) = decode(&w2.buf).unwrap();
+        assert_eq!(d.rootfs, "/r");
+        assert_eq!(d.argv, vec!["/bin/true".to_string()]);
+    }
+}
