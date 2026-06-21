@@ -114,7 +114,10 @@ not in one shot.
   remounted `MS_RDONLY`, all in the container's mount namespace before exec.
   Host-verified in QEMU: `/proc/kcore` reads 0 bytes, `/proc/sysrq-trigger`
   writes are inert, and writes to `/etc` and `/proc/sys` fail with `EROFS`.
-  (Full `pivot_root` and the general `mounts[]` list are still to come.)
+  The kernel also performs the bundle's **`mounts[]`** (in order, replacing the
+  hard-coded default), translating OCI options to `MS_*` flags — verified by a
+  `tmpfs` `/tmp` mounted `nosuid,nodev,noexec`. (Full `pivot_root` + `root.readonly`
+  and sysctls are still to come.)
 - **M6 (done) — cgroup v2.** The CLI creates the cgroup, sets limits, and places
   the container; the kernel enforces them. Two controllers, each verified
   deterministically: **pids** (`krunc-forktest` — `pids.current` pins at
