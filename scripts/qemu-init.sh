@@ -91,8 +91,8 @@ sleep 1
 echo "[vm] krunc state oci1   (expect: running)"
 /bin/krunc state oci1 | grep -E '"status"|"pid"' | sed 's/^/[vm]   /'
 echo "[vm] ----- kernel-applied confinement, host view of /proc/$CPID/status -----"
-grep -E "^(CapBnd|CapPrm|CapEff|NoNewPrivs):" /proc/$CPID/status 2>/dev/null | sed 's/^/[vm]   /'
-echo "[vm]   expected: CapBnd 00000000200004e1 (the 6 bounded caps), NoNewPrivs 1"
+grep -E "^(CapBnd|CapPrm|CapEff|NoNewPrivs|Seccomp):" /proc/$CPID/status 2>/dev/null | sed 's/^/[vm]   /'
+echo "[vm]   expected: CapBnd 00000000200004e1 (the 6 bounded caps), NoNewPrivs 1, Seccomp 2 (filter)"
 # Give the container's forktest probe a moment to fork up to the cap. Its parent
 # and every survivor pause(), so this snapshot is stable until we kill them.
 sleep 3

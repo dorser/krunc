@@ -22,6 +22,8 @@ use krunc_abi::{
 };
 use serde::Deserialize;
 
+pub mod seccomp;
+
 /// The OCI runtime `config.json`, restricted to the fields krunc consumes.
 #[derive(Debug, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -132,6 +134,44 @@ pub struct Linux {
     /// Paths to remount read-only inside the container.
     #[serde(default)]
     pub readonly_paths: Vec<String>,
+    /// seccomp syscall policy (compiled to a BPF program for the kernel).
+    pub seccomp: Option<Seccomp>,
+}
+
+/// `config.json` `linux.seccomp`: the syscall policy. krunc compiles the
+/// arg-less subset (see [`seccomp::compile`]) into a classic-BPF program.
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct Seccomp {
+    /// Action applied to syscalls with no matching rule (e.g. `SCMP_ACT_ALLOW`).
+    pub default_action: String,
+    /// errno returned when `default_action` is `SCMP_ACT_ERRNO` (default EPERM).
+    #[serde(default)]
+    pub default_errno_ret: Option<u32>,
+    /// Target architectures (informational; krunc targets x86-64 only).
+    #[serde(default)]
+    pub architectures: Vec<String>,
+    /// Per-syscall rules, evaluated in order (first match wins).
+    #[serde(default)]
+    pub syscalls: Vec<SeccompSyscall>,
+}
+
+/// One `config.json` `linux.seccomp.syscalls[]` rule.
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SeccompSyscall {
+    /// Syscall names this rule applies to.
+    #[serde(default)]
+    pub names: Vec<String>,
+    /// Action for these syscalls (e.g. `SCMP_ACT_ERRNO`).
+    pub action: String,
+    /// errno returned when `action` is `SCMP_ACT_ERRNO` (default EPERM).
+    #[serde(default)]
+    pub errno_ret: Option<u32>,
+    /// Argument matchers. krunc does not honor these, so a non-empty list makes
+    /// compilation fail rather than silently weaken the policy.
+    #[serde(default)]
+    pub args: Vec<serde_json::Value>,
 }
 
 /// `config.json` `linux.resources` (the subset krunc enforces via cgroup v2).
@@ -341,6 +381,7 @@ pub fn config_to_spec(bundle: &Path, cfg: &OciConfig) -> Result<DomainSpec, OciE
     let mut gid_maps = Vec::new();
     let mut masked_paths = Vec::new();
     let mut readonly_paths = Vec::new();
+    let mut seccomp = Vec::new();
     if let Some(linux) = &cfg.linux {
         for ns in &linux.namespaces {
             if ns.path.is_some() {
@@ -362,6 +403,9 @@ pub fn config_to_spec(bundle: &Path, cfg: &OciConfig) -> Result<DomainSpec, OciE
             .collect();
         masked_paths = linux.masked_paths.clone();
         readonly_paths = linux.readonly_paths.clone();
+        if let Some(sc) = &linux.seccomp {
+            seccomp = seccomp::compile(sc)?;
+        }
     }
 
     let mut flags = 0u64;
@@ -387,8 +431,7 @@ pub fn config_to_spec(bundle: &Path, cfg: &OciConfig) -> Result<DomainSpec, OciE
         gid_maps,
         flags,
         cap_bounding,
-        // seccomp compilation (config.json linux.seccomp -> sock_filter[]) is M5.
-        seccomp: Vec::new(),
+        seccomp,
         masked_paths,
         readonly_paths,
     };

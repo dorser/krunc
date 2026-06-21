@@ -77,6 +77,9 @@ extern "C" {
         fstype: *const c_char,
         flags: c_ulong,
     ) -> c_int;
+    /// Install a kernel-resident classic-BPF seccomp program (`len` instructions)
+    /// on the current task. Must be called after no_new_privs is set.
+    fn krunc_seccomp_install(insns: *const c_void, len: c_uint) -> c_int;
     // msleep() is exported by mainline.
     fn msleep(msecs: c_uint);
 }
@@ -166,6 +169,7 @@ struct ContainerCtx {
     envp: KVec<KVec<u8>>,      // each NUL-terminated; empty -> default env
     cap_bounding: u64,         // capability ceiling to apply (0 = leave untouched)
     no_new_privs: bool,        // set no_new_privs before exec
+    seccomp: KVec<u8>,         // compiled sock_filter[] blob (empty = no seccomp)
     masked: KVec<KVec<u8>>,    // paths over-mounted to be inaccessible (each NUL-terminated)
     readonly: KVec<KVec<u8>>,  // paths remounted read-only (each NUL-terminated)
     ctrl: Option<Arc<ContainerControl>>, // Some -> two-phase (created) container
@@ -396,6 +400,7 @@ fn handle_text_command(buf: &[u8]) -> Result {
         false,
         KVec::new(),
         KVec::new(),
+        KVec::new(),
     )?;
     pr_info!("started container id={} pid={}\n", id, pid);
     Ok(())
@@ -580,6 +585,7 @@ struct DecodedSpec {
     ns: u32,
     cap_bounding: u64,
     flags: u64,
+    seccomp: KVec<u8>,
     masked: KVec<KVec<u8>>,
     readonly: KVec<KVec<u8>>,
 }
@@ -627,6 +633,7 @@ fn decode_spec(buf: &[u8]) -> Result<DecodedSpec> {
         ns: 0,
         cap_bounding: 0,
         flags: 0,
+        seccomp: KVec::new(),
         masked: KVec::new(),
         readonly: KVec::new(),
     };
@@ -647,9 +654,15 @@ fn decode_spec(buf: &[u8]) -> Result<DecodedSpec> {
             5 => d.ns = sr.u32()?,                 // NAMESPACES
             8 => d.flags = sr.u64()?,              // FLAGS
             9 => d.cap_bounding = sr.u64()?,       // CAP_BOUNDING
+            10 => {
+                // SECCOMP: a raw sock_filter[] blob; copy verbatim (8 bytes/insn).
+                let mut v: KVec<u8> = KVec::new();
+                v.extend_from_slice(payload, GFP_KERNEL)?;
+                d.seccomp = v;
+            }
             11 => d.masked = read_strvec_k(&mut sr)?, // MASKED_PATHS
             12 => d.readonly = read_strvec_k(&mut sr)?, // RO_PATHS
-            // tags 6/7 (uid/gid maps) and 10 (seccomp) land in later milestones.
+            // tags 6/7 (uid/gid maps) land in a later milestone.
             _ => {}
         }
     }
@@ -687,6 +700,7 @@ fn create_from_blob(spec: &[u8]) -> Result<(u64, i32)> {
         true,
         d.cap_bounding,
         no_new_privs,
+        d.seccomp,
         d.masked,
         d.readonly,
     )
@@ -703,6 +717,7 @@ fn spawn(
     paused: bool,
     cap_bounding: u64,
     no_new_privs: bool,
+    seccomp: KVec<u8>,
     masked: KVec<KVec<u8>>,
     readonly: KVec<KVec<u8>>,
 ) -> Result<(u64, i32)> {
@@ -728,6 +743,7 @@ fn spawn(
             envp,
             cap_bounding,
             no_new_privs,
+            seccomp,
             masked,
             readonly,
             ctrl: ctrl.as_ref().map(|a| a.clone()),
@@ -872,6 +888,23 @@ unsafe extern "C" fn container_entry(arg: *mut c_void) -> c_int {
     // which capabilities could leak.
     // SAFETY: FFI call into the vmlinux helper, operating on `current`.
     unsafe { krunc_apply_creds(ctx.cap_bounding, if ctx.no_new_privs { 1 } else { 0 }) };
+
+    // Sealed syscall policy: install the compiled seccomp program now, after
+    // no_new_privs is set, so it is in force for the very first userspace
+    // instruction and (being under no_new_privs) cannot be relaxed for the
+    // container's whole life. This removes the entry point for entire classes of
+    // kernel-exploit escapes. The blob is a sock_filter[] (8 bytes per insn).
+    if ctx.seccomp.len() >= 8 && ctx.seccomp.len() % 8 == 0 {
+        let count = (ctx.seccomp.len() / 8) as c_uint;
+        // SAFETY: `ctx.seccomp` is a live, 8-byte-aligned-length buffer of
+        // `count` sock_filter records; the helper copies it and does not retain
+        // the pointer.
+        let rc = unsafe { krunc_seccomp_install(ctx.seccomp.as_ptr() as *const c_void, count) };
+        if rc != 0 {
+            pr_err!("krunc: seccomp install failed: {}\n", rc);
+            return rc; // ctx dropped -> freed; container does not start unconfined
+        }
+    }
 
     // Build argv/envp pointer arrays (into ctx's buffers, which stay valid for
     // the execve call). On a successful exec this function never returns, so

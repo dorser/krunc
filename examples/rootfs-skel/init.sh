@@ -61,6 +61,15 @@ if [ "$KRUNC_PIDS_TEST" = 1 ]; then
 		echo "[container]   /proc/sys: read-only, write denied (EROFS)"
 	fi
 
+	echo "[container] --- seccomp (sealed syscall policy) ---"
+	# chmod needs no capability when you own the target, so a denial here is the
+	# seccomp filter at work (not the dropped caps). The policy returns EPERM.
+	if chmod 0700 /tmp 2>/dev/null; then
+		echo "[container]   chmod /tmp: ALLOWED (unexpected -- seccomp not applied)"
+	else
+		echo "[container]   chmod /tmp: blocked by seccomp (EPERM)"
+	fi
+
 	echo "[container] my cgroup: $(cat /proc/self/cgroup 2>&-)"
 	echo "[container] pids test: forktest will fork until the cgroup pids.max stops it"
 	# Hand off to the deterministic fork(2) probe. It becomes PID 1, forks until

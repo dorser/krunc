@@ -32,6 +32,26 @@
     "cgroupsPath": "krunc/oci1",
     "resources": { "pids": { "limit": 16 } },
     "maskedPaths": ["/proc/kcore", "/proc/sysrq-trigger"],
-    "readonlyPaths": ["/proc/sys", "/etc"]
+    "readonlyPaths": ["/proc/sys", "/etc"],
+    "seccomp": {
+      "defaultAction": "SCMP_ACT_ALLOW",
+      "architectures": ["SCMP_ARCH_X86_64"],
+      "syscalls": [
+        {
+          "names": ["chmod", "fchmod", "fchmodat"],
+          "action": "SCMP_ACT_ERRNO",
+          "errnoRet": 1
+        },
+        {
+          "names": [
+            "ptrace", "keyctl", "add_key", "request_key", "bpf",
+            "userfaultfd", "perf_event_open", "kexec_load",
+            "init_module", "finit_module", "setns"
+          ],
+          "action": "SCMP_ACT_ERRNO",
+          "errnoRet": 1
+        }
+      ]
+    }
   }
 }

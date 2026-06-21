@@ -18,6 +18,9 @@ if ! grep -q 'krunc_exports.o' kernel/Makefile; then
 	echo 'obj-y += krunc_exports.o' >> kernel/Makefile
 fi
 
+echo "==> apply in-tree seccomp install helpers (filter.c + seccomp.c)"
+bash "$REPO/scripts/patch-kernel-seccomp.sh"
+
 echo "==> base config: defconfig + kvm_guest.config"
 make -j"$JOBS" defconfig
 make -j"$JOBS" kvm_guest.config
@@ -34,6 +37,8 @@ scripts/config \
 	--enable MODULES --enable MODULE_UNLOAD \
 	--enable NAMESPACES \
 	--enable PID_NS --enable UTS_NS --enable IPC_NS --enable NET_NS --enable USER_NS \
+	--enable SECCOMP --enable SECCOMP_FILTER \
+	--enable CGROUPS --enable CGROUP_PIDS \
 	--enable DEVTMPFS --enable DEVTMPFS_MOUNT \
 	--enable BLK_DEV_INITRD --enable RD_GZIP --enable RD_XZ \
 	--enable TMPFS --enable PROC_FS --enable SYSFS --enable OVERLAY_FS \

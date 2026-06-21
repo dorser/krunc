@@ -102,8 +102,29 @@ not in one shot.
   text-interface container. See `docs/sample-v2-confinement.txt`.
 - **M3 (partial) done** — the kernel mounts a private `/proc` + `/sys` for the
   container in-kernel (via `path_mount`) before dropping privileges, so even a
-  confined container has them. (Full `pivot_root`, the `mounts[]` list, and
-  masked/readonly paths are still to come.)
-- **Next:** M3 remainder (pivot_root + masked/ro paths + mounts[]), M5 seccomp,
-  M6 cgroups, M7 user-ns mapping + Landlock, M8 lifetime enforcement, M9
-  conformance, M10 containerd, then the full `Domain` typestate object + domainfd.
+  confined container has them. **maskedPaths + readonlyPaths** are now also
+  enforced in-kernel: each masked path is over-mounted (bind `/dev/null` for
+  files, read-only `tmpfs` for dirs) and each read-only path is bind-mounted then
+  remounted `MS_RDONLY`, all in the container's mount namespace before exec.
+  Host-verified in QEMU: `/proc/kcore` reads 0 bytes, `/proc/sysrq-trigger`
+  writes are inert, and writes to `/etc` and `/proc/sys` fail with `EROFS`.
+  (Full `pivot_root` and the general `mounts[]` list are still to come.)
+- **M6 (partial) done** — **cgroup v2 `pids`** controller: the CLI creates the
+  cgroup, sets `pids.max`, and places the container; the kernel enforces it.
+  Host-verified deterministically with `krunc-forktest` (a `fork(2)` probe):
+  `pids.current` pins at `pids.max=16`, the kernel denies further forks
+  (`pids.events max > 0`). Memory/cpu controllers and `MEMCG` (needs a kernel
+  rebuild) are still to come.
+- **M5 (done) — seccomp.** The CLI compiles the OCI `linux.seccomp` policy into a
+  classic-BPF `sock_filter[]` program (`krunc-oci::seccomp`, full x86-64 syscall
+  table, 4 unit tests); the kernel installs it on the container **after**
+  `no_new_privs`, in kernel context just before exec, via an in-tree helper
+  (`krunc_seccomp_install` in `kernel/seccomp.c` + `krunc_bpf_prog_create_kern_trans`
+  in `net/core/filter.c`, applied by `scripts/patch-kernel-seccomp.sh`). Because
+  it is sealed under `no_new_privs`, a compromised workload cannot relax it.
+  Host-verified in QEMU: a `chmod` (needs no capability on an owned path) returns
+  `EPERM`, and `/proc/<pid>/status` shows `Seccomp: 2` (filter mode), with no
+  kernel warnings.
+- **Next:** M3 remainder (pivot_root + general `mounts[]`), M7 user-ns mapping +
+  Landlock, M8 lifetime enforcement, M9 conformance, M10 containerd, then the
+  full `Domain` typestate object + domainfd.
