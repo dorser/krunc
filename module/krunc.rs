@@ -65,6 +65,10 @@ extern "C" {
     fn krunc_set_hostname(name: *const c_char, len: usize) -> c_int;
     fn krunc_chroot(path: *const c_char) -> c_int;
     fn krunc_kill(nr: c_int, sig: c_int) -> c_int;
+    /// Apply privilege confinement to the current task before exec: lower the
+    /// capability sets to `cap_mask` (0 = leave untouched) and optionally set
+    /// no_new_privs.
+    fn krunc_apply_creds(cap_mask: u64, no_new_privs: c_int) -> c_int;
     // msleep() is exported by mainline.
     fn msleep(msecs: c_uint);
 }
@@ -93,6 +97,12 @@ const ST_STOPPED: u32 = 2;
 
 const MAX_ARGS: usize = 32;
 const MAX_SPEC: usize = 16 * 1024;
+/// Maximum length of a single string field in the binary spec.
+const MAX_STR: usize = 4096;
+/// krunc-abi wire magic and version (see the `krunc-abi` crate).
+const ABI_VERSION: u32 = 1;
+/// `OPT_NO_NEW_PRIVS` from the krunc-abi `flags` section.
+const OPT_NO_NEW_PRIVS: u64 = 1 << 0;
 
 /// ioctl command numbers (we match on the _IOC_NR only, so the exact size/dir
 /// bits the userspace side encodes do not need to agree precisely).
@@ -141,6 +151,8 @@ struct ContainerCtx {
     rootfs: KVec<u8>,          // NUL-terminated
     argv: KVec<KVec<u8>>,      // each NUL-terminated; argv[0] is the binary
     envp: KVec<KVec<u8>>,      // each NUL-terminated; empty -> default env
+    cap_bounding: u64,         // capability ceiling to apply (0 = leave untouched)
+    no_new_privs: bool,        // set no_new_privs before exec
     ctrl: Option<Arc<ContainerControl>>, // Some -> two-phase (created) container
 }
 
@@ -235,7 +247,7 @@ fn ioctl_dispatch(cmd: u32, arg: usize) -> Result<isize> {
             }
             UserSlice::new(UserPtr::from_addr(c.spec_ptr as usize), c.spec_len as usize)
                 .read_all(&mut spec, GFP_KERNEL)?;
-            let (id, pid) = create_from_oci(&spec)?;
+            let (id, pid) = create_from_blob(&spec)?;
             c.id = id;
             c.pid = pid;
         }
@@ -358,7 +370,7 @@ fn handle_text_command(buf: &[u8]) -> Result {
     }
     // `run …` (one-shot: created and started immediately)
     let (hostname, rootfs, argv, envp, flags) = parse_run_line(line)?;
-    let (id, pid) = spawn(hostname, rootfs, argv, envp, flags, false)?;
+    let (id, pid) = spawn(hostname, rootfs, argv, envp, flags, false, 0, false)?;
     pr_info!("started container id={} pid={}\n", id, pid);
     Ok(())
 }
@@ -445,18 +457,14 @@ fn to_cvec(s: &[u8]) -> Result<KVec<u8>> {
     Ok(v)
 }
 
-fn ns_flag(name: &[u8]) -> c_ulong {
-    match name {
-        b"pid" => CLONE_NEWPID,
-        b"mount" | b"mnt" => CLONE_NEWNS,
-        b"uts" => CLONE_NEWUTS,
-        b"ipc" => CLONE_NEWIPC,
-        b"network" | b"net" => CLONE_NEWNET,
-        _ => 0, // user/cgroup/time namespaces are not handled (PoC)
+type Spec = (KVec<u8>, KVec<u8>, KVec<KVec<u8>>, KVec<KVec<u8>>, c_ulong);
+
+fn split_kv(tok: &[u8]) -> (&[u8], &[u8]) {
+    match tok.iter().position(|&b| b == b'=') {
+        Some(p) => (&tok[..p], &tok[p + 1..]),
+        None => (tok, &tok[tok.len()..]),
     }
 }
-
-type Spec = (KVec<u8>, KVec<u8>, KVec<KVec<u8>>, KVec<KVec<u8>>, c_ulong);
 
 /// Text `run` line: whitespace-separated `key=value` tokens (no spaces in
 /// values). `exec` is argv[0]; each `arg=` appends. All five namespaces.
@@ -504,65 +512,116 @@ fn parse_run_line(line: &[u8]) -> Result<Spec> {
     Ok((host, rootfs, argv, KVec::new(), ALL_NS | SIGCHLD))
 }
 
-/// OCI spec from the CLI: newline-separated `key=value` lines (values may
-/// contain spaces). Keys: `rootfs`, `host`, `arg` (repeatable, in order =
-/// argv), `env` (repeatable), `ns` (comma list of namespaces).
-fn parse_oci_spec(spec: &[u8]) -> Result<Spec> {
-    let mut rootfs: Option<KVec<u8>> = None;
-    let mut host: Option<KVec<u8>> = None;
-    let mut argv: KVec<KVec<u8>> = KVec::new();
-    let mut envp: KVec<KVec<u8>> = KVec::new();
-    let mut flags: c_ulong = 0;
-    let mut have_ns = false;
+/// A bounds-checked, panic-free cursor over the binary spec buffer.
+struct BReader<'a> {
+    b: &'a [u8],
+    p: usize,
+}
 
-    for raw in spec.split(|&b| b == b'\n') {
-        let line = trim(raw);
-        if line.is_empty() {
-            continue;
+impl<'a> BReader<'a> {
+    fn new(b: &'a [u8]) -> Self {
+        Self { b, p: 0 }
+    }
+    fn rem(&self) -> usize {
+        self.b.len() - self.p
+    }
+    fn take(&mut self, n: usize) -> Result<&'a [u8]> {
+        if n > self.rem() {
+            return Err(EINVAL);
         }
-        let (key, val) = split_kv(line);
-        match key {
-            b"rootfs" => rootfs = Some(to_cvec(val)?),
-            b"host" | b"hostname" => host = Some(to_cvec(val)?),
-            b"arg" => {
-                if argv.len() < MAX_ARGS - 1 {
-                    argv.push(to_cvec(val)?, GFP_KERNEL)?;
-                }
-            }
-            b"env" => {
-                if envp.len() < MAX_ARGS - 1 {
-                    envp.push(to_cvec(val)?, GFP_KERNEL)?;
-                }
-            }
-            b"ns" => {
-                have_ns = true;
-                for n in val.split(|&b| b == b',') {
-                    flags |= ns_flag(trim(n));
-                }
-            }
+        let s = &self.b[self.p..self.p + n];
+        self.p += n;
+        Ok(s)
+    }
+    fn u16(&mut self) -> Result<u16> {
+        Ok(u16::from_le_bytes(self.take(2)?.try_into().map_err(|_| EINVAL)?))
+    }
+    fn u32(&mut self) -> Result<u32> {
+        Ok(u32::from_le_bytes(self.take(4)?.try_into().map_err(|_| EINVAL)?))
+    }
+    fn u64(&mut self) -> Result<u64> {
+        Ok(u64::from_le_bytes(self.take(8)?.try_into().map_err(|_| EINVAL)?))
+    }
+}
+
+/// Fields decoded from the krunc-abi binary spec. The kernel performs only this
+/// trivial, strict, bounds-checked parse — never any JSON parsing.
+struct DecodedSpec {
+    hostname: KVec<u8>,
+    rootfs: KVec<u8>,
+    argv: KVec<KVec<u8>>,
+    envp: KVec<KVec<u8>>,
+    ns: u32,
+    cap_bounding: u64,
+    flags: u64,
+}
+
+fn read_strvec_k(sr: &mut BReader<'_>) -> Result<KVec<KVec<u8>>> {
+    let n = sr.u32()? as usize;
+    let mut v: KVec<KVec<u8>> = KVec::new();
+    for _ in 0..n {
+        let l = sr.u32()? as usize;
+        if l > MAX_STR {
+            return Err(EINVAL);
+        }
+        let bytes = sr.take(l)?;
+        if v.len() < MAX_ARGS - 1 {
+            v.push(to_cvec(bytes)?, GFP_KERNEL)?;
+        }
+    }
+    Ok(v)
+}
+
+/// Decode the krunc-abi binary spec (see the `krunc-abi` crate for the wire
+/// format). Strict and total: never panics, rejects any out-of-bounds length,
+/// and ignores unknown section tags (forward-compatible).
+fn decode_spec(buf: &[u8]) -> Result<DecodedSpec> {
+    if buf.len() > MAX_SPEC {
+        return Err(EINVAL);
+    }
+    let mut r = BReader::new(buf);
+    if r.take(4)? != &b"KRNC"[..] {
+        return Err(EINVAL);
+    }
+    if r.u32()? != ABI_VERSION {
+        return Err(EINVAL);
+    }
+    let _op = r.u32()?; // op is also conveyed by the ioctl number
+    let count = r.u32()? as usize;
+    if count > MAX_SPEC / 8 {
+        return Err(EINVAL);
+    }
+    let mut d = DecodedSpec {
+        hostname: KVec::new(),
+        rootfs: KVec::new(),
+        argv: KVec::new(),
+        envp: KVec::new(),
+        ns: 0,
+        cap_bounding: 0,
+        flags: 0,
+    };
+    for _ in 0..count {
+        let tag = r.u16()?;
+        let _pad = r.u16()?;
+        let len = r.u32()? as usize;
+        if len > r.rem() {
+            return Err(EINVAL);
+        }
+        let payload = r.take(len)?;
+        let mut sr = BReader::new(payload);
+        match tag {
+            1 => d.rootfs = to_cvec(payload)?,     // ROOTFS
+            2 => d.hostname = to_cvec(payload)?,   // HOSTNAME
+            3 => d.argv = read_strvec_k(&mut sr)?, // ARGV
+            4 => d.envp = read_strvec_k(&mut sr)?, // ENV
+            5 => d.ns = sr.u32()?,                 // NAMESPACES
+            8 => d.flags = sr.u64()?,              // FLAGS
+            9 => d.cap_bounding = sr.u64()?,       // CAP_BOUNDING
+            // tags 6/7 (uid/gid maps) and 10 (seccomp) land in later milestones.
             _ => {}
         }
     }
-
-    let rootfs = rootfs.ok_or(EINVAL)?;
-    if argv.is_empty() {
-        return Err(EINVAL);
-    }
-    let host = match host {
-        Some(h) => h,
-        None => to_cvec(b"krunc")?,
-    };
-    if !have_ns {
-        flags = ALL_NS;
-    }
-    Ok((host, rootfs, argv, envp, flags | SIGCHLD))
-}
-
-fn split_kv(tok: &[u8]) -> (&[u8], &[u8]) {
-    match tok.iter().position(|&b| b == b'=') {
-        Some(p) => (&tok[..p], &tok[p + 1..]),
-        None => (tok, &tok[tok.len()..]),
-    }
+    Ok(d)
 }
 
 fn drain_into(src: &mut KVec<KVec<u8>>, dst: &mut KVec<KVec<u8>>) -> Result {
@@ -575,9 +634,28 @@ fn drain_into(src: &mut KVec<KVec<u8>>, dst: &mut KVec<KVec<u8>>) -> Result {
 
 // ============================ spawn / init ================================
 
-fn create_from_oci(spec: &[u8]) -> Result<(u64, i32)> {
-    let (hostname, rootfs, argv, envp, flags) = parse_oci_spec(spec)?;
-    spawn(hostname, rootfs, argv, envp, flags, true)
+fn create_from_blob(spec: &[u8]) -> Result<(u64, i32)> {
+    let d = decode_spec(spec)?;
+    if d.rootfs.len() <= 1 || d.argv.is_empty() {
+        return Err(EINVAL);
+    }
+    let host = if d.hostname.len() > 1 {
+        d.hostname
+    } else {
+        to_cvec(b"krunc")?
+    };
+    let ns = if d.ns != 0 { d.ns as c_ulong } else { ALL_NS };
+    let no_new_privs = d.flags & OPT_NO_NEW_PRIVS != 0;
+    spawn(
+        host,
+        d.rootfs,
+        d.argv,
+        d.envp,
+        ns | SIGCHLD,
+        true,
+        d.cap_bounding,
+        no_new_privs,
+    )
 }
 
 /// Create the container init task. If `paused`, it blocks before exec until
@@ -589,6 +667,8 @@ fn spawn(
     envp: KVec<KVec<u8>>,
     flags: c_ulong,
     paused: bool,
+    cap_bounding: u64,
+    no_new_privs: bool,
 ) -> Result<(u64, i32)> {
     let ctrl = if paused {
         Some(Arc::new(
@@ -610,6 +690,8 @@ fn spawn(
             rootfs,
             argv,
             envp,
+            cap_bounding,
+            no_new_privs,
             ctrl: ctrl.as_ref().map(|a| a.clone()),
         },
         GFP_KERNEL,
@@ -672,6 +754,13 @@ unsafe extern "C" fn container_entry(arg: *mut c_void) -> c_int {
             }
         }
     }
+
+    // Privilege confinement, applied atomically in kernel context just before
+    // exec: the capability ceiling + no_new_privs are in force for the very
+    // first userspace instruction, with no intermediate userspace process in
+    // which capabilities could leak.
+    // SAFETY: FFI call into the vmlinux helper, operating on `current`.
+    unsafe { krunc_apply_creds(ctx.cap_bounding, if ctx.no_new_privs { 1 } else { 0 }) };
 
     // Build argv/envp pointer arrays (into ctx's buffers, which stay valid for
     // the execve call). On a successful exec this function never returns, so

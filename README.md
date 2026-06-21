@@ -108,8 +108,8 @@ echo 'kill 1234' > /dev/krunc
 ## OCI runtime CLI (drive it like `runc`)
 
 krunc also exposes an **ioctl** control plane implementing an OCI-runtime-style
-two-phase lifecycle, plus a small userspace binary, `krunc` (in `cli/`), that
-speaks the same command surface as `runc`:
+two-phase lifecycle, plus a small **all-Rust** userspace binary, `krunc` (in
+`userspace/krunc-cli/`), that speaks the same command surface as `runc`:
 
 ```sh
 krunc create <id> --bundle <dir> [--pid-file <f>]   # set up + block before exec
@@ -120,52 +120,61 @@ krunc delete <id>
 krunc list ; krunc --version
 ```
 
-It reads the OCI bundle's `config.json`, translates the supported subset
-(`process.args`/`env`, `root.path`, `hostname`, `linux.namespaces`) into a krunc
-kernel spec, and drives the module's `create`(paused)/`start`/`state`/`kill`/
-`delete` ioctls. State is persisted under `--root` (default `/run/krunc`) like
-runc. A captured standalone lifecycle run is in
-[`docs/sample-oci-run.txt`](docs/sample-oci-run.txt).
+It reads the OCI bundle's `config.json` (`userspace/krunc-oci`), translates the
+supported subset (`process.args`/`env`, `root.path`, `hostname`,
+`linux.namespaces`, `linux.uid/gidMappings`, `process.capabilities.bounding`,
+`process.noNewPrivileges`) into a validated binary spec (`userspace/krunc-abi`),
+and drives the module's `create`(paused)/`start`/`state`/`kill`/`delete` ioctls.
+The kernel then applies the confinement — namespaces, in-kernel chroot, **the
+capability bounding set and `no_new_privs`** — atomically before exec.
 
-This is the API a higher-level runtime expects. **containerd** drives an OCI
-runtime through `containerd-shim-runc-v2`, which invokes it via the
-`github.com/containerd/go-runc` client (`BinaryName` selects the binary). This
-is **verified**: `conformance/` uses go-runc — the exact library the shim uses —
-to drive krunc through `Create → State → Start → State → Delete` successfully
-(see [`docs/sample-containerd-run.txt`](docs/sample-containerd-run.txt)).
-Standing up the full containerd daemon needs a bit more (and lacks cgroups/stats
-and tty console for now); see the *containerd* notes in
-[`docs/DESIGN.md`](docs/DESIGN.md).
+A captured run is in
+[`docs/sample-v2-confinement.txt`](docs/sample-v2-confinement.txt): the OCI
+container's capabilities are dropped to exactly the bounding set
+(`CapBnd=00000000200004e1`) with `NoNewPrivs=1`, **verified from the host** via
+`/proc/<pid>/status` — contrasted against the unconfined text-interface container
+(`CapBnd=000001ffffffffff`).
+
+This is the API a higher-level runtime expects: **containerd** drives an OCI
+runtime through `containerd-shim-runc-v2` (via the `go-runc` client, with
+`BinaryName` selecting the binary). An earlier Go prototype was verified driving
+krunc through the full lifecycle; the project is now all-Rust and a native
+shim plus the remaining confinement (mounts/pivot_root, seccomp, cgroups,
+Landlock) are tracked in [`docs/ROADMAP.md`](docs/ROADMAP.md).
 
 ## Repository layout
 
 ```
 module/                Rust kernel module (the runtime itself)
-  krunc.rs             misc device, text + ioctl control, registry, container_entry
+  krunc.rs             misc device, text + ioctl control, binary-spec decode,
+                       registry, container_entry (chroot + caps + no_new_privs + exec)
   Kbuild, Makefile     out-of-tree module build
 kernel-patch/
-  krunc_exports.c      tiny vmlinux shim: krunc_spawn + the primitives krunc needs
-cli/
-  main.go              runc/OCI-compatible CLI (create/start/state/kill/delete)
-conformance/
-  main.go              drives krunc via go-runc (containerd's runtime client)
+  krunc_exports.c      tiny vmlinux shim: krunc_spawn, krunc_apply_creds + helpers
+userspace/             all-Rust userspace (Cargo workspace)
+  krunc-abi/           versioned, bounds-checked binary spec (no_std-friendly, no unsafe)
+  krunc-oci/           OCI config.json -> DomainSpec translation (serde)
+  krunc-cli/           the runc-compatible `krunc` CLI (create/start/state/kill/delete)
 examples/
   rootfs-skel/init.sh  example container entrypoint (the "app")
-  bundle/config.json   example OCI bundle config
+  bundle/config.json   example OCI bundle (with caps bounding + noNewPrivileges)
 scripts/
   vm-setup.sh          install kernel + Rust-for-Linux toolchain on a test VM
   pin-rust.sh          pin the exact rustc/bindgen the kernel requires
   build-kernel.sh      configure + build a kernel with CONFIG_RUST + the shim
   build-module.sh      build the out-of-tree krunc.ko
-  build-cli.sh         build the static krunc OCI CLI
+  build-cli.sh         build the static (musl) all-Rust krunc CLI
   make-initramfs.sh    assemble busybox + krunc.ko + krunc CLI + rootfs/bundle
   run-qemu.sh          boot the test kernel under QEMU/KVM
-  qemu-init.sh         the in-VM demo driver (text + OCI lifecycle + unload)
+  qemu-init.sh         the in-VM demo driver (text + OCI lifecycle + confinement + unload)
   run-test.sh          rebuild module + cli + initramfs + run QEMU (fast loop)
 docs/
-  DESIGN.md            architecture and rationale
-  sample-run.txt       captured text-interface demo output
-  sample-oci-run.txt   captured OCI runtime-CLI lifecycle output
+  ARCHITECTURE.md      the krunc_domain object design (v2 target)
+  SECURITY.md          threat model, two pillars, honest limits
+  ROADMAP.md           milestones + test matrix
+  DESIGN.md            v1 design and rationale
+  research-notes/      cited research the design rests on
+  sample-v2-confinement.txt   all-Rust pipeline + host-verified capability drop
 ```
 
 ## Build & run

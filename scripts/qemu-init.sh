@@ -76,11 +76,12 @@ cat /dev/krunc | sed 's/^/[vm]   /'
 
 ############################################################################
 echo
-echo "=========== DEMO 3: OCI runtime CLI (containerd-compatible) ==========="
+echo "====== DEMO 3: OCI lifecycle via the all-Rust krunc CLI + confinement ======"
 echo "[vm] krunc --version:"
 /bin/krunc --version | sed 's/^/[vm]   /'
 echo "[vm] krunc create oci1 --bundle /bundle   (sets up + blocks before exec)"
 /bin/krunc create oci1 --bundle /bundle --pid-file /run/oci1.pid
+CPID=$(cat /run/oci1.pid 2>/dev/null)
 echo "[vm] krunc state oci1   (expect: created)"
 /bin/krunc state oci1 | grep -E '"status"|"id"|"pid"' | sed 's/^/[vm]   /'
 echo "[vm] krunc start oci1   (releases the paused init -> execs the entrypoint)"
@@ -88,6 +89,9 @@ echo "[vm] krunc start oci1   (releases the paused init -> execs the entrypoint)
 sleep 1
 echo "[vm] krunc state oci1   (expect: running)"
 /bin/krunc state oci1 | grep -E '"status"|"pid"' | sed 's/^/[vm]   /'
+echo "[vm] ----- kernel-applied confinement, host view of /proc/$CPID/status -----"
+grep -E "^(CapBnd|CapPrm|CapEff|NoNewPrivs):" /proc/$CPID/status 2>/dev/null | sed 's/^/[vm]   /'
+echo "[vm]   expected: CapBnd 00000000200004e1 (the 6 bounded caps), NoNewPrivs 1"
 sleep 3
 echo "[vm] krunc state oci1   (after the entrypoint exits, expect: stopped)"
 /bin/krunc state oci1 | grep -E '"status"' | sed 's/^/[vm]   /'
@@ -98,17 +102,7 @@ echo "[vm] krunc delete oci1"
 
 ############################################################################
 echo
-echo "===== DEMO 4: containerd runtime client (go-runc) drives krunc ====="
-echo "[vm] go-runc is the library containerd-shim-runc-v2 uses to call the runtime"
-if [ -x /bin/krunc-conformance ]; then
-	/bin/krunc-conformance /bundle 2>&1 | sed 's/^/[vm]   /'
-else
-	echo "[vm]   (krunc-conformance not built; skipping)"
-fi
-
-############################################################################
-echo
-echo "================ DEMO 5: unload the runtime cleanly ================"
+echo "================ DEMO 4: unload the runtime cleanly ================"
 exec 3>&-                 # close the control device so the module is unused
 if rmmod krunc; then
 	echo "[vm] krunc.ko unloaded cleanly"

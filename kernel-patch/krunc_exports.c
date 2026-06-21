@@ -29,6 +29,8 @@
 #include <linux/sched.h>
 #include <linux/sched/task.h>
 #include <linux/sched/signal.h>
+#include <linux/cred.h>
+#include <linux/capability.h>
 #include <linux/binfmts.h>
 #include <linux/namei.h>
 #include <linux/fs_struct.h>
@@ -42,6 +44,7 @@
 int krunc_set_hostname(const char *name, size_t len);
 int krunc_chroot(const char *path);
 int krunc_kill(pid_t nr, int sig);
+int krunc_apply_creds(u64 cap_mask, int no_new_privs);
 pid_t krunc_spawn(int (*fn)(void *), void *arg, unsigned long flags);
 
 /* Re-export existing primitives that mainline keeps internal. */
@@ -133,3 +136,41 @@ int krunc_kill(pid_t nr, int sig)
 	return ret;
 }
 EXPORT_SYMBOL_GPL(krunc_kill);
+
+/*
+ * Apply the container's privilege confinement to the *current* task, atomically
+ * in kernel context, just before exec:
+ *   - lower the capability bounding/effective/permitted/inheritable sets to
+ *     @cap_mask and clear the ambient set (the bounding set is the irreversible
+ *     ceiling: nothing outside @cap_mask can ever be regained), and
+ *   - optionally set no_new_privs (required for a tamper-proof seccomp policy
+ *     and to stop SUID privilege regain).
+ *
+ * Because this runs in the container init task before kernel_execve(), the
+ * confinement is in force for the very first userspace instruction — there is no
+ * intermediate userspace process in which the capability state could leak.
+ */
+int krunc_apply_creds(u64 cap_mask, int no_new_privs)
+{
+	struct cred *new;
+	kernel_cap_t caps = { .val = cap_mask & ((1ULL << (CAP_LAST_CAP + 1)) - 1) };
+
+	if (no_new_privs)
+		task_set_no_new_privs(current);
+
+	/* cap_mask == 0 means "unspecified": leave the capability sets untouched. */
+	if (cap_mask == 0)
+		return 0;
+
+	new = prepare_creds();
+	if (!new)
+		return -ENOMEM;
+	new->cap_bset = caps;
+	new->cap_effective = caps;
+	new->cap_permitted = caps;
+	new->cap_inheritable = caps;
+	new->cap_ambient = (kernel_cap_t){ .val = 0 };
+	commit_creds(new); /* consumes @new */
+	return 0;
+}
+EXPORT_SYMBOL_GPL(krunc_apply_creds);
