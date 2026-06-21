@@ -38,6 +38,7 @@ scripts/config \
 	--enable NAMESPACES \
 	--enable PID_NS --enable UTS_NS --enable IPC_NS --enable NET_NS --enable USER_NS \
 	--enable SECCOMP --enable SECCOMP_FILTER \
+	--enable SECURITY --enable SECURITY_LANDLOCK \
 	--enable CGROUPS --enable CGROUP_PIDS --enable MEMCG \
 	--enable DEVTMPFS --enable DEVTMPFS_MOUNT \
 	--enable BLK_DEV_INITRD --enable RD_GZIP --enable RD_XZ \

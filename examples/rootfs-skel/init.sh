@@ -79,6 +79,20 @@ if [ "$KRUNC_PIDS_TEST" = 1 ]; then
 	echo "[container] --- mounts (OCI mounts[] applied by the kernel) ---"
 	echo "[container]   /tmp: $(awk '$2=="/tmp"{print $1,$3,$4}' /proc/mounts 2>&-)  (expect tmpfs, nosuid/nodev/noexec)"
 
+	echo "[container] --- Landlock (sealed fs domain: immutable rootfs) ---"
+	if touch /landlock-rootfs-probe 2>/dev/null; then
+		echo "[container]   write to /   : ALLOWED (unexpected -- Landlock not applied)"
+		rm -f /landlock-rootfs-probe 2>/dev/null
+	else
+		echo "[container]   write to /   : DENIED by Landlock (rootfs is immutable)"
+	fi
+	if touch /tmp/landlock-ok 2>/dev/null; then
+		echo "[container]   write to /tmp: ALLOWED (the domain's writable scratch dir)"
+		rm -f /tmp/landlock-ok 2>/dev/null
+	else
+		echo "[container]   write to /tmp: DENIED (unexpected)"
+	fi
+
 	echo "[container] --- memory cgroup limit (memory.max) ---"
 	echo "[container]   memhog allocates until the cgroup OOM-kills it (config max=64 MiB):"
 	/bin/memhog

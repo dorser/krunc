@@ -191,6 +191,9 @@ pub struct DomainSpec {
     /// Mounts to perform inside the container, in order (empty = kernel default
     /// of a private `/proc` + `/sys`).
     pub mounts: Vec<Mount>,
+    /// If non-empty, enforce a sealed Landlock domain that allows writes only
+    /// beneath these paths (an immutable rootfs with writable scratch dirs).
+    pub landlock_rw_paths: Vec<String>,
 }
 
 // Section tags. Stable wire identifiers; never reuse a value.
@@ -212,6 +215,7 @@ mod tag {
     pub const CAP_SETS: u16 = 15;
     pub const USER: u16 = 16;
     pub const MOUNTS: u16 = 17;
+    pub const LANDLOCK_RW: u16 = 18;
 }
 
 /// Errors from encoding or (strict) decoding.
@@ -360,6 +364,7 @@ impl DomainSpec {
         check_len("readonly_paths", self.readonly_paths.len(), MAX_PATHS)?;
         check_len("rlimits", self.rlimits.len(), MAX_RLIMITS)?;
         check_len("mounts", self.mounts.len(), MAX_MOUNTS)?;
+        check_len("landlock_rw_paths", self.landlock_rw_paths.len(), MAX_PATHS)?;
         Ok(())
     }
 
@@ -435,6 +440,9 @@ impl DomainSpec {
         }
         if !self.mounts.is_empty() {
             emit(tag::MOUNTS, &mut |w| write_mounts(w, &self.mounts));
+        }
+        if !self.landlock_rw_paths.is_empty() {
+            emit(tag::LANDLOCK_RW, &mut |w| write_strvec(w, &self.landlock_rw_paths));
         }
 
         w.u32(count);
@@ -632,6 +640,9 @@ pub fn decode(buf: &[u8]) -> Result<(Op, DomainSpec), AbiError> {
             tag::MOUNTS => {
                 spec.mounts = read_mounts(&mut sr, "mounts")?;
             }
+            tag::LANDLOCK_RW => {
+                spec.landlock_rw_paths = read_strvec(&mut sr, "landlock_rw_paths", MAX_PATHS)?;
+            }
             _ => { /* unknown tag: ignore for forward-compat */ }
         }
     }
@@ -700,6 +711,7 @@ mod tests {
                     flags: 0x0000_000e, // MS_NOSUID|MS_NODEV|MS_NOEXEC
                 },
             ],
+            landlock_rw_paths: vec!["/tmp".into(), "/dev".into()],
         }
     }
 

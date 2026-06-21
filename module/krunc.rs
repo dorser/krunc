@@ -93,6 +93,8 @@ extern "C" {
     fn krunc_apply_rlimit(resource: c_uint, soft: u64, hard: u64) -> c_int;
     /// Set the current task's OOM-killer score adjustment before exec.
     fn krunc_set_oom_score_adj(adj: c_int);
+    /// Seal a Landlock domain allowing writes only beneath `paths` (`n` entries).
+    fn krunc_landlock_restrict_writes(paths: *const *const c_char, n: c_int) -> c_int;
     // msleep() is exported by mainline.
     fn msleep(msecs: c_uint);
 }
@@ -132,6 +134,8 @@ const MAX_SPEC: usize = 16 * 1024;
 const MAX_RLIMITS: usize = 32;
 /// Maximum number of mount entries accepted from the spec.
 const MAX_MOUNTS: usize = 64;
+/// Stack-array bound for the Landlock writable-path pointer list.
+const MAX_PATHS_ARR: usize = 64;
 /// Maximum length of a single string field in the binary spec.
 const MAX_STR: usize = 4096;
 /// krunc-abi wire magic and version (see the `krunc-abi` crate).
@@ -196,6 +200,7 @@ struct ContainerCtx {
     uid: u32,                  // target uid (process.user.uid)
     gid: u32,                  // target gid (process.user.gid)
     mounts: KVec<MountSpec>,   // mounts to perform (empty -> default /proc + /sys)
+    landlock_rw: KVec<KVec<u8>>, // Landlock writable paths (empty = no fs seal)
     ctrl: Option<Arc<ContainerControl>>, // Some -> two-phase (created) container
 }
 
@@ -430,6 +435,7 @@ fn handle_text_command(buf: &[u8]) -> Result {
         0,
         0,
         KVec::new(),
+        KVec::new(),
     )?;
     pr_info!("started container id={} pid={}\n", id, pid);
     Ok(())
@@ -626,6 +632,7 @@ struct DecodedSpec {
     uid: u32,
     gid: u32,
     mounts: KVec<MountSpec>,
+    landlock_rw: KVec<KVec<u8>>,
 }
 
 /// The five Linux capability sets applied to the container before exec.
@@ -747,6 +754,7 @@ fn decode_spec(buf: &[u8]) -> Result<DecodedSpec> {
         uid: 0,
         gid: 0,
         mounts: KVec::new(),
+        landlock_rw: KVec::new(),
     };
     for _ in 0..count {
         let tag = r.u16()?;
@@ -788,6 +796,7 @@ fn decode_spec(buf: &[u8]) -> Result<DecodedSpec> {
                 d.gid = sr.u32()?;
             }
             17 => d.mounts = read_mounts_k(&mut sr)?, // MOUNTS
+            18 => d.landlock_rw = read_strvec_k(&mut sr)?, // LANDLOCK_RW
             // tags 6/7 (uid/gid maps) land in a later milestone.
             _ => {}
         }
@@ -841,6 +850,7 @@ fn create_from_blob(spec: &[u8]) -> Result<(u64, i32)> {
         d.uid,
         d.gid,
         d.mounts,
+        d.landlock_rw,
     )
 }
 
@@ -863,6 +873,7 @@ fn spawn(
     uid: u32,
     gid: u32,
     mounts: KVec<MountSpec>,
+    landlock_rw: KVec<KVec<u8>>,
 ) -> Result<(u64, i32)> {
     let ctrl = if paused {
         Some(Arc::new(
@@ -894,6 +905,7 @@ fn spawn(
             uid,
             gid,
             mounts,
+            landlock_rw,
             ctrl: ctrl.as_ref().map(|a| a.clone()),
         },
         GFP_KERNEL,
@@ -1019,6 +1031,24 @@ fn apply_mounts(mounts: &KVec<MountSpec>) {
     }
 }
 
+/// Seal a Landlock write-restrict domain granting writes only beneath the given
+/// paths. Applied after no_new_privs so it is un-relaxable for the container's
+/// life. Returns 0 (or leaves the container running unsealed only if Landlock is
+/// absent — `-ENOSYS`, which we tolerate so a non-Landlock kernel still boots).
+fn apply_landlock(rw: &KVec<KVec<u8>>) -> c_int {
+    if rw.is_empty() {
+        return 0;
+    }
+    let mut ptrs = [ptr::null::<c_char>(); MAX_PATHS_ARR];
+    let n = core::cmp::min(rw.len(), MAX_PATHS_ARR);
+    for i in 0..n {
+        ptrs[i] = rw[i].as_ptr() as *const c_char;
+    }
+    // SAFETY: `ptrs[..n]` are NUL-terminated C strings valid for the call; the
+    // helper only reads them.
+    unsafe { krunc_landlock_restrict_writes(ptrs.as_ptr(), n as c_int) }
+}
+
 /// The container's PID 1, run in kernel context inside the new namespaces.
 ///
 /// # Safety
@@ -1128,6 +1158,17 @@ unsafe extern "C" fn container_entry(arg: *mut c_void) -> c_int {
             pr_err!("krunc: seccomp install failed: {}\n", rc);
             return rc; // ctx dropped -> freed; container does not start unconfined
         }
+    }
+
+    // Sealed filesystem domain: a Landlock ruleset that permits writes/creation
+    // only beneath the configured scratch paths. Like seccomp it is inherited
+    // across exec and (under no_new_privs) un-relaxable for the container's life,
+    // giving an immutable rootfs. -ENOSYS (a kernel without Landlock) is the only
+    // tolerated failure; any other error is fatal (fail closed).
+    let lrc = apply_landlock(&ctx.landlock_rw);
+    if lrc != 0 && lrc != -38 {
+        pr_err!("krunc: landlock seal failed: {}\n", lrc);
+        return lrc; // ctx dropped -> freed; do not start a container missing its seal
     }
 
     // Build argv/envp pointer arrays (into ctx's buffers, which stay valid for

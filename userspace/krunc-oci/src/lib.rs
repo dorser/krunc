@@ -616,6 +616,29 @@ pub fn config_to_spec(bundle: &Path, cfg: &OciConfig) -> Result<DomainSpec, OciE
         })
         .collect();
 
+    // For a read-only rootfs, seal an immutable-fs Landlock domain: writes are
+    // allowed only beneath the writable mounts (tmpfs / rw binds) plus /dev (for
+    // device writes such as the shell's /dev/null redirects). This achieves the
+    // immutable rootfs that a chroot-based remount cannot, sealed for life.
+    let landlock_rw_paths = if root.readonly {
+        let mut rw: Vec<String> = cfg
+            .mounts
+            .iter()
+            .filter(|m| {
+                let (flags, is_bind) = mount_flags(&m.options);
+                let ro = flags & 1 != 0; // MS_RDONLY
+                !ro && (m.mount_type == "tmpfs" || is_bind || m.mount_type.is_empty())
+            })
+            .map(|m| m.destination.clone())
+            .collect();
+        if !rw.iter().any(|p| p == "/dev") {
+            rw.push("/dev".into());
+        }
+        rw
+    } else {
+        Vec::new()
+    };
+
     let spec = DomainSpec {
         rootfs: resolve_rootfs(bundle, &root.path),
         hostname: cfg.hostname.clone().unwrap_or_default(),
@@ -638,6 +661,7 @@ pub fn config_to_spec(bundle: &Path, cfg: &OciConfig) -> Result<DomainSpec, OciE
         uid: process.user.as_ref().map(|u| u.uid).unwrap_or(0),
         gid: process.user.as_ref().map(|u| u.gid).unwrap_or(0),
         mounts,
+        landlock_rw_paths,
     };
     spec.validate()?;
     Ok(spec)
@@ -732,6 +756,9 @@ mod tests {
         assert_eq!(spec.mounts[1].flags, 2 | 4 | 8);
         assert_eq!(spec.mounts[2].fs_type, ""); // bind clears the type
         assert_eq!(spec.mounts[2].flags, 4096 | 16384 | 1);
+        // root.readonly -> Landlock seals writes to the tmpfs /tmp (+/dev); the
+        // proc mount and the read-only bind are excluded.
+        assert_eq!(spec.landlock_rw_paths, vec!["/tmp", "/dev"]);
     }
 
     #[test]

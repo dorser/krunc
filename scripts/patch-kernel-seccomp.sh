@@ -34,6 +34,25 @@ open(path, "w").write(src)
 PY
 }
 
+# append_block <file> <inc> : append the .inc at EOF (marker-delimited upsert).
+append_block() {
+	python3 - "$1" "$2" <<'PY'
+import sys
+path, inc = sys.argv[1:3]
+BEGIN = "/* ==== krunc seccomp patch (auto-inserted) ==== */\n"
+END = "/* ==== end krunc seccomp patch ==== */\n"
+src = open(path).read()
+b = src.find(BEGIN)
+if b != -1:
+    e = src.find(END, b)
+    assert e != -1, "found BEGIN without END marker"
+    src = src[:b] + src[e + len(END):]
+block = BEGIN + open(inc).read().rstrip("\n") + "\n" + END
+src = src.rstrip("\n") + "\n\n" + block
+open(path, "w").write(src)
+PY
+}
+
 insert_block "$KSRC/net/core/filter.c" "$REPO/kernel-patch/krunc_filter_add.inc" \
 	"EXPORT_SYMBOL_GPL(bpf_prog_create_from_user);" after
 echo "==> filter.c: krunc_bpf_prog_create_kern_trans installed"
@@ -43,3 +62,11 @@ echo "==> filter.c: krunc_bpf_prog_create_kern_trans installed"
 insert_block "$KSRC/kernel/seccomp.c" "$REPO/kernel-patch/krunc_seccomp_add.inc" \
 	"$(printf '#endif\t/* CONFIG_SECCOMP_FILTER */')" before
 echo "==> seccomp.c: krunc_seccomp_install installed"
+
+# Landlock write-restrict helper: appended at EOF of the landlock syscalls TU,
+# where the ruleset/cred helpers it needs are all visible. Only patched when the
+# landlock source is present (CONFIG_SECURITY_LANDLOCK builds it).
+if [ -f "$KSRC/security/landlock/syscalls.c" ]; then
+	append_block "$KSRC/security/landlock/syscalls.c" "$REPO/kernel-patch/krunc_landlock_add.inc"
+	echo "==> landlock/syscalls.c: krunc_landlock_restrict_writes installed"
+fi
