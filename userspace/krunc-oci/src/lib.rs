@@ -17,7 +17,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use krunc_abi::{
-    DomainSpec, IdMap, Rlimit, NS_CGROUP, NS_IPC, NS_MOUNT, NS_NET, NS_PID, NS_USER, NS_UTS,
+    DomainSpec, IdMap, Mount, Rlimit, NS_CGROUP, NS_IPC, NS_MOUNT, NS_NET, NS_PID, NS_USER, NS_UTS,
     OPT_NO_NEW_PRIVS, OPT_ROOTFS_RO,
 };
 use serde::Deserialize;
@@ -38,6 +38,25 @@ pub struct OciConfig {
     pub root: Option<Root>,
     /// Linux-specific configuration.
     pub linux: Option<Linux>,
+    /// Filesystem mounts to perform in the container.
+    #[serde(default)]
+    pub mounts: Vec<OciMount>,
+}
+
+/// A `config.json` top-level `mounts[]` entry.
+#[derive(Debug, Deserialize, Default)]
+pub struct OciMount {
+    /// Mountpoint inside the container.
+    pub destination: String,
+    /// Filesystem type (`proc`, `sysfs`, `tmpfs`, `bind`, …).
+    #[serde(rename = "type", default)]
+    pub mount_type: String,
+    /// Source (device, fs name, or bind source).
+    #[serde(default)]
+    pub source: String,
+    /// Mount options (`ro`, `nosuid`, `nodev`, `noexec`, `bind`, …).
+    #[serde(default)]
+    pub options: Vec<String>,
 }
 
 /// `config.json` `process`.
@@ -423,6 +442,55 @@ fn rlimit_resource(name: &str) -> Option<u32> {
     })
 }
 
+/// Translate OCI mount `options` into `(MS_* flags, is_bind)`. Data-style options
+/// (`size=`, `mode=`, …) are ignored — krunc applies no per-fs data string.
+fn mount_flags(options: &[String]) -> (u64, bool) {
+    // uapi/linux/mount.h bit values.
+    const MS_RDONLY: u64 = 1;
+    const MS_NOSUID: u64 = 2;
+    const MS_NODEV: u64 = 4;
+    const MS_NOEXEC: u64 = 8;
+    const MS_SYNCHRONOUS: u64 = 16;
+    const MS_REMOUNT: u64 = 32;
+    const MS_BIND: u64 = 4096;
+    const MS_REC: u64 = 16384;
+    const MS_NOATIME: u64 = 1024;
+    const MS_NODIRATIME: u64 = 2048;
+    const MS_RELATIME: u64 = 1 << 21;
+    const MS_STRICTATIME: u64 = 1 << 24;
+
+    let mut flags = 0u64;
+    let mut is_bind = false;
+    for opt in options {
+        match opt.as_str() {
+            "ro" => flags |= MS_RDONLY,
+            "rw" => flags &= !MS_RDONLY,
+            "nosuid" => flags |= MS_NOSUID,
+            "suid" => flags &= !MS_NOSUID,
+            "nodev" => flags |= MS_NODEV,
+            "dev" => flags &= !MS_NODEV,
+            "noexec" => flags |= MS_NOEXEC,
+            "exec" => flags &= !MS_NOEXEC,
+            "sync" => flags |= MS_SYNCHRONOUS,
+            "remount" => flags |= MS_REMOUNT,
+            "noatime" => flags |= MS_NOATIME,
+            "nodiratime" => flags |= MS_NODIRATIME,
+            "relatime" => flags |= MS_RELATIME,
+            "strictatime" => flags |= MS_STRICTATIME,
+            "bind" => {
+                flags |= MS_BIND;
+                is_bind = true;
+            }
+            "rbind" => {
+                flags |= MS_BIND | MS_REC;
+                is_bind = true;
+            }
+            _ => {} // data option (size=, mode=, …) or unknown: ignored
+        }
+    }
+    (flags, is_bind)
+}
+
 /// Translate a parsed OCI config (from `bundle`) into a validated [`DomainSpec`].
 pub fn config_to_spec(bundle: &Path, cfg: &OciConfig) -> Result<DomainSpec, OciError> {
     let process = cfg.process.as_ref().ok_or(OciError::Missing("process"))?;
@@ -493,6 +561,23 @@ pub fn config_to_spec(bundle: &Path, cfg: &OciConfig) -> Result<DomainSpec, OciE
         rlimits.push(Rlimit { resource, soft: rl.soft, hard: rl.hard });
     }
 
+    let mounts = cfg
+        .mounts
+        .iter()
+        .map(|m| {
+            let (flags, is_bind) = mount_flags(&m.options);
+            // For a bind, the krunc mount helper wants no fs type and the source
+            // path; otherwise pass the declared type and source.
+            let fs_type = if is_bind { String::new() } else { m.mount_type.clone() };
+            Mount {
+                destination: m.destination.clone(),
+                fs_type,
+                source: m.source.clone(),
+                flags,
+            }
+        })
+        .collect();
+
     let spec = DomainSpec {
         rootfs: resolve_rootfs(bundle, &root.path),
         hostname: cfg.hostname.clone().unwrap_or_default(),
@@ -514,6 +599,7 @@ pub fn config_to_spec(bundle: &Path, cfg: &OciConfig) -> Result<DomainSpec, OciE
         oom_score_adj: process.oom_score_adj,
         uid: process.user.as_ref().map(|u| u.uid).unwrap_or(0),
         gid: process.user.as_ref().map(|u| u.gid).unwrap_or(0),
+        mounts,
     };
     spec.validate()?;
     Ok(spec)
@@ -554,7 +640,14 @@ mod tests {
         "gidMappings": [ { "containerID": 0, "hostID": 100000, "size": 65536 } ],
         "maskedPaths": ["/proc/kcore", "/proc/sysrq-trigger"],
         "readonlyPaths": ["/proc/sys", "/bin"]
-      }
+      },
+      "mounts": [
+        { "destination": "/proc", "type": "proc", "source": "proc" },
+        { "destination": "/tmp", "type": "tmpfs", "source": "tmpfs",
+          "options": ["nosuid", "nodev", "noexec"] },
+        { "destination": "/etc/hosts", "type": "bind", "source": "/host/hosts",
+          "options": ["rbind", "ro"] }
+      ]
     }"#;
 
     #[test]
@@ -592,6 +685,15 @@ mod tests {
         assert_eq!(spec.oom_score_adj, Some(-500));
         assert_eq!(spec.uid, 65534);
         assert_eq!(spec.gid, 65534);
+        // mounts: proc (no flags), tmpfs /tmp (nosuid|nodev|noexec=0xe),
+        // and a recursive read-only bind (type cleared, MS_BIND|MS_REC|MS_RDONLY).
+        assert_eq!(spec.mounts.len(), 3);
+        assert_eq!(spec.mounts[0].destination, "/proc");
+        assert_eq!(spec.mounts[0].fs_type, "proc");
+        assert_eq!(spec.mounts[1].destination, "/tmp");
+        assert_eq!(spec.mounts[1].flags, 2 | 4 | 8);
+        assert_eq!(spec.mounts[2].fs_type, ""); // bind clears the type
+        assert_eq!(spec.mounts[2].flags, 4096 | 16384 | 1);
     }
 
     #[test]

@@ -45,6 +45,9 @@ pub const MAX_PATHS: usize = 256;
 /// Maximum number of rlimit entries (there are ~16 `RLIMIT_*` resources).
 pub const MAX_RLIMITS: usize = 32;
 
+/// Maximum number of mount entries.
+pub const MAX_MOUNTS: usize = 64;
+
 // ---- clone(2) namespace flags (uapi/linux/sched.h) ----
 /// `CLONE_NEWNS` — mount namespace.
 pub const NS_MOUNT: u32 = 0x0002_0000;
@@ -121,6 +124,19 @@ pub struct Rlimit {
     pub hard: u64,
 }
 
+/// A mount the kernel performs inside the container, as in `linux` `mounts[]`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Mount {
+    /// Mountpoint inside the container (e.g. `/proc`, `/tmp`).
+    pub destination: String,
+    /// Filesystem type (e.g. `proc`, `sysfs`, `tmpfs`) or empty for a bind.
+    pub fs_type: String,
+    /// Source (device, fs name, or bind source path).
+    pub source: String,
+    /// `MS_*` mount flags precomputed from the OCI options.
+    pub flags: u64,
+}
+
 /// The decoded domain specification.
 ///
 /// This is the userspace-friendly owned form. [`encode`](DomainSpec::encode)
@@ -172,6 +188,9 @@ pub struct DomainSpec {
     pub uid: u32,
     /// Target gid the container process runs as (`process.user.gid`; 0 = root).
     pub gid: u32,
+    /// Mounts to perform inside the container, in order (empty = kernel default
+    /// of a private `/proc` + `/sys`).
+    pub mounts: Vec<Mount>,
 }
 
 // Section tags. Stable wire identifiers; never reuse a value.
@@ -192,6 +211,7 @@ mod tag {
     pub const OOM_SCORE_ADJ: u16 = 14;
     pub const CAP_SETS: u16 = 15;
     pub const USER: u16 = 16;
+    pub const MOUNTS: u16 = 17;
 }
 
 /// Errors from encoding or (strict) decoding.
@@ -285,6 +305,21 @@ fn write_strvec(w: &mut Writer, items: &[String]) {
     }
 }
 
+fn write_str(w: &mut Writer, s: &str) {
+    w.u32(s.len() as u32);
+    w.bytes(s.as_bytes());
+}
+
+fn write_mounts(w: &mut Writer, mounts: &[Mount]) {
+    w.u32(mounts.len() as u32);
+    for m in mounts {
+        write_str(w, &m.destination);
+        write_str(w, &m.fs_type);
+        write_str(w, &m.source);
+        w.u64(m.flags);
+    }
+}
+
 fn write_maps(w: &mut Writer, maps: &[IdMap]) {
     w.u32(maps.len() as u32);
     for m in maps {
@@ -324,6 +359,7 @@ impl DomainSpec {
         check_len("masked_paths", self.masked_paths.len(), MAX_PATHS)?;
         check_len("readonly_paths", self.readonly_paths.len(), MAX_PATHS)?;
         check_len("rlimits", self.rlimits.len(), MAX_RLIMITS)?;
+        check_len("mounts", self.mounts.len(), MAX_MOUNTS)?;
         Ok(())
     }
 
@@ -396,6 +432,9 @@ impl DomainSpec {
                 w.u32(self.uid);
                 w.u32(self.gid);
             });
+        }
+        if !self.mounts.is_empty() {
+            emit(tag::MOUNTS, &mut |w| write_mounts(w, &self.mounts));
         }
 
         w.u32(count);
@@ -499,6 +538,21 @@ fn read_rlimits(r: &mut Reader<'_>, what: &'static str) -> Result<Vec<Rlimit>, A
     Ok(v)
 }
 
+fn read_mounts(r: &mut Reader<'_>, what: &'static str) -> Result<Vec<Mount>, AbiError> {
+    let n = r.u32()? as usize;
+    check_len(what, n, MAX_MOUNTS)?;
+    let mut v = Vec::with_capacity(n);
+    for _ in 0..n {
+        v.push(Mount {
+            destination: read_string(r, "mount.destination", MAX_STR)?,
+            fs_type: read_string(r, "mount.type", MAX_STR)?,
+            source: read_string(r, "mount.source", MAX_STR)?,
+            flags: r.u64()?,
+        });
+    }
+    Ok(v)
+}
+
 /// Decode a buffer into `(op, spec)`, enforcing every bound. Total: never panics.
 pub fn decode(buf: &[u8]) -> Result<(Op, DomainSpec), AbiError> {
     if buf.len() > MAX_SPEC {
@@ -575,6 +629,9 @@ pub fn decode(buf: &[u8]) -> Result<(Op, DomainSpec), AbiError> {
                 spec.uid = sr.u32()?;
                 spec.gid = sr.u32()?;
             }
+            tag::MOUNTS => {
+                spec.mounts = read_mounts(&mut sr, "mounts")?;
+            }
             _ => { /* unknown tag: ignore for forward-compat */ }
         }
     }
@@ -629,6 +686,20 @@ mod tests {
             oom_score_adj: Some(-500),
             uid: 65534,
             gid: 65534,
+            mounts: vec![
+                Mount {
+                    destination: "/proc".into(),
+                    fs_type: "proc".into(),
+                    source: "proc".into(),
+                    flags: 0,
+                },
+                Mount {
+                    destination: "/tmp".into(),
+                    fs_type: "tmpfs".into(),
+                    source: "tmpfs".into(),
+                    flags: 0x0000_000e, // MS_NOSUID|MS_NODEV|MS_NOEXEC
+                },
+            ],
         }
     }
 

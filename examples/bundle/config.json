@@ -58,5 +58,12 @@
         }
       ]
     }
-  }
+  },
+  "mounts": [
+    { "destination": "/proc", "type": "proc", "source": "proc" },
+    { "destination": "/sys", "type": "sysfs", "source": "sysfs",
+      "options": ["nosuid", "nodev", "noexec", "ro"] },
+    { "destination": "/tmp", "type": "tmpfs", "source": "tmpfs",
+      "options": ["nosuid", "nodev", "noexec"] }
+  ]
 }

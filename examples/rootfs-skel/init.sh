@@ -76,6 +76,9 @@ if [ "$KRUNC_PIDS_TEST" = 1 ]; then
 	echo "[container] --- user (process.user) ---"
 	echo "[container]   running as uid:gid = $(id -u):$(id -g)  (config requests 65534:65534)"
 
+	echo "[container] --- mounts (OCI mounts[] applied by the kernel) ---"
+	echo "[container]   /tmp: $(awk '$2=="/tmp"{print $1,$3,$4}' /proc/mounts 2>&-)  (expect tmpfs, nosuid/nodev/noexec)"
+
 	echo "[container] --- memory cgroup limit (memory.max) ---"
 	echo "[container]   memhog allocates until the cgroup OOM-kills it (config max=64 MiB):"
 	/bin/memhog

@@ -130,6 +130,8 @@ const MAX_ARGS: usize = 32;
 const MAX_SPEC: usize = 16 * 1024;
 /// Maximum number of rlimit entries accepted from the spec.
 const MAX_RLIMITS: usize = 32;
+/// Maximum number of mount entries accepted from the spec.
+const MAX_MOUNTS: usize = 64;
 /// Maximum length of a single string field in the binary spec.
 const MAX_STR: usize = 4096;
 /// krunc-abi wire magic and version (see the `krunc-abi` crate).
@@ -193,6 +195,7 @@ struct ContainerCtx {
     oom_score_adj: Option<i32>, // OOM score adjustment applied before exec
     uid: u32,                  // target uid (process.user.uid)
     gid: u32,                  // target gid (process.user.gid)
+    mounts: KVec<MountSpec>,   // mounts to perform (empty -> default /proc + /sys)
     ctrl: Option<Arc<ContainerControl>>, // Some -> two-phase (created) container
 }
 
@@ -426,6 +429,7 @@ fn handle_text_command(buf: &[u8]) -> Result {
         None,
         0,
         0,
+        KVec::new(),
     )?;
     pr_info!("started container id={} pid={}\n", id, pid);
     Ok(())
@@ -621,6 +625,7 @@ struct DecodedSpec {
     oom_score_adj: Option<i32>,
     uid: u32,
     gid: u32,
+    mounts: KVec<MountSpec>,
 }
 
 /// The five Linux capability sets applied to the container before exec.
@@ -639,6 +644,38 @@ struct RLimit {
     resource: u32,
     soft: u64,
     hard: u64,
+}
+
+/// A decoded mount (each path NUL-terminated; `fs_type`/`source` of length <= 1
+/// mean "none", passed to the helper as NULL).
+struct MountSpec {
+    destination: KVec<u8>,
+    fs_type: KVec<u8>,
+    source: KVec<u8>,
+    flags: c_ulong,
+}
+
+fn read_lenbytes<'a>(sr: &mut BReader<'a>) -> Result<&'a [u8]> {
+    let l = sr.u32()? as usize;
+    if l > MAX_STR {
+        return Err(EINVAL);
+    }
+    sr.take(l)
+}
+
+fn read_mounts_k(sr: &mut BReader<'_>) -> Result<KVec<MountSpec>> {
+    let n = sr.u32()? as usize;
+    let mut v: KVec<MountSpec> = KVec::new();
+    for _ in 0..n {
+        let dest = to_cvec(read_lenbytes(sr)?)?;
+        let fs_type = to_cvec(read_lenbytes(sr)?)?;
+        let source = to_cvec(read_lenbytes(sr)?)?;
+        let flags = sr.u64()? as c_ulong;
+        if v.len() < MAX_MOUNTS {
+            v.push(MountSpec { destination: dest, fs_type, source, flags }, GFP_KERNEL)?;
+        }
+    }
+    Ok(v)
 }
 
 fn read_rlimits_k(sr: &mut BReader<'_>) -> Result<KVec<RLimit>> {
@@ -709,6 +746,7 @@ fn decode_spec(buf: &[u8]) -> Result<DecodedSpec> {
         oom_score_adj: None,
         uid: 0,
         gid: 0,
+        mounts: KVec::new(),
     };
     for _ in 0..count {
         let tag = r.u16()?;
@@ -749,6 +787,7 @@ fn decode_spec(buf: &[u8]) -> Result<DecodedSpec> {
                 d.uid = sr.u32()?;
                 d.gid = sr.u32()?;
             }
+            17 => d.mounts = read_mounts_k(&mut sr)?, // MOUNTS
             // tags 6/7 (uid/gid maps) land in a later milestone.
             _ => {}
         }
@@ -801,6 +840,7 @@ fn create_from_blob(spec: &[u8]) -> Result<(u64, i32)> {
         d.oom_score_adj,
         d.uid,
         d.gid,
+        d.mounts,
     )
 }
 
@@ -822,6 +862,7 @@ fn spawn(
     oom_score_adj: Option<i32>,
     uid: u32,
     gid: u32,
+    mounts: KVec<MountSpec>,
 ) -> Result<(u64, i32)> {
     let ctrl = if paused {
         Some(Arc::new(
@@ -852,6 +893,7 @@ fn spawn(
             oom_score_adj,
             uid,
             gid,
+            mounts,
             ctrl: ctrl.as_ref().map(|a| a.clone()),
         },
         GFP_KERNEL,
@@ -929,6 +971,54 @@ fn apply_path_confinement(masked: &KVec<KVec<u8>>, readonly: &KVec<KVec<u8>>) {
     }
 }
 
+/// Perform the container's configured mounts in order, in its private mount
+/// namespace while still privileged. If none are configured, fall back to a
+/// private `/proc` + `/sys` (what an unconfigured container still needs).
+fn apply_mounts(mounts: &KVec<MountSpec>) {
+    if mounts.is_empty() {
+        // SAFETY: FFI calls with NUL-terminated C string literals.
+        unsafe {
+            krunc_mount(
+                c"proc".as_ptr() as *const c_char,
+                c"/proc".as_ptr() as *const c_char,
+                c"proc".as_ptr() as *const c_char,
+                0,
+            );
+            krunc_mount(
+                c"sysfs".as_ptr() as *const c_char,
+                c"/sys".as_ptr() as *const c_char,
+                c"sysfs".as_ptr() as *const c_char,
+                0,
+            );
+        }
+        return;
+    }
+
+    for i in 0..mounts.len() {
+        let m = &mounts[i];
+        if m.destination.len() <= 1 {
+            continue;
+        }
+        let dest = m.destination.as_ptr() as *const c_char;
+        // fs_type / source of length <= 1 are "none" -> NULL (e.g. bind mounts).
+        let src = if m.source.len() > 1 {
+            m.source.as_ptr() as *const c_char
+        } else {
+            ptr::null()
+        };
+        let typ = if m.fs_type.len() > 1 {
+            m.fs_type.as_ptr() as *const c_char
+        } else {
+            ptr::null()
+        };
+        // SAFETY: dest/src/typ are NUL-terminated C strings valid for the call.
+        let rc = unsafe { krunc_mount(src, dest, typ, m.flags) };
+        if rc != 0 {
+            pr_err!("krunc: mount #{} failed: {}\n", i, rc);
+        }
+    }
+}
+
 /// The container's PID 1, run in kernel context inside the new namespaces.
 ///
 /// # Safety
@@ -976,25 +1066,11 @@ unsafe extern "C" fn container_entry(arg: *mut c_void) -> c_int {
         );
     }
 
-    // Mount a private /proc (and best-effort /sys) for the container, while
-    // still privileged, in its CLONE_NEWNS mount namespace. The confined
-    // container itself cannot do this once capabilities are dropped, so the
-    // kernel sets it up here.
-    // SAFETY: FFI calls into the vmlinux helper with NUL-terminated C strings.
-    unsafe {
-        krunc_mount(
-            c"proc".as_ptr() as *const c_char,
-            c"/proc".as_ptr() as *const c_char,
-            c"proc".as_ptr() as *const c_char,
-            0,
-        );
-        krunc_mount(
-            c"sysfs".as_ptr() as *const c_char,
-            c"/sys".as_ptr() as *const c_char,
-            c"sysfs".as_ptr() as *const c_char,
-            0,
-        );
-    }
+    // Perform the container's mounts (config-driven, in order), while still
+    // privileged, in its CLONE_NEWNS mount namespace. The confined container
+    // itself cannot do this once capabilities are dropped, so the kernel sets
+    // them up here. With no mounts configured this defaults to /proc + /sys.
+    apply_mounts(&ctx.mounts);
 
     // Filesystem confinement, applied while still privileged so a compromised
     // workload cannot undo it later (it lives in the container's mount namespace
