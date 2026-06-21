@@ -143,8 +143,18 @@ pub struct DomainSpec {
     pub gid_maps: Vec<IdMap>,
     /// Boolean options (`OPT_*`).
     pub flags: u64,
-    /// Capability bounding set kept (a Linux capability bitmask).
+    /// Capability bounding set kept (a Linux capability bitmask). Acts as the
+    /// "apply capabilities" switch: when non-zero, all five sets below are
+    /// applied exactly; when zero, the capability state is left untouched.
     pub cap_bounding: u64,
+    /// Effective capability set (active capabilities).
+    pub cap_effective: u64,
+    /// Permitted capability set (capabilities that may be made effective).
+    pub cap_permitted: u64,
+    /// Inheritable capability set (preserved across `execve`).
+    pub cap_inheritable: u64,
+    /// Ambient capability set (inherited by unprivileged `execve`).
+    pub cap_ambient: u64,
     /// Opaque compiled seccomp program (a `struct sock_filter[]` blob). Empty =
     /// no seccomp.
     pub seccomp: Vec<u8>,
@@ -176,6 +186,7 @@ mod tag {
     pub const RO_PATHS: u16 = 12;
     pub const RLIMITS: u16 = 13;
     pub const OOM_SCORE_ADJ: u16 = 14;
+    pub const CAP_SETS: u16 = 15;
 }
 
 /// Errors from encoding or (strict) decoding.
@@ -353,6 +364,12 @@ impl DomainSpec {
         }
         if self.cap_bounding != 0 {
             emit(tag::CAP_BOUNDING, &mut |w| w.u64(self.cap_bounding));
+            emit(tag::CAP_SETS, &mut |w| {
+                w.u64(self.cap_effective);
+                w.u64(self.cap_permitted);
+                w.u64(self.cap_inheritable);
+                w.u64(self.cap_ambient);
+            });
         }
         if !self.seccomp.is_empty() {
             emit(tag::SECCOMP, &mut |w| w.bytes(&self.seccomp));
@@ -521,6 +538,12 @@ pub fn decode(buf: &[u8]) -> Result<(Op, DomainSpec), AbiError> {
             tag::GID_MAPS => spec.gid_maps = read_maps(&mut sr, "gid_maps")?,
             tag::FLAGS => spec.flags = sr.u64()?,
             tag::CAP_BOUNDING => spec.cap_bounding = sr.u64()?,
+            tag::CAP_SETS => {
+                spec.cap_effective = sr.u64()?;
+                spec.cap_permitted = sr.u64()?;
+                spec.cap_inheritable = sr.u64()?;
+                spec.cap_ambient = sr.u64()?;
+            }
             tag::SECCOMP => {
                 check_len("seccomp", payload.len(), MAX_SECCOMP)?;
                 spec.seccomp = payload.to_vec();
@@ -577,6 +600,10 @@ mod tests {
             gid_maps: vec![IdMap { container_id: 0, host_id: 100000, size: 65536 }],
             flags: OPT_NO_NEW_PRIVS | OPT_ROOTFS_RO,
             cap_bounding: 0x0000_0000_a80c_25fb,
+            cap_effective: 0x0000_0000_0000_0001,
+            cap_permitted: 0x0000_0000_a80c_25fb,
+            cap_inheritable: 0,
+            cap_ambient: 0,
             seccomp: vec![0xde, 0xad, 0xbe, 0xef],
             masked_paths: vec!["/proc/kcore".into(), "/proc/sysrq-trigger".into()],
             readonly_paths: vec!["/proc/sys".into(), "/bin".into()],

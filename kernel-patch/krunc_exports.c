@@ -46,7 +46,8 @@
 int krunc_set_hostname(const char *name, size_t len);
 int krunc_chroot(const char *path);
 int krunc_kill(pid_t nr, int sig);
-int krunc_apply_creds(u64 cap_mask, int no_new_privs);
+int krunc_apply_creds(u64 bset, u64 eff, u64 perm, u64 inh, u64 amb,
+		      int no_new_privs);
 int krunc_apply_rlimit(unsigned int resource, u64 soft, u64 hard);
 void krunc_set_oom_score_adj(int adj);
 int krunc_mount(const char *dev, const char *dir, const char *fstype,
@@ -151,9 +152,11 @@ EXPORT_SYMBOL_GPL(krunc_kill);
 /*
  * Apply the container's privilege confinement to the *current* task, atomically
  * in kernel context, just before exec:
- *   - lower the capability bounding/effective/permitted/inheritable sets to
- *     @cap_mask and clear the ambient set (the bounding set is the irreversible
- *     ceiling: nothing outside @cap_mask can ever be regained), and
+ *   - set the capability bounding/effective/permitted/inheritable/ambient sets
+ *     exactly to @bset/@eff/@perm/@inh/@amb (the bounding set is the irreversible
+ *     ceiling: nothing outside @bset can ever be regained; the other sets are
+ *     applied as requested so no capability is granted that was not asked for),
+ *     and
  *   - optionally set no_new_privs (required for a tamper-proof seccomp policy
  *     and to stop SUID privilege regain).
  *
@@ -161,26 +164,30 @@ EXPORT_SYMBOL_GPL(krunc_kill);
  * confinement is in force for the very first userspace instruction — there is no
  * intermediate userspace process in which the capability state could leak.
  */
-int krunc_apply_creds(u64 cap_mask, int no_new_privs)
+int krunc_apply_creds(u64 bset, u64 eff, u64 perm, u64 inh, u64 amb,
+		      int no_new_privs)
 {
 	struct cred *new;
-	kernel_cap_t caps = { .val = cap_mask & ((1ULL << (CAP_LAST_CAP + 1)) - 1) };
+	const u64 valid = (1ULL << (CAP_LAST_CAP + 1)) - 1;
 
 	if (no_new_privs)
 		task_set_no_new_privs(current);
 
-	/* cap_mask == 0 means "unspecified": leave the capability sets untouched. */
-	if (cap_mask == 0)
+	/* bset == 0 means "unspecified": leave the capability sets untouched. */
+	if (bset == 0)
 		return 0;
 
 	new = prepare_creds();
 	if (!new)
 		return -ENOMEM;
-	new->cap_bset = caps;
-	new->cap_effective = caps;
-	new->cap_permitted = caps;
-	new->cap_inheritable = caps;
-	new->cap_ambient = (kernel_cap_t){ .val = 0 };
+	/* Each set is applied exactly as requested (defaulting to empty), so a
+	 * container is never handed effective/permitted capabilities it did not
+	 * ask for just because they are within the bounding ceiling. */
+	new->cap_bset        = (kernel_cap_t){ .val = bset & valid };
+	new->cap_effective   = (kernel_cap_t){ .val = eff  & valid };
+	new->cap_permitted   = (kernel_cap_t){ .val = perm & valid };
+	new->cap_inheritable = (kernel_cap_t){ .val = inh  & valid };
+	new->cap_ambient     = (kernel_cap_t){ .val = amb  & valid };
 	commit_creds(new); /* consumes @new */
 	return 0;
 }

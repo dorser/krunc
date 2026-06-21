@@ -460,10 +460,17 @@ pub fn config_to_spec(bundle: &Path, cfg: &OciConfig) -> Result<DomainSpec, OciE
         flags |= OPT_ROOTFS_RO;
     }
 
-    let cap_bounding = match &process.capabilities {
-        Some(c) => caps_to_mask(&c.bounding)?,
-        None => 0,
-    };
+    let (cap_bounding, cap_effective, cap_permitted, cap_inheritable, cap_ambient) =
+        match &process.capabilities {
+            Some(c) => (
+                caps_to_mask(&c.bounding)?,
+                caps_to_mask(&c.effective)?,
+                caps_to_mask(&c.permitted)?,
+                caps_to_mask(&c.inheritable)?,
+                caps_to_mask(&c.ambient)?,
+            ),
+            None => (0, 0, 0, 0, 0),
+        };
 
     let mut rlimits = Vec::with_capacity(process.rlimits.len());
     for rl in &process.rlimits {
@@ -482,6 +489,10 @@ pub fn config_to_spec(bundle: &Path, cfg: &OciConfig) -> Result<DomainSpec, OciE
         gid_maps,
         flags,
         cap_bounding,
+        cap_effective,
+        cap_permitted,
+        cap_inheritable,
+        cap_ambient,
         seccomp,
         masked_paths,
         readonly_paths,
@@ -508,7 +519,8 @@ mod tests {
         "cwd": "/",
         "noNewPrivileges": true,
         "capabilities": {
-          "bounding": ["CAP_NET_BIND_SERVICE", "CAP_KILL", "CAP_AUDIT_WRITE"]
+          "bounding": ["CAP_NET_BIND_SERVICE", "CAP_KILL", "CAP_AUDIT_WRITE"],
+          "effective": ["CAP_KILL"]
         },
         "oomScoreAdj": -500,
         "rlimits": [
@@ -546,6 +558,12 @@ mod tests {
         );
         let expect_caps = (1u64 << 10) | (1u64 << 5) | (1u64 << 29);
         assert_eq!(spec.cap_bounding, expect_caps);
+        // effective is specified separately (just CAP_KILL); permitted/inheritable/
+        // ambient are unset, so they must be empty -- not silently equal to bounding.
+        assert_eq!(spec.cap_effective, 1u64 << 5);
+        assert_eq!(spec.cap_permitted, 0);
+        assert_eq!(spec.cap_inheritable, 0);
+        assert_eq!(spec.cap_ambient, 0);
         assert_eq!(spec.masked_paths, vec!["/proc/kcore", "/proc/sysrq-trigger"]);
         assert_eq!(spec.readonly_paths, vec!["/proc/sys", "/bin"]);
         assert_eq!(

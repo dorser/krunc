@@ -68,7 +68,14 @@ extern "C" {
     /// Apply privilege confinement to the current task before exec: lower the
     /// capability sets to `cap_mask` (0 = leave untouched) and optionally set
     /// no_new_privs.
-    fn krunc_apply_creds(cap_mask: u64, no_new_privs: c_int) -> c_int;
+    fn krunc_apply_creds(
+        bset: u64,
+        eff: u64,
+        perm: u64,
+        inh: u64,
+        amb: u64,
+        no_new_privs: c_int,
+    ) -> c_int;
     /// Mount `fstype` from `dev` onto `dir` in the current task's mount
     /// namespace (e.g. a fresh /proc for the container).
     fn krunc_mount(
@@ -175,7 +182,7 @@ struct ContainerCtx {
     rootfs: KVec<u8>,          // NUL-terminated
     argv: KVec<KVec<u8>>,      // each NUL-terminated; argv[0] is the binary
     envp: KVec<KVec<u8>>,      // each NUL-terminated; empty -> default env
-    cap_bounding: u64,         // capability ceiling to apply (0 = leave untouched)
+    cap_sets: CapSets,         // the five capability sets applied before exec
     no_new_privs: bool,        // set no_new_privs before exec
     seccomp: KVec<u8>,         // compiled sock_filter[] blob (empty = no seccomp)
     masked: KVec<KVec<u8>>,    // paths over-mounted to be inaccessible (each NUL-terminated)
@@ -406,7 +413,7 @@ fn handle_text_command(buf: &[u8]) -> Result {
         envp,
         flags,
         false,
-        0,
+        CapSets::default(),
         false,
         KVec::new(),
         KVec::new(),
@@ -596,12 +603,26 @@ struct DecodedSpec {
     envp: KVec<KVec<u8>>,
     ns: u32,
     cap_bounding: u64,
+    cap_effective: u64,
+    cap_permitted: u64,
+    cap_inheritable: u64,
+    cap_ambient: u64,
     flags: u64,
     seccomp: KVec<u8>,
     masked: KVec<KVec<u8>>,
     readonly: KVec<KVec<u8>>,
     rlimits: KVec<RLimit>,
     oom_score_adj: Option<i32>,
+}
+
+/// The five Linux capability sets applied to the container before exec.
+#[derive(Clone, Copy, Default)]
+struct CapSets {
+    bounding: u64,
+    effective: u64,
+    permitted: u64,
+    inheritable: u64,
+    ambient: u64,
 }
 
 /// A decoded resource limit (`setrlimit`).
@@ -668,6 +689,10 @@ fn decode_spec(buf: &[u8]) -> Result<DecodedSpec> {
         envp: KVec::new(),
         ns: 0,
         cap_bounding: 0,
+        cap_effective: 0,
+        cap_permitted: 0,
+        cap_inheritable: 0,
+        cap_ambient: 0,
         flags: 0,
         seccomp: KVec::new(),
         masked: KVec::new(),
@@ -692,6 +717,13 @@ fn decode_spec(buf: &[u8]) -> Result<DecodedSpec> {
             5 => d.ns = sr.u32()?,                 // NAMESPACES
             8 => d.flags = sr.u64()?,              // FLAGS
             9 => d.cap_bounding = sr.u64()?,       // CAP_BOUNDING
+            15 => {
+                // CAP_SETS: effective, permitted, inheritable, ambient.
+                d.cap_effective = sr.u64()?;
+                d.cap_permitted = sr.u64()?;
+                d.cap_inheritable = sr.u64()?;
+                d.cap_ambient = sr.u64()?;
+            }
             10 => {
                 // SECCOMP: a raw sock_filter[] blob; copy verbatim (8 bytes/insn).
                 let mut v: KVec<u8> = KVec::new();
@@ -731,6 +763,13 @@ fn create_from_blob(spec: &[u8]) -> Result<(u64, i32)> {
     };
     let ns = if d.ns != 0 { d.ns as c_ulong } else { ALL_NS };
     let no_new_privs = d.flags & OPT_NO_NEW_PRIVS != 0;
+    let cap_sets = CapSets {
+        bounding: d.cap_bounding,
+        effective: d.cap_effective,
+        permitted: d.cap_permitted,
+        inheritable: d.cap_inheritable,
+        ambient: d.cap_ambient,
+    };
     spawn(
         host,
         d.rootfs,
@@ -738,7 +777,7 @@ fn create_from_blob(spec: &[u8]) -> Result<(u64, i32)> {
         d.envp,
         ns | SIGCHLD,
         true,
-        d.cap_bounding,
+        cap_sets,
         no_new_privs,
         d.seccomp,
         d.masked,
@@ -757,7 +796,7 @@ fn spawn(
     envp: KVec<KVec<u8>>,
     flags: c_ulong,
     paused: bool,
-    cap_bounding: u64,
+    cap_sets: CapSets,
     no_new_privs: bool,
     seccomp: KVec<u8>,
     masked: KVec<KVec<u8>>,
@@ -785,7 +824,7 @@ fn spawn(
             rootfs,
             argv,
             envp,
-            cap_bounding,
+            cap_sets,
             no_new_privs,
             seccomp,
             masked,
@@ -964,7 +1003,16 @@ unsafe extern "C" fn container_entry(arg: *mut c_void) -> c_int {
     // first userspace instruction, with no intermediate userspace process in
     // which capabilities could leak.
     // SAFETY: FFI call into the vmlinux helper, operating on `current`.
-    unsafe { krunc_apply_creds(ctx.cap_bounding, if ctx.no_new_privs { 1 } else { 0 }) };
+    unsafe {
+        krunc_apply_creds(
+            ctx.cap_sets.bounding,
+            ctx.cap_sets.effective,
+            ctx.cap_sets.permitted,
+            ctx.cap_sets.inheritable,
+            ctx.cap_sets.ambient,
+            if ctx.no_new_privs { 1 } else { 0 },
+        )
+    };
 
     // Sealed syscall policy: install the compiled seccomp program now, after
     // no_new_privs is set, so it is in force for the very first userspace
