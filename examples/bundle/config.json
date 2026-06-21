@@ -1,0 +1,25 @@
+{
+  "ociVersion": "1.0.2-dev",
+  "hostname": "oci-demo",
+  "process": {
+    "terminal": false,
+    "user": { "uid": 0, "gid": 0 },
+    "args": ["/bin/sh", "/init.sh"],
+    "env": [
+      "PATH=/bin:/sbin:/usr/bin:/usr/sbin",
+      "TERM=linux",
+      "container=krunc"
+    ],
+    "cwd": "/"
+  },
+  "root": { "path": "rootfs", "readonly": false },
+  "linux": {
+    "namespaces": [
+      { "type": "pid" },
+      { "type": "mount" },
+      { "type": "uts" },
+      { "type": "ipc" },
+      { "type": "network" }
+    ]
+  }
+}

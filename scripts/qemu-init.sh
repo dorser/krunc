@@ -76,7 +76,29 @@ cat /dev/krunc | sed 's/^/[vm]   /'
 
 ############################################################################
 echo
-echo "================ DEMO 3: unload the runtime cleanly ================"
+echo "=========== DEMO 3: OCI runtime CLI (containerd-compatible) ==========="
+echo "[vm] krunc --version:"
+/bin/krunc --version | sed 's/^/[vm]   /'
+echo "[vm] krunc create oci1 --bundle /bundle   (sets up + blocks before exec)"
+/bin/krunc create oci1 --bundle /bundle --pid-file /run/oci1.pid
+echo "[vm] krunc state oci1   (expect: created)"
+/bin/krunc state oci1 | grep -E '"status"|"id"|"pid"' | sed 's/^/[vm]   /'
+echo "[vm] krunc start oci1   (releases the paused init -> execs the entrypoint)"
+/bin/krunc start oci1
+sleep 1
+echo "[vm] krunc state oci1   (expect: running)"
+/bin/krunc state oci1 | grep -E '"status"|"pid"' | sed 's/^/[vm]   /'
+sleep 3
+echo "[vm] krunc state oci1   (after the entrypoint exits, expect: stopped)"
+/bin/krunc state oci1 | grep -E '"status"' | sed 's/^/[vm]   /'
+echo "[vm] krunc list:"
+/bin/krunc list | sed 's/^/[vm]   /'
+echo "[vm] krunc delete oci1"
+/bin/krunc delete oci1
+
+############################################################################
+echo
+echo "================ DEMO 4: unload the runtime cleanly ================"
 exec 3>&-                 # close the control device so the module is unused
 if rmmod krunc; then
 	echo "[vm] krunc.ko unloaded cleanly"

@@ -42,10 +42,36 @@
 int krunc_set_hostname(const char *name, size_t len);
 int krunc_chroot(const char *path);
 int krunc_kill(pid_t nr, int sig);
+pid_t krunc_spawn(int (*fn)(void *), void *arg, unsigned long flags);
 
 /* Re-export existing primitives that mainline keeps internal. */
 EXPORT_SYMBOL_GPL(user_mode_thread);
 EXPORT_SYMBOL_GPL(kernel_execve);
+
+/*
+ * Create a task that runs @fn in kernel context and may later kernel_execve()
+ * into userspace, in the namespaces selected by @flags (CLONE_NEW*). The low
+ * byte of @flags is the exit signal (e.g. SIGCHLD).
+ *
+ * Unlike user_mode_thread()/kernel_thread(), this deliberately does NOT set
+ * CLONE_VM: krunc may be called from an ordinary (possibly multi-threaded)
+ * userspace process, and the container init must not share that caller's
+ * address space (the child gets its own mm, which execve replaces). File
+ * descriptors are still inherited (CLONE_FILES is not set, so they are copied),
+ * which gives the container its stdio.
+ */
+pid_t krunc_spawn(int (*fn)(void *), void *arg, unsigned long flags)
+{
+	struct kernel_clone_args args = {
+		.flags		= (flags & ~(unsigned long)CSIGNAL),
+		.exit_signal	= (flags & CSIGNAL),
+		.fn		= fn,
+		.fn_arg		= arg,
+	};
+
+	return kernel_clone(&args);
+}
+EXPORT_SYMBOL_GPL(krunc_spawn);
 
 /*
  * Set the nodename (hostname) of the UTS namespace of the *current* task.

@@ -108,7 +108,64 @@ A more complete runtime would set up the container's stdio from the kernel side
 (e.g. opening a provided console before exec), the way `runc` connects a
 container to a pty.
 
-## 7. Testing approach
+## 7. OCI runtime CLI and containerd
+
+To be drivable by a higher-level runtime, krunc adds an OCI-runtime-style
+control plane on top of the same module.
+
+**Kernel ioctl ABI.** Alongside the text `write()`/`read()` interface, the misc
+device implements `ioctl`s carrying a small fixed `#[repr(C)]` struct
+(`KruncCmd`, 32 bytes): `CREATE`, `START`, `STATE`, `KILL`, `DELETE`. `CREATE`
+passes a pointer+length to a (newline `key=value`) spec, which the kernel copies
+in and parses; the heavier, variable-length data (args, env, paths, namespace
+set) stays text so the struct ABI is tiny and trivial to marshal from Go.
+
+**Two-phase create/start.** OCI requires `create` to set a container up but
+**not** run its entrypoint until `start`. krunc's `CREATE` spawns the container
+init, which sets hostname + enters the rootfs and then **blocks** (a per-
+container `AtomicU8` gate, polled with `msleep`) before `kernel_execve`. `START`
+flips the gate so the init proceeds to exec; `DELETE` of a not-yet-started
+container flips it to "doom" so the init exits instead. This mirrors runc's
+`exec.fifo` pause point.
+
+**The `krunc` CLI** (`cli/main.go`, static, pure stdlib) implements the runc
+command surface — `create --bundle … <id>`, `start`, `state`, `kill`, `delete`,
+`list`, `--version`. It reads the bundle's `config.json`, translates the
+supported subset (`process.args`/`env`, `root.path`, `hostname`,
+`linux.namespaces`) into the kernel spec, drives the ioctls, and persists per-id
+state under `--root` (default `/run/krunc`) — the same model runc uses.
+
+**Spawning from a userspace caller.** `user_mode_thread()`/`kernel_thread()`
+force `CLONE_VM`, which would make the container share the *caller's* address
+space — fine for a one-shot `busybox echo`, but it deadlocks a multi-threaded Go
+process trying to exit while a paused container still shares its mm. So
+`krunc_spawn()` clones **without** `CLONE_VM` (the child gets its own mm, which
+`execve` replaces) while still copying the caller's file descriptors, so the
+container inherits the caller's stdio.
+
+**containerd.** containerd drives an OCI runtime through
+`containerd-shim-runc-v2`, which `exec`s the runtime binary (configurable via the
+runtime options' `BinaryName`, the same hook crun/youki use) with runc-style
+subcommands on a bundle the shim writes. krunc's CLI implements that surface, so
+the shim can create/start/state/kill/delete a krunc container. The remaining
+gaps are inherent to the **runc shim being coupled to runc's process model**:
+
+- *Exit notification.* The shim expects the container init to be a manageable
+  child it can reap / get a `pidfd` exit event from. A krunc container is
+  kernel-spawned and reparents away from the runtime process, so the shim's exit
+  detection does not see it without extra plumbing (a `pidfd`/exit hook, or a
+  native shim).
+- *cgroups & stats.* The shim creates the cgroup and expects the runtime to
+  place the container in it; krunc does not honor cgroups yet, so resource
+  limits and `metrics`/`stats` are absent.
+- *Console/stdio* for `terminal:true` (console-socket fd passing) is not
+  implemented; `terminal:false` works via inherited fds.
+
+The robust path is **Path B**: a native `containerd-shim-krunc-v2` that
+implements the Task ttRPC service and owns these semantics directly, instead of
+impersonating runc. The OCI CLI here is the foundation for either path.
+
+## 8. Testing approach
 
 krunc requires a kernel with `CONFIG_RUST=y` and the export shim, so it is built
 and tested on a disposable VM. The demo boots the freshly built kernel **under
@@ -121,14 +178,15 @@ driver). This means:
 
 Isolation is verified two ways: the container prints its own view (hostname, PID
 1, visible processes, rootfs, interfaces), and the host side compares
-`/proc/<pid>/ns/*` inodes against its own.
+`/proc/<pid>/ns/*` inodes against its own. The OCI lifecycle is verified by
+driving the `krunc` CLI through create → start → state → delete (DEMO 3).
 
 A note on the kernel config: `CONFIG_RUST` is gated on
 `!CALL_PADDING || RUSTC_VERSION >= 1.81`. With the pinned rustc 1.78 (the
 kernel's documented minimum) the call-depth-tracking mitigation that selects
 `CALL_PADDING` is disabled in `build-kernel.sh`; irrelevant for a PoC.
 
-## 8. Limitations and next steps
+## 9. Limitations and next steps
 
 Current simplifications (see also the README):
 

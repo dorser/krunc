@@ -1,60 +1,42 @@
 // SPDX-License-Identifier: GPL-2.0
 //! # krunc — a container runtime in the kernel
 //!
-//! `krunc` ("kernel runc") is a proof-of-concept OCI-ish container runtime
-//! implemented as a Rust kernel module. Unlike `runc`, which is a userspace
-//! program that issues `clone`/`unshare`/`mount`/`pivot_root`/`execve`
-//! syscalls, krunc performs the entire container *orchestration* — namespace
-//! creation, rootfs entry and process exec — inside the kernel.
+//! `krunc` ("kernel runc") is a proof-of-concept container runtime implemented
+//! as a Rust kernel module. It performs container *orchestration* — namespace
+//! creation, rootfs entry, hostname and process exec — inside the kernel.
 //!
-//! ## Interface
+//! It exposes two control interfaces on the misc device `/dev/krunc`:
 //!
-//! krunc registers a misc character device `/dev/krunc`. It is intentionally
-//! "hardened"/narrow: the only way to talk to it is a single-line text command,
-//! which makes it trivially scriptable from a minimal (busybox) userland:
+//! * a **text** interface (busybox-friendly) for one-shot containers:
+//!   `write()` a line `run rootfs=… host=… exec=… [arg=…]` or `kill <pid>`;
+//!   `read()` returns the container table.
+//! * an **ioctl** interface implementing an OCI-runtime-style two-phase
+//!   lifecycle (`create` / `start` / `state` / `kill` / `delete`) used by the
+//!   userspace `krunc` OCI CLI so a higher-level runtime (containerd) can drive
+//!   it. `create` sets a container up and **blocks it before exec**; `start`
+//!   releases it.
 //!
-//! ```text
-//! # start a container
-//! echo 'run rootfs=/containers/demo host=demo exec=/bin/sh arg=/init.sh' > /dev/krunc
-//! # list containers
-//! cat /dev/krunc
-//! # stop a container (by host-visible pid)
-//! echo 'kill 1234' > /dev/krunc
-//! ```
-//!
-//! ## How a container is created (all in kernel context)
-//!
-//! 1. `write()` runs in the context of the calling process; krunc parses the
-//!    spec and calls [`user_mode_thread`] with the namespace clone flags
-//!    (`CLONE_NEWPID|NEWNS|NEWUTS|NEWIPC|NEWNET`). This creates a task that is
-//!    PID 1 inside a brand-new set of namespaces and is allowed to later
-//!    `execve()` into userspace (the same primitive the kernel uses to create
-//!    the real init at boot).
-//! 2. That task runs [`container_entry`] in kernel context, which:
-//!      * sets the container hostname in its private UTS namespace,
-//!      * performs an in-kernel chroot into the container rootfs,
-//!      * `kernel_execve()`s the requested binary, becoming the container's
-//!        userspace PID 1.
-//!
-//! The handful of kernel primitives that mainline does not export to modules
-//! (`user_mode_thread`, `kernel_execve`) plus two thin struct/locking helpers
-//! (`krunc_chroot`, `krunc_set_hostname`, `krunc_kill`) are provided by a small
-//! `kernel/krunc_exports.c` shim compiled into vmlinux. All policy and logic
-//! lives here, in Rust.
+//! The handful of primitives mainline does not export to modules
+//! (`user_mode_thread`, `kernel_execve`, plus thin `krunc_*` helpers) come from
+//! `kernel/krunc_exports.c`, compiled into vmlinux. All policy lives here.
 
 use core::ptr;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
 use kernel::{
     c_str,
     error::Error,
-    ffi::{c_char, c_int, c_ulong, c_void},
+    ffi::{c_char, c_int, c_uint, c_ulong, c_void},
     fs::{File, Kiocb},
+    ioctl::_IOC_NR,
     iov::{IovIterDest, IovIterSource},
     miscdevice::{MiscDevice, MiscDeviceOptions, MiscDeviceRegistration},
     prelude::*,
     str::CString,
+    sync::Arc,
+    transmute::{AsBytes, FromBytes},
     types::ForeignOwnable,
+    uaccess::{UserPtr, UserSlice},
 };
 
 module! {
@@ -67,25 +49,24 @@ module! {
 
 // -- FFI: primitives exported by kernel/krunc_exports.c (built into vmlinux) ---
 extern "C" {
-    /// Create a task in fresh namespaces that can later `kernel_execve()`.
-    /// Returns the new task's pid in the caller's pid namespace, or -errno.
-    fn user_mode_thread(
+    /// Create a container init task in fresh namespaces (clones without
+    /// CLONE_VM so it does not share the caller's address space). Returns the
+    /// new task's pid in the caller's pid namespace, or -errno.
+    fn krunc_spawn(
         f: unsafe extern "C" fn(*mut c_void) -> c_int,
         arg: *mut c_void,
         flags: c_ulong,
     ) -> c_int;
-    /// Exec a binary from kernel context (becomes userspace on success).
     fn kernel_execve(
         filename: *const c_char,
         argv: *const *const c_char,
         envp: *const *const c_char,
     ) -> c_int;
-    /// Set the nodename of the *current* task's UTS namespace.
     fn krunc_set_hostname(name: *const c_char, len: usize) -> c_int;
-    /// In-kernel chroot of the *current* task into `path`.
     fn krunc_chroot(path: *const c_char) -> c_int;
-    /// Send `sig` to the task with host-visible pid `nr`.
     fn krunc_kill(nr: c_int, sig: c_int) -> c_int;
+    // msleep() is exported by mainline.
+    fn msleep(msecs: c_uint);
 }
 
 // clone(2) namespace flags (uapi/linux/sched.h)
@@ -97,34 +78,79 @@ const CLONE_NEWNET: c_ulong = 0x4000_0000;
 const SIGCHLD: c_ulong = 17;
 const SIGKILL: c_int = 9;
 
-/// All namespaces krunc isolates by default, plus SIGCHLD so the container is a
-/// reapable child of the caller.
-const KRUNC_CLONE_FLAGS: c_ulong =
-    CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWNET | SIGCHLD;
+const ALL_NS: c_ulong =
+    CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWNET;
 
-/// Maximum argv entries handed to the container (argv[0] is the binary).
-const MAX_ARGS: usize = 8;
-/// Maximum bytes per argv entry (copied onto the kernel stack before exec).
-const ARG_LEN: usize = 256;
-/// Maximum accepted spec line length.
-const MAX_SPEC: usize = 4096;
+// Two-phase create/start gate states.
+const ACT_WAIT: u8 = 0; // created, blocked before exec
+const ACT_START: u8 = 1; // released -> exec
+const ACT_DOOM: u8 = 2; // torn down before start -> exit
 
-/// Heap context handed to the new task. Owned by [`container_entry`], which
-/// frees it before `execve` (so there is no per-container leak).
-struct ContainerCtx {
-    /// NUL-terminated hostname.
-    hostname: KVec<u8>,
-    /// NUL-terminated host path of the container rootfs.
-    rootfs: KVec<u8>,
-    /// argv; argv[0] is the binary. Each entry is NUL-terminated.
-    argv: KVec<KVec<u8>>,
+// OCI lifecycle states reported by ioctl STATE.
+const ST_CREATED: u32 = 0;
+const ST_RUNNING: u32 = 1;
+const ST_STOPPED: u32 = 2;
+
+const MAX_ARGS: usize = 32;
+const MAX_SPEC: usize = 16 * 1024;
+
+/// ioctl command numbers (we match on the _IOC_NR only, so the exact size/dir
+/// bits the userspace side encodes do not need to agree precisely).
+const NR_CREATE: u32 = 1;
+const NR_START: u32 = 2;
+const NR_STATE: u32 = 3;
+const NR_KILL: u32 = 4;
+const NR_DELETE: u32 = 5;
+
+/// ioctl payload shared with the userspace CLI. `#[repr(C)]`, 32 bytes, no
+/// padding holes (fields ordered by decreasing alignment).
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct KruncCmd {
+    /// userspace pointer to the (text) spec, for CREATE.
+    spec_ptr: u64,
+    /// container id (out for CREATE; in for START/STATE/KILL/DELETE).
+    id: u64,
+    /// length of the spec, for CREATE.
+    spec_len: u32,
+    /// host-visible pid (out for CREATE/STATE).
+    pid: i32,
+    /// signal number, for KILL.
+    sig: i32,
+    /// container state (out for STATE).
+    state: u32,
 }
 
-/// A launched container, for status/listing.
+// SAFETY: `KruncCmd` is `#[repr(C)]` and contains only integers, so every byte
+// pattern is a valid value and there are no padding bytes.
+unsafe impl FromBytes for KruncCmd {}
+// SAFETY: `KruncCmd` has no padding, so all of its bytes are initialized.
+unsafe impl AsBytes for KruncCmd {}
+
+/// Shared control block for a paused (two-phase) container. The container init
+/// polls `action`; the module sets it from `start`/`delete`.
+struct ContainerControl {
+    action: AtomicU8,
+}
+
+/// Heap context handed to the new task (via `ForeignOwnable`). On a successful
+/// `execve` the task never returns, so this is intentionally leaked then (a
+/// small, documented per-container cost); on any failure path it is dropped.
+struct ContainerCtx {
+    hostname: KVec<u8>,        // NUL-terminated
+    rootfs: KVec<u8>,          // NUL-terminated
+    argv: KVec<KVec<u8>>,      // each NUL-terminated; argv[0] is the binary
+    envp: KVec<KVec<u8>>,      // each NUL-terminated; empty -> default env
+    ctrl: Option<Arc<ContainerControl>>, // Some -> two-phase (created) container
+}
+
+/// A launched container, for status/listing and the OCI lifecycle.
 struct Container {
     id: u64,
     pid: i32,
     hostname: KVec<u8>,
+    ctrl: Option<Arc<ContainerControl>>,
+    started: bool,
 }
 
 kernel::sync::global_lock! {
@@ -158,8 +184,6 @@ impl kernel::InPlaceModule for KruncModule {
     }
 }
 
-/// Per-open state. krunc keeps all real state in the global [`REGISTRY`], so
-/// this is just a marker.
 struct KruncDevice;
 
 #[vtable]
@@ -170,26 +194,195 @@ impl MiscDevice for KruncDevice {
         Ok(KBox::new(KruncDevice, GFP_KERNEL)?)
     }
 
-    /// A write is a single command line: `run ...` or `kill <pid>`.
+    /// Text control: a single command line (`run …` or `kill <pid>`).
     fn write_iter(_kiocb: Kiocb<'_, Self::Ptr>, iov: &mut IovIterSource<'_>) -> Result<usize> {
         let mut buf: KVec<u8> = KVec::new();
         let len = iov.copy_from_iter_vec(&mut buf, GFP_KERNEL)?;
         if buf.len() > MAX_SPEC {
             return Err(EINVAL);
         }
-        handle_command(&buf)?;
+        handle_text_command(&buf)?;
         Ok(len)
     }
 
-    /// A read returns the container table.
+    /// Text status: the container table.
     fn read_iter(mut kiocb: Kiocb<'_, Self::Ptr>, iov: &mut IovIterDest<'_>) -> Result<usize> {
         let out = render_status()?;
         let read = iov.simple_read_from_buffer(kiocb.ki_pos_mut(), &out)?;
         Ok(read)
     }
+
+    /// OCI lifecycle control plane.
+    fn ioctl(_device: &KruncDevice, _file: &File, cmd: u32, arg: usize) -> Result<isize> {
+        ioctl_dispatch(cmd, arg)
+    }
 }
 
-// ----------------------------- command handling ------------------------------
+// =============================== ioctl plane ================================
+
+fn ioctl_dispatch(cmd: u32, arg: usize) -> Result<isize> {
+    let size = core::mem::size_of::<KruncCmd>();
+    let mut c: KruncCmd = UserSlice::new(UserPtr::from_addr(arg), size)
+        .reader()
+        .read::<KruncCmd>()?;
+
+    match _IOC_NR(cmd) {
+        NR_CREATE => {
+            // Copy the spec text in from userspace.
+            let mut spec: KVec<u8> = KVec::new();
+            if c.spec_len as usize > MAX_SPEC {
+                return Err(EINVAL);
+            }
+            UserSlice::new(UserPtr::from_addr(c.spec_ptr as usize), c.spec_len as usize)
+                .read_all(&mut spec, GFP_KERNEL)?;
+            let (id, pid) = create_from_oci(&spec)?;
+            c.id = id;
+            c.pid = pid;
+        }
+        NR_START => start_container(c.id)?,
+        NR_STATE => {
+            let (state, pid) = container_state(c.id)?;
+            c.state = state;
+            c.pid = pid;
+        }
+        NR_KILL => {
+            let sig = if c.sig != 0 { c.sig } else { SIGKILL };
+            kill_container(c.id, sig)?;
+        }
+        NR_DELETE => delete_container(c.id)?,
+        _ => return Err(ENOTTY),
+    }
+
+    // Write the (possibly updated) command struct back out.
+    UserSlice::new(UserPtr::from_addr(arg), size)
+        .writer()
+        .write::<KruncCmd>(&c)?;
+    Ok(0)
+}
+
+fn start_container(id: u64) -> Result {
+    let mut g = REGISTRY.lock();
+    for c in g.iter_mut() {
+        if c.id == id {
+            if let Some(ctrl) = &c.ctrl {
+                ctrl.action.store(ACT_START, Ordering::Release);
+            }
+            c.started = true;
+            pr_info!("started container id={} pid={}\n", id, c.pid);
+            return Ok(());
+        }
+    }
+    Err(ENOENT)
+}
+
+fn container_state(id: u64) -> Result<(u32, i32)> {
+    let g = REGISTRY.lock();
+    for c in g.as_slice() {
+        if c.id == id {
+            let state = if !c.started {
+                ST_CREATED
+            } else if is_alive(c.pid) {
+                ST_RUNNING
+            } else {
+                ST_STOPPED
+            };
+            return Ok((state, c.pid));
+        }
+    }
+    Err(ENOENT)
+}
+
+fn kill_container(id: u64, sig: i32) -> Result {
+    let pid = {
+        let g = REGISTRY.lock();
+        g.as_slice()
+            .iter()
+            .find(|c| c.id == id)
+            .map(|c| c.pid)
+            .ok_or(ENOENT)?
+    };
+    // SAFETY: FFI call into the vmlinux helper.
+    let rc = unsafe { krunc_kill(pid, sig) };
+    if rc < 0 {
+        return Err(Error::from_errno(rc));
+    }
+    Ok(())
+}
+
+fn delete_container(id: u64) -> Result {
+    let mut g = REGISTRY.lock();
+    let idx = g
+        .as_slice()
+        .iter()
+        .position(|c| c.id == id)
+        .ok_or(ENOENT)?;
+    let c = &g.as_slice()[idx];
+    if !c.started {
+        // never started: release the blocked init so it exits instead of execs.
+        if let Some(ctrl) = &c.ctrl {
+            ctrl.action.store(ACT_DOOM, Ordering::Release);
+        }
+    } else if is_alive(c.pid) {
+        // SAFETY: FFI call into the vmlinux helper.
+        unsafe { krunc_kill(c.pid, SIGKILL) };
+    }
+    g.remove(idx).map_err(|_| EINVAL)?;
+    pr_info!("deleted container id={}\n", id);
+    Ok(())
+}
+
+/// Liveness probe: signal 0 sends nothing, just checks the pid still exists.
+fn is_alive(pid: i32) -> bool {
+    // SAFETY: FFI call into the vmlinux helper.
+    unsafe { krunc_kill(pid, 0) == 0 }
+}
+
+// ============================== text plane =================================
+
+fn handle_text_command(buf: &[u8]) -> Result {
+    let line = trim(buf);
+    if line.is_empty() {
+        return Err(EINVAL);
+    }
+    if let Some(rest) = line.strip_prefix(b"kill") {
+        let rest = rest.strip_prefix(b"=").unwrap_or(rest);
+        let pid = parse_i32(rest).ok_or(EINVAL)?;
+        // SAFETY: FFI call into the vmlinux helper.
+        let rc = unsafe { krunc_kill(pid, SIGKILL) };
+        if rc < 0 {
+            return Err(Error::from_errno(rc));
+        }
+        REGISTRY.lock().retain(|c| c.pid != pid);
+        pr_info!("killed container pid {}\n", pid);
+        return Ok(());
+    }
+    // `run …` (one-shot: created and started immediately)
+    let (hostname, rootfs, argv, envp, flags) = parse_run_line(line)?;
+    let (id, pid) = spawn(hostname, rootfs, argv, envp, flags, false)?;
+    pr_info!("started container id={} pid={}\n", id, pid);
+    Ok(())
+}
+
+fn render_status() -> Result<KVec<u8>> {
+    let mut out: KVec<u8> = KVec::new();
+    out.extend_from_slice(b"ID    PID      STATE    HOSTNAME\n", GFP_KERNEL)?;
+    let guard = REGISTRY.lock();
+    for c in guard.as_slice() {
+        let state = if !c.started {
+            "created"
+        } else if is_alive(c.pid) {
+            "running"
+        } else {
+            "exited"
+        };
+        let host = core::str::from_utf8(&c.hostname).unwrap_or("?");
+        let line = CString::try_from_fmt(fmt!("{:<5} {:<8} {:<8} {}\n", c.id, c.pid, state, host))?;
+        out.extend_from_slice(line.as_bytes(), GFP_KERNEL)?;
+    }
+    Ok(out)
+}
+
+// ============================ spec parsing ================================
 
 fn is_ws(b: u8) -> bool {
     matches!(b, b' ' | b'\t' | b'\r' | b'\n')
@@ -245,7 +438,6 @@ fn parse_i32(s: &[u8]) -> Option<i32> {
     Some(v as i32)
 }
 
-/// Build a NUL-terminated kernel byte vector from `s`.
 fn to_cvec(s: &[u8]) -> Result<KVec<u8>> {
     let mut v = KVec::with_capacity(s.len() + 1, GFP_KERNEL)?;
     v.extend_from_slice(s, GFP_KERNEL)?;
@@ -253,31 +445,22 @@ fn to_cvec(s: &[u8]) -> Result<KVec<u8>> {
     Ok(v)
 }
 
-fn handle_command(buf: &[u8]) -> Result {
-    let line = trim(buf);
-    if line.is_empty() {
-        return Err(EINVAL);
+fn ns_flag(name: &[u8]) -> c_ulong {
+    match name {
+        b"pid" => CLONE_NEWPID,
+        b"mount" | b"mnt" => CLONE_NEWNS,
+        b"uts" => CLONE_NEWUTS,
+        b"ipc" => CLONE_NEWIPC,
+        b"network" | b"net" => CLONE_NEWNET,
+        _ => 0, // user/cgroup/time namespaces are not handled (PoC)
     }
-
-    // `kill <pid>` / `kill=<pid>`
-    if let Some(rest) = line.strip_prefix(b"kill") {
-        let rest = rest.strip_prefix(b"=").unwrap_or(rest);
-        let pid = parse_i32(rest).ok_or(EINVAL)?;
-        // SAFETY: simple FFI call into the vmlinux helper.
-        let rc = unsafe { krunc_kill(pid, SIGKILL) };
-        if rc < 0 {
-            pr_warn!("kill {} failed: {}\n", pid, rc);
-            return Err(Error::from_errno(rc));
-        }
-        REGISTRY.lock().retain(|c| c.pid != pid);
-        pr_info!("killed container pid {}\n", pid);
-        return Ok(());
-    }
-
-    run_container(line)
 }
 
-fn run_container(line: &[u8]) -> Result {
+type Spec = (KVec<u8>, KVec<u8>, KVec<KVec<u8>>, KVec<KVec<u8>>, c_ulong);
+
+/// Text `run` line: whitespace-separated `key=value` tokens (no spaces in
+/// values). `exec` is argv[0]; each `arg=` appends. All five namespaces.
+fn parse_run_line(line: &[u8]) -> Result<Spec> {
     let mut rootfs: Option<KVec<u8>> = None;
     let mut host: Option<KVec<u8>> = None;
     let mut exec: Option<KVec<u8>> = None;
@@ -295,11 +478,7 @@ fn run_container(line: &[u8]) -> Result {
         if start == i {
             break;
         }
-        let tok = &line[start..i];
-        let (key, val) = match tok.iter().position(|&b| b == b'=') {
-            Some(p) => (&tok[..p], &tok[p + 1..]),
-            None => (tok, &tok[tok.len()..]),
-        };
+        let (key, val) = split_kv(&line[start..i]);
         match key {
             b"rootfs" => rootfs = Some(to_cvec(val)?),
             b"host" | b"hostname" => host = Some(to_cvec(val)?),
@@ -309,7 +488,6 @@ fn run_container(line: &[u8]) -> Result {
                     args.push(to_cvec(val)?, GFP_KERNEL)?;
                 }
             }
-            b"run" => {}
             _ => {}
         }
     }
@@ -320,37 +498,132 @@ fn run_container(line: &[u8]) -> Result {
         Some(h) => h,
         None => to_cvec(b"krunc")?,
     };
-
-    // assemble argv = [exec, args...]
     let mut argv: KVec<KVec<u8>> = KVec::new();
     argv.push(exec, GFP_KERNEL)?;
-    while !args.is_empty() {
-        let a = args.remove(0).map_err(|_| EINVAL)?;
-        argv.push(a, GFP_KERNEL)?;
+    drain_into(&mut args, &mut argv)?;
+    Ok((host, rootfs, argv, KVec::new(), ALL_NS | SIGCHLD))
+}
+
+/// OCI spec from the CLI: newline-separated `key=value` lines (values may
+/// contain spaces). Keys: `rootfs`, `host`, `arg` (repeatable, in order =
+/// argv), `env` (repeatable), `ns` (comma list of namespaces).
+fn parse_oci_spec(spec: &[u8]) -> Result<Spec> {
+    let mut rootfs: Option<KVec<u8>> = None;
+    let mut host: Option<KVec<u8>> = None;
+    let mut argv: KVec<KVec<u8>> = KVec::new();
+    let mut envp: KVec<KVec<u8>> = KVec::new();
+    let mut flags: c_ulong = 0;
+    let mut have_ns = false;
+
+    for raw in spec.split(|&b| b == b'\n') {
+        let line = trim(raw);
+        if line.is_empty() {
+            continue;
+        }
+        let (key, val) = split_kv(line);
+        match key {
+            b"rootfs" => rootfs = Some(to_cvec(val)?),
+            b"host" | b"hostname" => host = Some(to_cvec(val)?),
+            b"arg" => {
+                if argv.len() < MAX_ARGS - 1 {
+                    argv.push(to_cvec(val)?, GFP_KERNEL)?;
+                }
+            }
+            b"env" => {
+                if envp.len() < MAX_ARGS - 1 {
+                    envp.push(to_cvec(val)?, GFP_KERNEL)?;
+                }
+            }
+            b"ns" => {
+                have_ns = true;
+                for n in val.split(|&b| b == b',') {
+                    flags |= ns_flag(trim(n));
+                }
+            }
+            _ => {}
+        }
     }
 
-    // hostname copy for the status table (without trailing NUL)
+    let rootfs = rootfs.ok_or(EINVAL)?;
+    if argv.is_empty() {
+        return Err(EINVAL);
+    }
+    let host = match host {
+        Some(h) => h,
+        None => to_cvec(b"krunc")?,
+    };
+    if !have_ns {
+        flags = ALL_NS;
+    }
+    Ok((host, rootfs, argv, envp, flags | SIGCHLD))
+}
+
+fn split_kv(tok: &[u8]) -> (&[u8], &[u8]) {
+    match tok.iter().position(|&b| b == b'=') {
+        Some(p) => (&tok[..p], &tok[p + 1..]),
+        None => (tok, &tok[tok.len()..]),
+    }
+}
+
+fn drain_into(src: &mut KVec<KVec<u8>>, dst: &mut KVec<KVec<u8>>) -> Result {
+    while !src.is_empty() {
+        let a = src.remove(0).map_err(|_| EINVAL)?;
+        dst.push(a, GFP_KERNEL)?;
+    }
+    Ok(())
+}
+
+// ============================ spawn / init ================================
+
+fn create_from_oci(spec: &[u8]) -> Result<(u64, i32)> {
+    let (hostname, rootfs, argv, envp, flags) = parse_oci_spec(spec)?;
+    spawn(hostname, rootfs, argv, envp, flags, true)
+}
+
+/// Create the container init task. If `paused`, it blocks before exec until
+/// `start`. Returns `(id, host_pid)`.
+fn spawn(
+    hostname: KVec<u8>,
+    rootfs: KVec<u8>,
+    argv: KVec<KVec<u8>>,
+    envp: KVec<KVec<u8>>,
+    flags: c_ulong,
+    paused: bool,
+) -> Result<(u64, i32)> {
+    let ctrl = if paused {
+        Some(Arc::new(
+            ContainerControl {
+                action: AtomicU8::new(ACT_WAIT),
+            },
+            GFP_KERNEL,
+        )?)
+    } else {
+        None
+    };
+
     let mut host_disp: KVec<u8> = KVec::new();
-    host_disp.extend_from_slice(&host[..host.len().saturating_sub(1)], GFP_KERNEL)?;
+    host_disp.extend_from_slice(&hostname[..hostname.len().saturating_sub(1)], GFP_KERNEL)?;
 
     let ctx = KBox::new(
         ContainerCtx {
-            hostname: host,
+            hostname,
             rootfs,
             argv,
+            envp,
+            ctrl: ctrl.as_ref().map(|a| a.clone()),
         },
         GFP_KERNEL,
     )?;
     let raw = ctx.into_foreign();
 
-    // SAFETY: `container_entry` has the required C ABI and `raw` is a freshly
-    // leaked `KBox<ContainerCtx>` which it takes ownership of.
-    let pid = unsafe { user_mode_thread(container_entry, raw, KRUNC_CLONE_FLAGS) };
+    // SAFETY: `container_entry` has the required C ABI and takes ownership of
+    // `raw` (a leaked `KBox<ContainerCtx>`).
+    let pid = unsafe { krunc_spawn(container_entry, raw, flags) };
     if pid < 0 {
         // The thread was not created; reclaim and drop the context.
-        // SAFETY: `raw` was produced by `into_foreign` just above and not consumed.
+        // SAFETY: `raw` was produced by `into_foreign` just above and unused.
         drop(unsafe { <KBox<ContainerCtx> as ForeignOwnable>::from_foreign(raw) });
-        pr_err!("user_mode_thread failed: {}\n", pid);
+        pr_err!("krunc_spawn failed: {}\n", pid);
         return Err(Error::from_errno(pid));
     }
 
@@ -360,92 +633,83 @@ fn run_container(line: &[u8]) -> Result {
             id,
             pid,
             hostname: host_disp,
+            ctrl,
+            started: !paused,
         },
         GFP_KERNEL,
     )?;
-    pr_info!("started container id={} pid={}\n", id, pid);
-    Ok(())
+    Ok((id, pid))
 }
 
-fn render_status() -> Result<KVec<u8>> {
-    let mut out: KVec<u8> = KVec::new();
-    out.extend_from_slice(b"ID    PID      STATE    HOSTNAME\n", GFP_KERNEL)?;
-    let guard = REGISTRY.lock();
-    for c in guard.as_slice() {
-        // Probe liveness with signal 0 (sends nothing, just checks existence).
-        // SAFETY: simple FFI call into the vmlinux helper.
-        let alive = unsafe { krunc_kill(c.pid, 0) } == 0;
-        let state = if alive { "running" } else { "exited" };
-        let host = core::str::from_utf8(&c.hostname).unwrap_or("?");
-        let line = CString::try_from_fmt(fmt!("{:<5} {:<8} {:<8} {}\n", c.id, c.pid, state, host))?;
-        out.extend_from_slice(line.as_bytes(), GFP_KERNEL)?;
-    }
-    Ok(out)
-}
-
-// ----------------------------- the container init ----------------------------
-
-/// Entry point of the container's PID 1, executed in kernel context inside the
-/// new namespaces. Sets hostname, enters the rootfs and execs the binary.
+/// The container's PID 1, run in kernel context inside the new namespaces.
 ///
 /// # Safety
-/// `arg` must be a `*mut c_void` produced by `KBox::<ContainerCtx>::into_foreign`.
+/// `arg` must be a `*mut c_void` from `KBox::<ContainerCtx>::into_foreign`.
 unsafe extern "C" fn container_entry(arg: *mut c_void) -> c_int {
     // SAFETY: by contract `arg` is a leaked `KBox<ContainerCtx>`.
     let ctx = unsafe { <KBox<ContainerCtx> as ForeignOwnable>::from_foreign(arg) };
 
-    // hostname (best effort)
     if ctx.hostname.len() > 1 {
         let hlen = ctx.hostname.len() - 1; // exclude trailing NUL
-        // SAFETY: pointer/len describe a valid NUL-terminated buffer.
+        // SAFETY: valid NUL-terminated buffer.
         unsafe { krunc_set_hostname(ctx.hostname.as_ptr() as *const c_char, hlen) };
     }
 
-    // enter the container rootfs
     // SAFETY: `rootfs` is NUL-terminated.
     let cr = unsafe { krunc_chroot(ctx.rootfs.as_ptr() as *const c_char) };
     if cr != 0 {
         pr_err!("chroot into container rootfs failed: {}\n", cr);
-        return cr; // ctx dropped here -> no leak
+        return cr; // ctx dropped here -> freed
     }
 
-    // Copy argv onto the stack so the heap context can be freed before exec.
-    let mut argbuf = [[0u8; ARG_LEN]; MAX_ARGS];
-    let mut argptr = [ptr::null::<c_char>(); MAX_ARGS + 1];
+    // Two-phase: a created container blocks here until start (or delete).
+    if let Some(ctrl) = ctx.ctrl.as_ref() {
+        loop {
+            match ctrl.action.load(Ordering::Acquire) {
+                ACT_WAIT => unsafe { msleep(10) },
+                ACT_DOOM => return 0, // torn down before start; ctx dropped -> freed
+                _ => break,
+            }
+        }
+    }
+
+    // Build argv/envp pointer arrays (into ctx's buffers, which stay valid for
+    // the execve call). On a successful exec this function never returns, so
+    // `ctx` is leaked (small, documented); any failure path drops it.
+    let mut argv_ptr = [ptr::null::<c_char>(); MAX_ARGS + 1];
     let n = core::cmp::min(ctx.argv.len(), MAX_ARGS);
     for i in 0..n {
-        let src = &ctx.argv[i];
-        let l = core::cmp::min(src.len(), ARG_LEN);
-        argbuf[i][..l].copy_from_slice(&src[..l]);
-        argbuf[i][ARG_LEN - 1] = 0; // guarantee NUL termination
-        argptr[i] = argbuf[i].as_ptr() as *const c_char;
+        argv_ptr[i] = ctx.argv[i].as_ptr() as *const c_char;
     }
-    argptr[n] = ptr::null();
+    argv_ptr[n] = ptr::null();
+    if argv_ptr[0].is_null() {
+        pr_err!("container has no exec path\n");
+        return -22; // -EINVAL
+    }
 
-    // Minimal default environment.
-    let envp: [*const c_char; 5] = [
+    let default_env: [*const c_char; 5] = [
         b"PATH=/bin:/sbin:/usr/bin:/usr/sbin\0".as_ptr() as *const c_char,
         b"HOME=/\0".as_ptr() as *const c_char,
         b"TERM=linux\0".as_ptr() as *const c_char,
         b"container=krunc\0".as_ptr() as *const c_char,
         ptr::null(),
     ];
+    let mut env_ptr = [ptr::null::<c_char>(); MAX_ARGS + 1];
+    let envp: *const *const c_char = if ctx.envp.is_empty() {
+        default_env.as_ptr()
+    } else {
+        let m = core::cmp::min(ctx.envp.len(), MAX_ARGS);
+        for i in 0..m {
+            env_ptr[i] = ctx.envp[i].as_ptr() as *const c_char;
+        }
+        env_ptr[m] = ptr::null();
+        env_ptr.as_ptr()
+    };
 
-    // argv is copied to the stack; free the heap context now.
-    drop(ctx);
-
-    if argptr[0].is_null() {
-        pr_err!("container has no exec path\n");
-        return -22; // -EINVAL
-    }
-
-    // Become the container's userspace process. On success `kernel_execve`
-    // rewrites this task's registers to enter the new program; it returns 0 and
-    // the new program runs when this function returns. A non-zero return is a
-    // genuine exec failure.
-    // SAFETY: argptr/envp are NUL-terminated arrays of NUL-terminated strings,
-    // valid for the duration of the call.
-    let rc = unsafe { kernel_execve(argptr[0], argptr.as_ptr(), envp.as_ptr()) };
+    // SAFETY: argv/envp are NUL-terminated arrays of NUL-terminated strings,
+    // valid for the duration of the call. On success the kernel rewrites this
+    // task's registers to enter the new program and returns 0.
+    let rc = unsafe { kernel_execve(argv_ptr[0], argv_ptr.as_ptr(), envp) };
     if rc != 0 {
         pr_err!("execve failed: {}\n", rc);
     }

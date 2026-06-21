@@ -93,28 +93,62 @@ cat /dev/krunc
 echo 'kill 1234' > /dev/krunc
 ```
 
+## OCI runtime CLI (drive it like `runc`)
+
+krunc also exposes an **ioctl** control plane implementing an OCI-runtime-style
+two-phase lifecycle, plus a small userspace binary, `krunc` (in `cli/`), that
+speaks the same command surface as `runc`:
+
+```sh
+krunc create <id> --bundle <dir> [--pid-file <f>]   # set up + block before exec
+krunc start  <id>                                   # release -> exec entrypoint
+krunc state  <id>                                   # OCI state JSON (created/running/stopped)
+krunc kill   <id> <signal>
+krunc delete <id>
+krunc list ; krunc --version
+```
+
+It reads the OCI bundle's `config.json`, translates the supported subset
+(`process.args`/`env`, `root.path`, `hostname`, `linux.namespaces`) into a krunc
+kernel spec, and drives the module's `create`(paused)/`start`/`state`/`kill`/
+`delete` ioctls. State is persisted under `--root` (default `/run/krunc`) like
+runc. A captured standalone lifecycle run is in
+[`docs/sample-oci-run.txt`](docs/sample-oci-run.txt).
+
+This is the API a higher-level runtime expects. **containerd** drives an OCI
+runtime through `containerd-shim-runc-v2`, which `exec`s the runtime binary
+(configurable via the runtime's `BinaryName`). See the *containerd* notes in
+[`docs/DESIGN.md`](docs/DESIGN.md) for how krunc plugs in and the current limits
+(the runc shim is coupled to runc's process model — exit notification, cgroups
+and stats need a native shim or further work).
+
 ## Repository layout
 
 ```
 module/                Rust kernel module (the runtime itself)
-  krunc.rs             misc device, spec parser, registry, container_entry
+  krunc.rs             misc device, text + ioctl control, registry, container_entry
   Kbuild, Makefile     out-of-tree module build
 kernel-patch/
-  krunc_exports.c      tiny vmlinux shim exporting the primitives krunc needs
+  krunc_exports.c      tiny vmlinux shim: krunc_spawn + the primitives krunc needs
+cli/
+  main.go              runc/OCI-compatible CLI (create/start/state/kill/delete)
 examples/
   rootfs-skel/init.sh  example container entrypoint (the "app")
+  bundle/config.json   example OCI bundle config
 scripts/
   vm-setup.sh          install kernel + Rust-for-Linux toolchain on a test VM
   pin-rust.sh          pin the exact rustc/bindgen the kernel requires
   build-kernel.sh      configure + build a kernel with CONFIG_RUST + the shim
   build-module.sh      build the out-of-tree krunc.ko
-  make-initramfs.sh    assemble busybox + krunc.ko + container rootfs
+  build-cli.sh         build the static krunc OCI CLI
+  make-initramfs.sh    assemble busybox + krunc.ko + krunc CLI + rootfs/bundle
   run-qemu.sh          boot the test kernel under QEMU/KVM
-  qemu-init.sh         the in-VM demo driver (host side of the demo)
-  run-test.sh          rebuild module + initramfs + run QEMU (fast inner loop)
+  qemu-init.sh         the in-VM demo driver (text + OCI lifecycle + unload)
+  run-test.sh          rebuild module + cli + initramfs + run QEMU (fast loop)
 docs/
   DESIGN.md            architecture and rationale
-  sample-run.txt       captured end-to-end demo output
+  sample-run.txt       captured text-interface demo output
+  sample-oci-run.txt   captured OCI runtime-CLI lifecycle output
 ```
 
 ## Build & run
@@ -144,18 +178,24 @@ Verified on: Linux 6.18, rustc 1.78.0, bindgen 0.65.1, clang/LLVM 18, x86-64.
 This is a **proof of concept** with a deliberately hardened (narrow) boundary;
 it is not production software. Notable simplifications and known limitations:
 
-- **Boundary.** One fixed text command format; a small, fixed default
-  environment; argv is bounded (≤ 8 entries, ≤ 255 bytes each). No OCI spec, no
-  cgroups/seccomp/capabilities/user-namespace mapping yet.
-- **Privilege.** `run`/`kill` require the writer to be privileged (namespace
-  creation needs `CAP_SYS_ADMIN`); there is no per-caller authorization beyond
-  the device's file permissions.
+- **Boundary.** Fixed text + ioctl command formats; argv/env are bounded.
+  A subset of the OCI `config.json` is honored (args, env, root, hostname,
+  namespaces); cgroups, mounts, capabilities, seccomp, devices, hooks and
+  user-namespace mapping are not yet.
+- **containerd.** krunc implements the runc/OCI CLI, so the runc shim can
+  create/start/stop a container, but full containerd integration is limited by
+  the shim's coupling to runc's process model (exit notification, cgroups,
+  stats) — a native shim is the clean path. See `docs/DESIGN.md` §7.
+- **Privilege.** `run`/`create`/`kill` require the caller to be privileged
+  (namespace creation needs `CAP_SYS_ADMIN`); there is no per-caller
+  authorization beyond the device's file permissions.
 - **Lifecycle.** The container registry detects liveness lazily (signal-0
-  probe) but does not reap; exited containers linger in the table until the
-  module is unloaded.
-- **Two non-exported primitives** (`user_mode_thread`, `kernel_execve`) and three
-  thin helpers are exported to modules by `kernel-patch/krunc_exports.c`. All
-  policy/logic lives in Rust; the shim only exposes generic primitives.
+  probe) but does not reap; exited containers linger in the table until
+  `delete`/unload.
+- **vmlinux shim.** `kernel-patch/krunc_exports.c` exports `krunc_spawn`
+  (clone without `CLONE_VM`), re-exports `user_mode_thread`/`kernel_execve`, and
+  adds thin `krunc_{set_hostname,chroot,kill}` helpers. All policy/logic lives in
+  Rust; the shim only exposes generic primitives.
 
 See [`docs/DESIGN.md`](docs/DESIGN.md) for the reasoning behind each choice and a
 list of natural next steps (cgroups, pivot_root + mount setup, capability

@@ -1,0 +1,53 @@
+=================================================================
+ Captured serial console of the krunc OCI runtime-CLI lifecycle
+ (DEMO 3), driven by the runc-compatible 'krunc' binary.
+ Reproduce with: scripts/run-test.sh
+=================================================================
+=========== DEMO 3: OCI runtime CLI (containerd-compatible) ===========
+[vm] krunc --version:
+[vm]   runc version 1.1.0-krunc
+[vm]   commit: krunc-poc
+[vm]   spec: 1.0.2-dev
+[vm]   go: go1.22.2
+[vm] krunc create oci1 --bundle /bundle   (sets up + blocks before exec)
+created oci1 (pid 128, krunc id 3)
+[vm] krunc state oci1   (expect: created)
+[vm]     "id": "oci1",
+[vm]     "status": "created",
+[vm]     "pid": 128,
+[vm] krunc start oci1   (releases the paused init -> execs the entrypoint)
+[    7.179702] krunc: started container id=3 pid=128
+==================================================================
+[container] Hello from inside a krunc container!
+[container] hostname (UTS namespace) : oci-demo
+[container] my pid   (PID namespace) : 1        <- should be 1
+[container] mounted private /proc
+[container] processes I can see (PID namespace):
+PID   COMMAND
+    1 sh
+    6 ps
+[container] filesystem root (mount ns + chroot):
+bin
+dev
+init.sh
+proc
+sys
+tmp
+[container] network interfaces (NET namespace):
+           lo:
+           sit0@NONE:
+[container] writing a file to prove we have our own rootfs...
+[container] krunc was here
+[container] sleeping briefly so the host can inspect our namespaces...
+[vm] krunc state oci1   (expect: running)
+[vm]     "status": "running",
+[vm]     "pid": 128,
+[container] goodbye (PID 1 exiting -> namespaces tear down)
+==================================================================
+[vm] krunc state oci1   (after the entrypoint exits, expect: stopped)
+[vm]     "status": "stopped",
+[vm] krunc list:
+[vm]   ID                   STATUS     PID      BUNDLE
+[vm]   oci1                 stopped    128      /bundle
+[vm] krunc delete oci1
+[   10.309475] krunc: deleted container id=3
