@@ -97,6 +97,8 @@ const SIGKILL: c_int = 9;
 const MS_RDONLY: c_ulong = 1;
 const MS_REMOUNT: c_ulong = 32;
 const MS_BIND: c_ulong = 4096;
+const MS_REC: c_ulong = 16384;
+const MS_PRIVATE: c_ulong = 1 << 18;
 
 const ALL_NS: c_ulong =
     CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWNET;
@@ -853,6 +855,21 @@ unsafe extern "C" fn container_entry(arg: *mut c_void) -> c_int {
                 _ => break,
             }
         }
+    }
+
+    // Make the container's whole mount tree private *before* we mount anything,
+    // so none of the mounts we create (/proc, /sys, masks, read-only binds)
+    // propagate back to the host's mount namespace, and host mount events do not
+    // leak in. This is runc's first setup step; it operates only on this task's
+    // CLONE_NEWNS namespace.
+    // SAFETY: FFI call with a NUL-terminated path; dev/fstype are unused here.
+    unsafe {
+        krunc_mount(
+            ptr::null(),
+            c"/".as_ptr() as *const c_char,
+            ptr::null(),
+            MS_REC | MS_PRIVATE,
+        );
     }
 
     // Mount a private /proc (and best-effort /sys) for the container, while
