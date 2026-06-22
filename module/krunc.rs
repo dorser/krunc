@@ -26,7 +26,7 @@ use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use kernel::{
     c_str,
     error::Error,
-    ffi::{c_char, c_int, c_uint, c_ulong, c_void},
+    ffi::{c_char, c_int, c_long, c_uint, c_ulong, c_void},
     fs::{File, Kiocb},
     ioctl::_IOC_NR,
     iov::{IovIterDest, IovIterSource},
@@ -65,6 +65,10 @@ extern "C" {
     fn krunc_set_hostname(name: *const c_char, len: usize) -> c_int;
     fn krunc_chroot(path: *const c_char) -> c_int;
     fn krunc_kill(nr: c_int, sig: c_int) -> c_int;
+    /// Terminate the current task in kernel context. Used on every
+    /// `container_entry` path that does NOT successfully `kernel_execve`, so the
+    /// task never "returns to userspace" without a valid user context.
+    fn krunc_exit(code: c_long) -> !;
     /// Apply privilege confinement to the current task before exec. When
     /// `caps_present` is non-zero the five capability sets are applied exactly
     /// (an all-empty set drops every capability); when zero the capability state
@@ -1089,18 +1093,30 @@ unsafe extern "C" fn container_entry(arg: *mut c_void) -> c_int {
     let cr = unsafe { krunc_chroot(ctx.rootfs.as_ptr() as *const c_char) };
     if cr != 0 {
         pr_err!("chroot into container rootfs failed: {}\n", cr);
-        return cr; // ctx dropped here -> freed
+        drop(ctx); // free before exiting (see krunc_exit)
+        // SAFETY: this task never reached exec; exit cleanly instead of returning.
+        unsafe { krunc_exit(cr as c_long) };
     }
 
     // Two-phase: a created container blocks here until start (or delete).
+    let mut doomed = false;
     if let Some(ctrl) = ctx.ctrl.as_ref() {
         loop {
             match ctrl.action.load(Ordering::Acquire) {
                 ACT_WAIT => unsafe { msleep(10) },
-                ACT_DOOM => return 0, // torn down before start; ctx dropped -> freed
+                ACT_DOOM => {
+                    doomed = true; // torn down before start
+                    break;
+                }
                 _ => break,
             }
         }
+    }
+    if doomed {
+        drop(ctx); // free before exiting
+        // SAFETY: never reached exec; exit cleanly instead of returning to a
+        // non-existent userspace context (which would fault at IP 0).
+        unsafe { krunc_exit(0) };
     }
 
     // Make the container's whole mount tree private *before* we mount anything,
@@ -1164,7 +1180,10 @@ unsafe extern "C" fn container_entry(arg: *mut c_void) -> c_int {
         let rc = unsafe { krunc_seccomp_install(ctx.seccomp.as_ptr() as *const c_void, count) };
         if rc != 0 {
             pr_err!("krunc: seccomp install failed: {}\n", rc);
-            return rc; // ctx dropped -> freed; container does not start unconfined
+            drop(ctx); // free before exiting
+            // SAFETY: never reached exec; exit cleanly (container does not start
+            // unconfined) rather than return to a non-existent userspace context.
+            unsafe { krunc_exit(rc as c_long) };
         }
     }
 
@@ -1195,12 +1214,15 @@ unsafe extern "C" fn container_entry(arg: *mut c_void) -> c_int {
     let lrc = apply_landlock(&ctx.landlock_rw);
     if lrc != 0 && lrc != -38 {
         pr_err!("krunc: landlock seal failed: {}\n", lrc);
-        return lrc; // ctx dropped -> freed; do not start a container missing its seal
+        drop(ctx); // free before exiting
+        // SAFETY: never reached exec; exit cleanly (do not start a container
+        // missing its seal) rather than return to a non-existent user context.
+        unsafe { krunc_exit(lrc as c_long) };
     }
 
     // Build argv/envp pointer arrays (into ctx's buffers, which stay valid for
-    // the execve call). On a successful exec this function never returns, so
-    // `ctx` is leaked (small, documented); any failure path drops it.
+    // the execve call). On a successful exec this function returns normally so
+    // the task enters the new program; every failure path exits via krunc_exit.
     let mut argv_ptr = [ptr::null::<c_char>(); MAX_ARGS + 1];
     let n = core::cmp::min(ctx.argv.len(), MAX_ARGS);
     for i in 0..n {
@@ -1209,7 +1231,9 @@ unsafe extern "C" fn container_entry(arg: *mut c_void) -> c_int {
     argv_ptr[n] = ptr::null();
     if argv_ptr[0].is_null() {
         pr_err!("container has no exec path\n");
-        return -22; // -EINVAL
+        drop(ctx); // free before exiting
+        // SAFETY: never reached exec; exit cleanly instead of returning.
+        unsafe { krunc_exit(-22) }; // -EINVAL
     }
 
     let default_env: [*const c_char; 5] = [
@@ -1233,10 +1257,15 @@ unsafe extern "C" fn container_entry(arg: *mut c_void) -> c_int {
 
     // SAFETY: argv/envp are NUL-terminated arrays of NUL-terminated strings,
     // valid for the duration of the call. On success the kernel rewrites this
-    // task's registers to enter the new program and returns 0.
+    // task's registers to enter the new program and returns 0 here, so we must
+    // RETURN (below) for the task to enter userspace. On failure there is no
+    // user context to return to, so we exit cleanly instead.
     let rc = unsafe { kernel_execve(argv_ptr[0], argv_ptr.as_ptr(), envp) };
     if rc != 0 {
         pr_err!("execve failed: {}\n", rc);
+        drop(ctx); // free before exiting
+        // SAFETY: exec did not happen; exit cleanly rather than fault at IP 0.
+        unsafe { krunc_exit(rc as c_long) };
     }
     rc
 }

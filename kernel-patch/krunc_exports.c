@@ -51,6 +51,7 @@
 int krunc_set_hostname(const char *name, size_t len);
 int krunc_chroot(const char *path);
 int krunc_kill(pid_t nr, int sig);
+void __noreturn krunc_exit(long code);
 int krunc_apply_creds(u64 bset, u64 eff, u64 perm, u64 inh, u64 amb,
 		      u32 uid, u32 gid, int no_new_privs, int caps_present);
 int krunc_apply_rlimit(unsigned int resource, u64 soft, u64 hard);
@@ -154,6 +155,21 @@ int krunc_kill(pid_t nr, int sig)
 	return ret;
 }
 EXPORT_SYMBOL_GPL(krunc_kill);
+
+/*
+ * Terminate the *current* task in kernel context. A krunc container init is a
+ * krunc_spawn()'d task that is meant to kernel_execve() into userspace; if its
+ * entry function instead *returns* (a setup error, or a teardown before start),
+ * the task would "return to userspace" with no valid user context and fault at
+ * IP 0. Calling do_exit() makes such a task exit cleanly. Never use this on the
+ * success path: there kernel_execve() has set up the user registers and the
+ * entry function must return so the task enters the new program.
+ */
+void __noreturn krunc_exit(long code)
+{
+	do_exit(code);
+}
+EXPORT_SYMBOL_GPL(krunc_exit);
 
 /*
  * Apply the container's privilege confinement to the *current* task, atomically
