@@ -65,9 +65,10 @@ extern "C" {
     fn krunc_set_hostname(name: *const c_char, len: usize) -> c_int;
     fn krunc_chroot(path: *const c_char) -> c_int;
     fn krunc_kill(nr: c_int, sig: c_int) -> c_int;
-    /// Apply privilege confinement to the current task before exec: lower the
-    /// capability sets to `cap_mask` (0 = leave untouched) and optionally set
-    /// no_new_privs.
+    /// Apply privilege confinement to the current task before exec. When
+    /// `caps_present` is non-zero the five capability sets are applied exactly
+    /// (an all-empty set drops every capability); when zero the capability state
+    /// is left untouched. Optionally sets no_new_privs.
     fn krunc_apply_creds(
         bset: u64,
         eff: u64,
@@ -77,6 +78,7 @@ extern "C" {
         uid: c_uint,
         gid: c_uint,
         no_new_privs: c_int,
+        caps_present: c_int,
     ) -> c_int;
     /// Mount `fstype` from `dev` onto `dir` in the current task's mount
     /// namespace (e.g. a fresh /proc for the container).
@@ -618,6 +620,7 @@ struct DecodedSpec {
     argv: KVec<KVec<u8>>,
     envp: KVec<KVec<u8>>,
     ns: u32,
+    cap_present: bool,
     cap_bounding: u64,
     cap_effective: u64,
     cap_permitted: u64,
@@ -636,8 +639,11 @@ struct DecodedSpec {
 }
 
 /// The five Linux capability sets applied to the container before exec.
+/// `present` distinguishes "apply these exactly" (including all-empty = drop
+/// everything) from "leave the task's caps untouched".
 #[derive(Clone, Copy, Default)]
 struct CapSets {
+    present: bool,
     bounding: u64,
     effective: u64,
     permitted: u64,
@@ -740,6 +746,7 @@ fn decode_spec(buf: &[u8]) -> Result<DecodedSpec> {
         argv: KVec::new(),
         envp: KVec::new(),
         ns: 0,
+        cap_present: false,
         cap_bounding: 0,
         cap_effective: 0,
         cap_permitted: 0,
@@ -772,7 +779,10 @@ fn decode_spec(buf: &[u8]) -> Result<DecodedSpec> {
             4 => d.envp = read_strvec_k(&mut sr)?, // ENV
             5 => d.ns = sr.u32()?,                 // NAMESPACES
             8 => d.flags = sr.u64()?,              // FLAGS
-            9 => d.cap_bounding = sr.u64()?,       // CAP_BOUNDING
+            9 => {
+                d.cap_present = true;
+                d.cap_bounding = sr.u64()?;
+            } // CAP_BOUNDING
             15 => {
                 // CAP_SETS: effective, permitted, inheritable, ambient.
                 d.cap_effective = sr.u64()?;
@@ -827,6 +837,7 @@ fn create_from_blob(spec: &[u8]) -> Result<(u64, i32)> {
     let ns = if d.ns != 0 { d.ns as c_ulong } else { ALL_NS };
     let no_new_privs = d.flags & OPT_NO_NEW_PRIVS != 0;
     let cap_sets = CapSets {
+        present: d.cap_present,
         bounding: d.cap_bounding,
         effective: d.cap_effective,
         permitted: d.cap_permitted,
@@ -1140,6 +1151,7 @@ unsafe extern "C" fn container_entry(arg: *mut c_void) -> c_int {
             ctx.uid as c_uint,
             ctx.gid as c_uint,
             if ctx.no_new_privs { 1 } else { 0 },
+            if ctx.cap_sets.present { 1 } else { 0 },
         )
     };
 

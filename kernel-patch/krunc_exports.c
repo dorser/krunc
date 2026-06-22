@@ -48,7 +48,7 @@ int krunc_set_hostname(const char *name, size_t len);
 int krunc_chroot(const char *path);
 int krunc_kill(pid_t nr, int sig);
 int krunc_apply_creds(u64 bset, u64 eff, u64 perm, u64 inh, u64 amb,
-		      u32 uid, u32 gid, int no_new_privs);
+		      u32 uid, u32 gid, int no_new_privs, int caps_present);
 int krunc_apply_rlimit(unsigned int resource, u64 soft, u64 hard);
 void krunc_set_oom_score_adj(int adj);
 int krunc_mount(const char *dev, const char *dir, const char *fstype,
@@ -166,7 +166,7 @@ EXPORT_SYMBOL_GPL(krunc_kill);
  * intermediate userspace process in which the capability state could leak.
  */
 int krunc_apply_creds(u64 bset, u64 eff, u64 perm, u64 inh, u64 amb,
-		      u32 uid, u32 gid, int no_new_privs)
+		      u32 uid, u32 gid, int no_new_privs, int caps_present)
 {
 	struct cred *new;
 	const u64 valid = (1ULL << (CAP_LAST_CAP + 1)) - 1;
@@ -176,8 +176,10 @@ int krunc_apply_creds(u64 bset, u64 eff, u64 perm, u64 inh, u64 amb,
 	if (no_new_privs)
 		task_set_no_new_privs(current);
 
-	/* bset == 0 means "unspecified": leave the capability sets untouched. */
-	if (bset == 0)
+	/* Only touch the capability state when the caller explicitly manages it.
+	 * Note this is independent of @bset's value: an all-empty set is a valid,
+	 * fully-confined request ("drop every capability"), not "unspecified". */
+	if (!caps_present)
 		return 0;
 
 	new = prepare_creds();

@@ -580,6 +580,10 @@ pub fn config_to_spec(bundle: &Path, cfg: &OciConfig) -> Result<DomainSpec, OciE
         flags |= OPT_ROOTFS_RO;
     }
 
+    // A present `capabilities` object means the caller is managing caps and the
+    // five sets must be applied exactly — even if all empty (drop everything).
+    // Absent, krunc leaves the task's caps as they are.
+    let caps_present = process.capabilities.is_some();
     let (cap_bounding, cap_effective, cap_permitted, cap_inheritable, cap_ambient) =
         match &process.capabilities {
             Some(c) => (
@@ -648,6 +652,7 @@ pub fn config_to_spec(bundle: &Path, cfg: &OciConfig) -> Result<DomainSpec, OciE
         uid_maps,
         gid_maps,
         flags,
+        caps_present,
         cap_bounding,
         cap_effective,
         cap_permitted,
@@ -728,6 +733,7 @@ mod tests {
             vec![IdMap { container_id: 0, host_id: 100000, size: 65536 }]
         );
         let expect_caps = (1u64 << 10) | (1u64 << 5) | (1u64 << 29);
+        assert!(spec.caps_present);
         assert_eq!(spec.cap_bounding, expect_caps);
         // effective is specified separately (just CAP_KILL); permitted/inheritable/
         // ambient are unset, so they must be empty -- not silently equal to bounding.
@@ -803,6 +809,31 @@ mod tests {
             config_to_spec(Path::new("/b"), &cfg),
             Err(OciError::Missing("root"))
         ));
+    }
+
+    #[test]
+    fn empty_capabilities_drops_all() {
+        // An explicit (but empty) capabilities object means "drop everything":
+        // caps must be marked present so the kernel applies the all-empty set
+        // rather than treating it as "leave caps untouched".
+        let cfg = parse_config(
+            r#"{"process":{"args":["/x"],"capabilities":{"bounding":[],"effective":[],"permitted":[],"inheritable":[],"ambient":[]}},"root":{"path":"r"}}"#,
+        )
+        .unwrap();
+        let spec = config_to_spec(Path::new("/b"), &cfg).unwrap();
+        assert!(spec.caps_present);
+        assert_eq!(spec.cap_bounding, 0);
+        assert_eq!(spec.cap_effective, 0);
+    }
+
+    #[test]
+    fn no_capabilities_leaves_caps_untouched() {
+        // No capabilities object at all -> caps_present false (the kernel leaves
+        // the task's capability state as-is).
+        let cfg =
+            parse_config(r#"{"process":{"args":["/x"]},"root":{"path":"r"}}"#).unwrap();
+        let spec = config_to_spec(Path::new("/b"), &cfg).unwrap();
+        assert!(!spec.caps_present);
     }
 
     #[test]

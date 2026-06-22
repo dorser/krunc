@@ -159,9 +159,14 @@ pub struct DomainSpec {
     pub gid_maps: Vec<IdMap>,
     /// Boolean options (`OPT_*`).
     pub flags: u64,
-    /// Capability bounding set kept (a Linux capability bitmask). Acts as the
-    /// "apply capabilities" switch: when non-zero, all five sets below are
-    /// applied exactly; when zero, the capability state is left untouched.
+    /// Whether the capability sets below were explicitly specified and must be
+    /// applied. When `true`, all five sets are applied *exactly* (an all-empty
+    /// set therefore drops every capability — the correct, fully-confined
+    /// result); when `false`, the task's capability state is left untouched
+    /// (used by callers, like the raw text interface, that do not manage caps).
+    pub caps_present: bool,
+    /// Capability bounding set kept (a Linux capability bitmask). The bounding
+    /// set is the irreversible ceiling; the other four sets are applied as-is.
     pub cap_bounding: u64,
     /// Effective capability set (active capabilities).
     pub cap_effective: u64,
@@ -408,7 +413,7 @@ impl DomainSpec {
         if self.flags != 0 {
             emit(tag::FLAGS, &mut |w| w.u64(self.flags));
         }
-        if self.cap_bounding != 0 {
+        if self.caps_present {
             emit(tag::CAP_BOUNDING, &mut |w| w.u64(self.cap_bounding));
             emit(tag::CAP_SETS, &mut |w| {
                 w.u64(self.cap_effective);
@@ -610,7 +615,10 @@ pub fn decode(buf: &[u8]) -> Result<(Op, DomainSpec), AbiError> {
             tag::UID_MAPS => spec.uid_maps = read_maps(&mut sr, "uid_maps")?,
             tag::GID_MAPS => spec.gid_maps = read_maps(&mut sr, "gid_maps")?,
             tag::FLAGS => spec.flags = sr.u64()?,
-            tag::CAP_BOUNDING => spec.cap_bounding = sr.u64()?,
+            tag::CAP_BOUNDING => {
+                spec.caps_present = true;
+                spec.cap_bounding = sr.u64()?;
+            }
             tag::CAP_SETS => {
                 spec.cap_effective = sr.u64()?;
                 spec.cap_permitted = sr.u64()?;
@@ -682,6 +690,7 @@ mod tests {
             uid_maps: vec![IdMap { container_id: 0, host_id: 100000, size: 65536 }],
             gid_maps: vec![IdMap { container_id: 0, host_id: 100000, size: 65536 }],
             flags: OPT_NO_NEW_PRIVS | OPT_ROOTFS_RO,
+            caps_present: true,
             cap_bounding: 0x0000_0000_a80c_25fb,
             cap_effective: 0x0000_0000_0000_0001,
             cap_permitted: 0x0000_0000_a80c_25fb,
