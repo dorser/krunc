@@ -88,6 +88,9 @@ extern "C" {
         fstype: *const c_char,
         flags: c_ulong,
     ) -> c_int;
+    /// Create directory `path` (one level) in the current task's mount namespace
+    /// so a nested mountpoint can be materialized inside a just-mounted parent.
+    fn krunc_mkdir(path: *const c_char, mode: u16) -> c_int;
     /// Install a kernel-resident classic-BPF seccomp program (`len` instructions)
     /// on the current task. Must be called after no_new_privs is set.
     fn krunc_seccomp_install(insns: *const c_void, len: c_uint) -> c_int;
@@ -1034,6 +1037,14 @@ fn apply_mounts(mounts: &KVec<MountSpec>) {
         } else {
             ptr::null()
         };
+        // For a real filesystem mount (not a bind, which may target a file),
+        // ensure the destination directory exists — it may be nested inside a
+        // parent we just mounted (e.g. /dev/pts in the fresh /dev tmpfs), where
+        // the rootfs's original directory is now hidden. -EEXIST is fine.
+        if !typ.is_null() {
+            // SAFETY: `dest` is a NUL-terminated C string valid for the call.
+            unsafe { krunc_mkdir(dest, 0o755) };
+        }
         // SAFETY: dest/src/typ are NUL-terminated C strings valid for the call.
         let rc = unsafe { krunc_mount(src, dest, typ, m.flags) };
         if rc != 0 {

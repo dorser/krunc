@@ -42,6 +42,10 @@
 #include <linux/resource.h>
 #include <linux/oom.h>
 #include <linux/sched/user.h>
+#include <linux/fs.h>
+#include <linux/dcache.h>
+#include <linux/mount.h>
+#include <linux/fcntl.h>
 
 /* Prototypes (the kernel builds with -Wmissing-prototypes -Werror). */
 int krunc_set_hostname(const char *name, size_t len);
@@ -53,6 +57,7 @@ int krunc_apply_rlimit(unsigned int resource, u64 soft, u64 hard);
 void krunc_set_oom_score_adj(int adj);
 int krunc_mount(const char *dev, const char *dir, const char *fstype,
 		unsigned long flags);
+int krunc_mkdir(const char *path, umode_t mode);
 pid_t krunc_spawn(int (*fn)(void *), void *arg, unsigned long flags);
 
 /* path_mount() is non-static (fs/internal.h) but not in a public header; declare
@@ -300,3 +305,29 @@ int krunc_mount(const char *dev, const char *dir, const char *fstype,
 	return err;
 }
 EXPORT_SYMBOL_GPL(krunc_mount);
+
+/* init_mkdir() (fs/init.c) is __init code (freed after boot) — unusable at
+ * container-creation time. We reimplement a kernel-context mkdir here. */
+
+/*
+ * Create directory @path (one level; the parent must already exist) in the
+ * *current* task's mount namespace, relative to its (chrooted) root. Used by the
+ * container init to materialize a nested mountpoint inside a just-mounted parent
+ * — e.g. /dev/pts or /dev/shm inside the fresh /dev tmpfs — the way runc does,
+ * so a stock containerd/Docker mount set applies cleanly. -EEXIST is benign.
+ */
+int krunc_mkdir(const char *path, umode_t mode)
+{
+	struct dentry *dentry, *res;
+	struct path parent;
+	int err;
+
+	dentry = start_creating_path(AT_FDCWD, path, &parent, LOOKUP_DIRECTORY);
+	if (IS_ERR(dentry))
+		return PTR_ERR(dentry);
+	res = vfs_mkdir(mnt_idmap(parent.mnt), d_inode(parent.dentry), dentry, mode);
+	err = IS_ERR(res) ? PTR_ERR(res) : 0;
+	end_creating_path(&parent, dentry);
+	return err;
+}
+EXPORT_SYMBOL_GPL(krunc_mkdir);
