@@ -47,24 +47,26 @@ fi
 
 cat <<'EOF'
 
-============== krunc + containerd (real docker-style) ==============
-containerd is driving krunc as its OCI runtime. Run a container the
-docker way (nerdctl is the docker-compatible CLI) and watch the
-kernel domain enforce it:
+============== krunc + containerd (runc-CLI compatible) ==============
+containerd's io.containerd.runc.v2 shim can drive krunc (krunc is the
+runc binary). NOTE: krunc is a STRICT OCI runtime — it rejects any
+config carrying a property it cannot faithfully apply (per runtime-spec
+create). containerd's/nerdctl's DEFAULT configs include a device cgroup,
+sysctls and argument-matched seccomp, so these are REJECTED by design
+(krunc refuses rather than silently weakening the container):
 
   nerdctl run --rm --runtime /bin/krunc --net none \
-      docker.io/library/busybox:latest echo hello-from-krunc
-  nerdctl run --rm --runtime /bin/krunc --net none \
-      docker.io/library/busybox:latest cat /proc/self/status   # caps
-  nerdctl images ;  nerdctl ps -a
-
-containerd's own CLI works too:
+      docker.io/library/busybox:latest echo hi      # -> rejected (exit 1)
   ctr run --rm --runc-binary /bin/krunc \
-      docker.io/library/busybox:latest demo echo hi
+      docker.io/library/busybox:latest demo echo hi  # -> rejected (exit 1)
+
+To run under containerd the runtime config must be reduced to krunc's
+supported subset (or those properties implemented spec-faithfully). For
+a working demo, use `krunc run` / a hand-written OCI bundle instead.
 
 Inspect: dmesg | grep krunc   ;   cat /var/log/containerd.log
 Quit:    poweroff -f
-===================================================================
+=====================================================================
 EOF
 
 while true; do
