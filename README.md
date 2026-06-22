@@ -154,7 +154,7 @@ kernel-patch/
 userspace/             all-Rust userspace (Cargo workspace)
   krunc-abi/           versioned, bounds-checked binary spec (no_std-friendly, no unsafe)
   krunc-oci/           OCI config.json -> DomainSpec translation (serde)
-  krunc-cli/           the runc-compatible `krunc` CLI (create/start/state/kill/delete)
+  krunc-cli/           the runc-compatible `krunc` CLI (run/create/start/state/kill/delete)
 examples/
   rootfs-skel/init.sh  example container entrypoint (the "app")
   bundle/config.json   example OCI bundle (with caps bounding + noNewPrivileges)
@@ -167,6 +167,11 @@ scripts/
   make-initramfs.sh    assemble busybox + krunc.ko + krunc CLI + rootfs/bundle
   run-qemu.sh          boot the test kernel under QEMU/KVM
   qemu-init.sh         the in-VM demo driver (text + OCI lifecycle + confinement + unload)
+  run-interactive.sh   boot to a shell to drive krunc by hand (incl. `krunc run`)
+  qemu-shell-init.sh   interactive in-VM init (loads krunc.ko, prints a cheatsheet)
+  setup-containerd-image.sh  stage containerd + nerdctl + a busybox image
+  run-containerd.sh    boot a guest where real containerd/nerdctl drive krunc
+  qemu-containerd-init.sh    in-VM init that starts containerd with krunc as runtime
   run-test.sh          rebuild module + cli + initramfs + run QEMU (fast loop)
 docs/
   ARCHITECTURE.md      the krunc_domain object design (v2 target)
@@ -197,6 +202,26 @@ enables Rust and the namespaces, and compiles `kernel-patch/krunc_exports.c`
 into vmlinux. Once the kernel is built once, `scripts/run-test.sh` is the fast
 iteration loop.
 
+### Run containers by hand (docker-style)
+
+Three ways to drive it, from highest-level to lowest:
+
+```sh
+# 1) Real docker-style: containerd + nerdctl drive krunc as their OCI runtime.
+scripts/setup-containerd-image.sh   # once: stage containerd/nerdctl + a busybox image
+scripts/run-containerd.sh           # boots QEMU; inside the guest:
+#   nerdctl run --rm --runtime /bin/krunc --net none busybox echo hello
+#   ctr run --rm --runc-binary /bin/krunc docker.io/library/busybox:latest d echo hi
+
+# 2) krunc's own docker-style one-shot CLI (no daemon):
+scripts/run-interactive.sh          # boots QEMU to a shell; inside:
+#   krunc run busybox -- echo hello
+#   krunc run busybox -- cat /proc/self/status   # caps dropped
+
+# 3) The runc/OCI lifecycle directly:
+#   krunc create demo --bundle /bundle && krunc start demo && krunc delete demo
+```
+
 Verified on: Linux 6.18, rustc 1.78.0, bindgen 0.65.1, clang/LLVM 18, x86-64.
 
 ## Status, hardening & limitations
@@ -205,14 +230,17 @@ This is a **proof of concept** with a deliberately hardened (narrow) boundary;
 it is not production software. Notable simplifications and known limitations:
 
 - **Boundary.** Fixed text + ioctl command formats; argv/env are bounded.
-  A subset of the OCI `config.json` is honored (args, env, root, hostname,
-  namespaces); cgroups, mounts, capabilities, seccomp, devices, hooks and
-  user-namespace mapping are not yet.
-- **containerd.** krunc implements the runc/OCI CLI, and `go-runc` (the library
-  the containerd runc shim uses) drives it through the full lifecycle (verified,
-  see `conformance/`). Standing up the full containerd daemon additionally needs
-  cgroup placement, task-exit wiring and tty console support — or, more cleanly,
-  a native `containerd-shim-krunc-v2`. See `docs/DESIGN.md` §7.
+  A large subset of the OCI `config.json` is honored (args, env, root, hostname,
+  namespaces, capabilities, seccomp, cgroups pids/memory/cpu, mounts, masked/
+  read-only paths, rlimits, oom score, user, Landlock-sealed read-only rootfs);
+  devices, hooks and user-namespace mapping are not yet.
+- **containerd / nerdctl (working).** Real containerd v2.3 drives krunc through
+  the standard `io.containerd.runc.v2` shim with krunc as the runc binary, so the
+  docker-compatible `nerdctl run --runtime /bin/krunc … busybox echo …` and
+  `ctr run --runc-binary /bin/krunc …` both run a container, stream its stdout
+  back and propagate the exit code (`scripts/run-containerd.sh`). tty/`-t`
+  (console-socket) and CNI networking (`--net none` is used) are not yet wired;
+  a native `containerd-shim-krunc-v2` remains optional future work.
 - **Privilege.** `run`/`create`/`kill` require the caller to be privileged
   (namespace creation needs `CAP_SYS_ADMIN`); there is no per-caller
   authorization beyond the device's file permissions.

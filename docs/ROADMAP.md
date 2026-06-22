@@ -52,9 +52,9 @@ Each is independently verifiable and committed.
   path; document the in-tree LSM (Landlock-extended) as the mainline form.
 - **M9 — OCI conformance.** Run `opencontainers/runtime-tools` validation against
   the Rust CLI; green for supported features; precisely report the unsupported.
-- **M10 — containerd e2e.** Real containerd + offline busybox OCI image + krunc
-  runtime; `ctr run`. Document results (incl. exit-notification via the shim
-  subreaper). Optionally a native Rust `containerd-shim-krunc-v2`.
+- **M10 (done — see below) — containerd e2e.** Real containerd + offline busybox
+  OCI image + krunc runtime; `ctr run` and `nerdctl run`. A native Rust
+  `containerd-shim-krunc-v2` remains optional future work.
 - **M11 — Hardening + docs.** Fuzz the ABI validator; stress/soak; finalize
   SECURITY/ARCHITECTURE and the mainline-graduation (in-tree LSM) write-up.
 
@@ -148,6 +148,23 @@ not in one shot.
   `krunc_domain` vision), and it achieves the immutability that a chroot-based
   `root.readonly` cannot. Host-verified in QEMU: the container's `touch /` is
   **denied**, `touch /tmp` is **allowed**.
+- **M10 (done) — real containerd / nerdctl e2e.** containerd v2.3 drives krunc
+  as its OCI runtime through the standard `io.containerd.runc.v2` shim (krunc is
+  the runc binary): `ctr run --runc-binary /bin/krunc …` and the
+  docker-compatible `nerdctl run --runtime /bin/krunc …busybox echo …` both run a
+  container, stream its stdout back (the kernel-cloned init inherits the shim's
+  stdio fifos) and propagate the exit code. Two compatibility fixes made this
+  work on stock containerd-generated configs: the CLI now prepares the rootfs
+  like runc (creates mount destinations, PATH-resolves `argv[0]`), and the kernel
+  installs the seccomp filter while still privileged so the default
+  containerd/Docker profile (no `noNewPrivileges`, arg matchers) loads. The
+  bounding set inside the container is exactly nerdctl's default
+  (`0x…a80425fb`) — krunc enforces the policy containerd supplies. Reproduce with
+  `scripts/setup-containerd-image.sh` + `scripts/run-containerd.sh`.
+- **krunc run (done) — docker-style one-shot.** `krunc run [--image <name>|<name>]
+  -- <cmd>` synthesizes a hardened bundle around an extracted rootfs and runs the
+  command create+start+wait+delete, streaming output and propagating the exit
+  code (host-verified: `krunc run busybox -- echo`, `CapEff/CapBnd 0`).
 - **Next:** M3 remainder (`pivot_root`, sysctls); M7 user-ns id mapping; M8 lifetime
-  enforcement (BPF-LSM kill-on-escape); M9 conformance; M10 containerd; and the full
-  `Domain` typestate object + domainfd.
+  enforcement (BPF-LSM kill-on-escape); M9 conformance; a native Rust
+  `containerd-shim-krunc-v2`; and the full `Domain` typestate object + domainfd.
