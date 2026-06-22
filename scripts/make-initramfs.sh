@@ -85,6 +85,14 @@ if [ -d "$IMAGES" ]; then
 	echo "==> bundled images: $(ls "$ROOT/images" | tr '\n' ' ')"
 fi
 
+# Optional: extra files overlaid onto the initramfs root (e.g. containerd +
+# nerdctl binaries and a runtime config for the real higher-level-runtime image).
+EXTRA_DIR="${EXTRA_DIR:-}"
+if [ -n "$EXTRA_DIR" ] && [ -d "$EXTRA_DIR" ]; then
+	sudo cp -a "$EXTRA_DIR"/. "$ROOT"/
+	echo "==> overlaid extra files from $EXTRA_DIR"
+fi
+
 # device nodes (need root)
 sudo mknod -m 600 "$ROOT/dev/console" c 5 1
 sudo mknod -m 666 "$ROOT/dev/null"    c 1 3
