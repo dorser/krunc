@@ -22,28 +22,31 @@ fi
 cat <<'EOF'
 
 ================== krunc interactive shell ==================
-Two ways to drive the runtime:
+Run containers like docker — one command, see the output:
 
-1) OCI / runc-compatible CLI (the interface containerd speaks):
+1) docker-run-style one-shot (build + run + wait, confined in-kernel):
+     krunc run busybox -- echo hello        # prints: hello
+     krunc run busybox -- uname -a
+     krunc run busybox -- id                # uid=0(root), but...
+     krunc run busybox -- cat /proc/self/status | grep Cap   # all caps dropped
+     krunc run busybox -- sh                # interactive shell in a container
+   (images live in /images; --name <id> to name it; exit code is propagated.)
+
+2) OCI / runc-compatible CLI (the interface containerd speaks):
      krunc create demo --bundle /bundle    # set up + block before exec
-     krunc state  demo                      # JSON status (created)
      krunc start  demo                      # release -> exec the entrypoint
-     krunc list
-     krunc kill   demo KILL                 # send a signal
-     krunc delete demo
+     krunc state  demo ; krunc list ; krunc kill demo KILL ; krunc delete demo
    Policy lives in /bundle/config.json (caps, seccomp, Landlock, cgroups,
    user, mounts). Edit it (vi) and re-create to change confinement.
 
-2) Raw kernel text ABI (write a spec line to the control device):
-     echo 'run rootfs=/containers/demo host=myhost exec=/bin/sh arg=/init.sh' > /dev/krunc
+3) Raw kernel text ABI (write a spec line to the control device):
+     echo 'run rootfs=/containers/demo host=h exec=/bin/sh arg=/init.sh' > /dev/krunc
      cat /dev/krunc                         # list containers the kernel tracks
-     echo 'kill <pid>' > /dev/krunc         # stop one (pid from `cat /dev/krunc`)
 
 Peek at what the kernel enforced (after a container ran):
      ls -l /sys/fs/cgroup/krunc/            # cgroups krunc created
      dmesg | grep -i krunc                  # module log lines
 
-     rmmod krunc        # unload (run `exec 3>&-` style: close any fds first)
      poweroff -f        # quit QEMU
 ============================================================
 EOF

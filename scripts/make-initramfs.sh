@@ -75,6 +75,16 @@ if [ -x "$CPUHOG" ]; then
 	chmod +x "$ROOT/bundle/rootfs/bin/cpuhog"
 fi
 
+# Optional: prebuilt docker-style images for `krunc run --image <name> <cmd>`.
+# Each subdirectory of $IMAGES is an already-extracted rootfs (carrying its own
+# /dev nodes); `cp -a` preserves those nodes and the cpio below runs as root.
+IMAGES="${IMAGES:-$HOME/stage/images}"
+if [ -d "$IMAGES" ]; then
+	mkdir -p "$ROOT/images"
+	sudo cp -a "$IMAGES"/. "$ROOT/images"/
+	echo "==> bundled images: $(ls "$ROOT/images" | tr '\n' ' ')"
+fi
+
 # device nodes (need root)
 sudo mknod -m 600 "$ROOT/dev/console" c 5 1
 sudo mknod -m 666 "$ROOT/dev/null"    c 1 3
