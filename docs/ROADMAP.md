@@ -161,10 +161,19 @@ not in one shot.
   bounding set inside the container is exactly nerdctl's default
   (`0x…a80425fb`) — krunc enforces the policy containerd supplies. Reproduce with
   `scripts/setup-containerd-image.sh` + `scripts/run-containerd.sh`.
+- **mounts (done) — full containerd mount set.** The kernel now materializes
+  nested mountpoints (`krunc_mkdir` → `vfs_mkdir`) before each filesystem mount,
+  so a stock containerd/nerdctl `/dev/pts`, `/dev/shm`, `/dev/mqueue`,
+  `/sys/fs/cgroup`, … all mount inside the just-created `/dev` tmpfs (host-verified
+  under `nerdctl run`). Non-tty stdio works; **interactive `-t` (console-socket
+  PTY + controlling-terminal setup) is not yet wired** — use `--net none` and
+  non-tty for now.
 - **krunc run (done) — docker-style one-shot.** `krunc run [--image <name>|<name>]
   -- <cmd>` synthesizes a hardened bundle around an extracted rootfs and runs the
   command create+start+wait+delete, streaming output and propagating the exit
   code (host-verified: `krunc run busybox -- echo`, `CapEff/CapBnd 0`).
-- **Next:** M3 remainder (`pivot_root`, sysctls); M7 user-ns id mapping; M8 lifetime
-  enforcement (BPF-LSM kill-on-escape); M9 conformance; a native Rust
+- **Next:** interactive `-t` console-socket support (PTY handoff via `SCM_RIGHTS`
+  is prototyped; needs kernel-side `setsid`+`TIOCSCTTY`); M3 remainder
+  (`pivot_root`, sysctls); M7 user-ns id mapping; M8 lifetime enforcement
+  (BPF-LSM kill-on-escape); M9 conformance; a native Rust
   `containerd-shim-krunc-v2`; and the full `Domain` typestate object + domainfd.
