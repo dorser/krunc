@@ -587,6 +587,23 @@ pub fn config_to_spec(bundle: &Path, cfg: &OciConfig) -> Result<DomainSpec, OciE
     if process.terminal {
         return Err(OciError::UnsupportedProperty("process.terminal".into()));
     }
+    // krunc execs the entrypoint at the rootfs root; it does not chdir, so it
+    // cannot honor a non-root `process.cwd` (REQUIRED by the spec). Reject one
+    // rather than silently running the process in the wrong directory.
+    if let Some(cwd) = &process.cwd {
+        if !cwd.is_empty() && cwd != "/" {
+            return Err(OciError::UnsupportedProperty(
+                "process.cwd other than \"/\"".into(),
+            ));
+        }
+    }
+    // krunc applies process.user.uid/gid but does not set supplementary groups,
+    // so a non-empty additionalGids must be rejected rather than ignored.
+    if let Some(user) = &process.user {
+        if !user.additional_gids.is_empty() {
+            return Err(OciError::UnsupportedProperty("process.user.additionalGids".into()));
+        }
+    }
     let root = cfg.root.as_ref().ok_or(OciError::Missing("root"))?;
     if root.path.is_empty() {
         return Err(OciError::Missing("root.path"));
@@ -897,6 +914,39 @@ mod tests {
             parse_config(r#"{"process":{"args":["/x"]},"root":{"path":"r"}}"#).unwrap();
         let spec = config_to_spec(Path::new("/b"), &cfg).unwrap();
         assert!(!spec.caps_present);
+    }
+
+    #[test]
+    fn nonroot_cwd_rejected() {
+        let cfg = parse_config(
+            r#"{"process":{"args":["/x"],"cwd":"/app"},"root":{"path":"r"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            config_to_spec(Path::new("/b"), &cfg),
+            Err(OciError::UnsupportedProperty(_))
+        ));
+    }
+
+    #[test]
+    fn root_cwd_accepted() {
+        let cfg = parse_config(
+            r#"{"process":{"args":["/x"],"cwd":"/"},"root":{"path":"r"}}"#,
+        )
+        .unwrap();
+        assert!(config_to_spec(Path::new("/b"), &cfg).is_ok());
+    }
+
+    #[test]
+    fn additional_gids_rejected() {
+        let cfg = parse_config(
+            r#"{"process":{"args":["/x"],"user":{"uid":0,"gid":0,"additionalGids":[10]}},"root":{"path":"r"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            config_to_spec(Path::new("/b"), &cfg),
+            Err(OciError::UnsupportedProperty(_))
+        ));
     }
 
     #[test]
