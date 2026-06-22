@@ -14,8 +14,10 @@
 //! ```
 //!
 //! Only the x86-64 native ABI is targeted (the kernel krunc runs on). Rules that
-//! carry argument matchers are rejected rather than silently mis-compiled into a
-//! weaker policy (see [`OciError::Unsupported`]).
+//! carry argument matchers are compiled coarsely — the action is applied to the
+//! whole syscall, ignoring the argument predicate — so the default
+//! containerd/Docker profile (which uses a few) compiles and the bulk of an
+//! allow-list policy is preserved.
 
 use crate::{OciError, Seccomp};
 use krunc_abi::MAX_SECCOMP;
@@ -102,9 +104,13 @@ pub fn compile(s: &Seccomp) -> Result<Vec<u8>, OciError> {
     // not exist on this architecture and are skipped, matching libseccomp.
     let mut rules: Vec<(u32, u32)> = Vec::new();
     for rule in &s.syscalls {
-        if !rule.args.is_empty() {
-            return Err(OciError::Unsupported("seccomp argument matchers"));
-        }
+        // Argument matchers are compiled coarsely: the action is applied to the
+        // whole syscall, ignoring the argument predicate. krunc's generator is
+        // number-based and does not emit argument comparisons; the default
+        // containerd/Docker seccomp profile relies on a few arg matchers (e.g.
+        // clone/personality), so rejecting them would make krunc unusable as a
+        // containerd runtime. Coarsening keeps the rest of an allow-list profile
+        // intact while letting those handful of syscalls match unconditionally.
         let ret = action_ret(&rule.action, rule.errno_ret)?;
         for name in &rule.names {
             if let Some(nr) = syscall_nr(name) {
@@ -601,7 +607,9 @@ mod tests {
     }
 
     #[test]
-    fn arg_matchers_rejected() {
+    fn arg_matchers_coarsened_not_rejected() {
+        // Argument matchers are compiled coarsely (name-only) so the default
+        // containerd/Docker profile, which uses a few of them, still compiles.
         let s = Seccomp {
             default_action: "SCMP_ACT_ALLOW".into(),
             default_errno_ret: None,
@@ -613,7 +621,8 @@ mod tests {
                 args: vec![serde_json::json!({"index": 1})],
             }],
         };
-        assert!(matches!(compile(&s), Err(OciError::Unsupported(_))));
+        let prog = compile(&s).expect("arg-matched rule should compile coarsely");
+        assert!(!prog.is_empty());
     }
 
     #[test]

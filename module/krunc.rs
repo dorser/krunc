@@ -1136,6 +1136,27 @@ unsafe extern "C" fn container_entry(arg: *mut c_void) -> c_int {
         unsafe { krunc_set_oom_score_adj(adj as c_int) };
     }
 
+    // Sealed syscall policy: install the compiled seccomp program while the init
+    // task is still privileged (kernel context, with CAP_SYS_ADMIN), so the
+    // install succeeds even when the OCI config does not request no_new_privs —
+    // as the default containerd/Docker profile does not. A seccomp filter is
+    // permanent and is inherited across the exec below, and no_new_privs is set
+    // immediately after (in apply_creds) and before exec, so the policy is in
+    // force for the very first userspace instruction and privileges still cannot
+    // be regained. This removes the entry point for entire classes of
+    // kernel-exploit escapes. The blob is a sock_filter[] (8 bytes per insn).
+    if ctx.seccomp.len() >= 8 && ctx.seccomp.len() % 8 == 0 {
+        let count = (ctx.seccomp.len() / 8) as c_uint;
+        // SAFETY: `ctx.seccomp` is a live, 8-byte-aligned-length buffer of
+        // `count` sock_filter records; the helper copies it and does not retain
+        // the pointer.
+        let rc = unsafe { krunc_seccomp_install(ctx.seccomp.as_ptr() as *const c_void, count) };
+        if rc != 0 {
+            pr_err!("krunc: seccomp install failed: {}\n", rc);
+            return rc; // ctx dropped -> freed; container does not start unconfined
+        }
+    }
+
     // Privilege confinement, applied atomically in kernel context just before
     // exec: the capability ceiling + no_new_privs are in force for the very
     // first userspace instruction, with no intermediate userspace process in
@@ -1154,23 +1175,6 @@ unsafe extern "C" fn container_entry(arg: *mut c_void) -> c_int {
             if ctx.cap_sets.present { 1 } else { 0 },
         )
     };
-
-    // Sealed syscall policy: install the compiled seccomp program now, after
-    // no_new_privs is set, so it is in force for the very first userspace
-    // instruction and (being under no_new_privs) cannot be relaxed for the
-    // container's whole life. This removes the entry point for entire classes of
-    // kernel-exploit escapes. The blob is a sock_filter[] (8 bytes per insn).
-    if ctx.seccomp.len() >= 8 && ctx.seccomp.len() % 8 == 0 {
-        let count = (ctx.seccomp.len() / 8) as c_uint;
-        // SAFETY: `ctx.seccomp` is a live, 8-byte-aligned-length buffer of
-        // `count` sock_filter records; the helper copies it and does not retain
-        // the pointer.
-        let rc = unsafe { krunc_seccomp_install(ctx.seccomp.as_ptr() as *const c_void, count) };
-        if rc != 0 {
-            pr_err!("krunc: seccomp install failed: {}\n", rc);
-            return rc; // ctx dropped -> freed; container does not start unconfined
-        }
-    }
 
     // Sealed filesystem domain: a Landlock ruleset that permits writes/creation
     // only beneath the configured scratch paths. Like seccomp it is inherited

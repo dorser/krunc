@@ -49,13 +49,18 @@ cat <<'EOF'
 
 ============== krunc + containerd (real docker-style) ==============
 containerd is driving krunc as its OCI runtime. Run a container the
-docker way and watch the kernel domain enforce it:
+docker way (nerdctl is the docker-compatible CLI) and watch the
+kernel domain enforce it:
 
+  nerdctl run --rm --runtime /bin/krunc --net none \
+      docker.io/library/busybox:latest echo hello-from-krunc
+  nerdctl run --rm --runtime /bin/krunc --net none \
+      docker.io/library/busybox:latest cat /proc/self/status   # caps
+  nerdctl images ;  nerdctl ps -a
+
+containerd's own CLI works too:
   ctr run --rm --runc-binary /bin/krunc \
-      docker.io/library/busybox:latest demo echo hello-from-krunc
-  ctr run --rm --runc-binary /bin/krunc \
-      docker.io/library/busybox:latest demo cat /proc/self/status   # CapEff 0
-  ctr containers ls ;  ctr images ls
+      docker.io/library/busybox:latest demo echo hi
 
 Inspect: dmesg | grep krunc   ;   cat /var/log/containerd.log
 Quit:    poweroff -f
