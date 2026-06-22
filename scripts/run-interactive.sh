@@ -16,8 +16,21 @@ BZ="$KDIR/arch/x86/boot/bzImage"
 echo "==> building interactive initramfs"
 INIT="$REPO/scripts/qemu-shell-init.sh" OUT="$INITRAMFS" bash "$REPO/scripts/make-initramfs.sh"
 
+# Prefer hardware acceleration (KVM). If the device exists but isn't writable,
+# try a one-shot, best-effort permission fix; otherwise fall back to TCG.
 KVM=()
-[ -w /dev/kvm ] && KVM=(-enable-kvm -cpu host)
+if [ -e /dev/kvm ]; then
+	if [ ! -w /dev/kvm ]; then
+		sudo -n chmod 666 /dev/kvm 2>/dev/null || true
+	fi
+	if [ -w /dev/kvm ]; then
+		KVM=(-enable-kvm -cpu host)
+	else
+		echo "==> /dev/kvm not writable; booting under TCG emulation (slower)." >&2
+	fi
+else
+	echo "==> no /dev/kvm; booting under TCG emulation (slower)." >&2
+fi
 
 echo "==> booting QEMU (interactive). Type 'poweroff -f' to quit."
 exec qemu-system-x86_64 \
