@@ -27,7 +27,7 @@ mkdir -p "$ROOT"/bundle/rootfs/bin "$ROOT"/bundle/rootfs/proc \
 # initramfs userland
 cp "$BB" "$ROOT/bin/busybox"
 ln -sf busybox "$ROOT/bin/sh"
-cp "$REPO/scripts/qemu-init.sh" "$ROOT/init"
+cp "${INIT:-$REPO/scripts/qemu-init.sh}" "$ROOT/init"
 cp "$REPO/module/krunc.ko" "$ROOT/krunc.ko"
 cp "$KRUNC_BIN" "$ROOT/bin/krunc"
 chmod +x "$ROOT/init" "$ROOT/bin/busybox" "$ROOT/bin/krunc"

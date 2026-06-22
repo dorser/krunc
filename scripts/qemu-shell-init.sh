@@ -1,0 +1,55 @@
+#!/bin/sh
+# qemu-shell-init.sh - PID 1 for INTERACTIVE krunc play. Sets up the environment,
+# loads the krunc module (creating /dev/krunc), prints a cheatsheet, and drops to
+# a shell so you can drive the runtime by hand. Use `poweroff -f` to quit.
+
+PATH=/bin:/sbin:/usr/bin:/usr/sbin
+export PATH
+
+/bin/busybox --install -s /bin 2>/dev/null
+mount -t proc     proc /proc            2>/dev/null
+mount -t sysfs    sys  /sys             2>/dev/null
+mount -t devtmpfs dev  /dev             2>/dev/null
+mount -t tmpfs    tmp  /tmp             2>/dev/null
+mount -t cgroup2  cgrp /sys/fs/cgroup   2>/dev/null
+
+if insmod /krunc.ko 2>/dev/null; then
+	echo "krunc.ko loaded -> $(ls -l /dev/krunc 2>/dev/null)"
+else
+	echo "WARNING: insmod /krunc.ko failed"
+fi
+
+cat <<'EOF'
+
+================== krunc interactive shell ==================
+Two ways to drive the runtime:
+
+1) OCI / runc-compatible CLI (the interface containerd speaks):
+     krunc create demo --bundle /bundle    # set up + block before exec
+     krunc state  demo                      # JSON status (created)
+     krunc start  demo                      # release -> exec the entrypoint
+     krunc list
+     krunc kill   demo KILL                 # send a signal
+     krunc delete demo
+   Policy lives in /bundle/config.json (caps, seccomp, Landlock, cgroups,
+   user, mounts). Edit it (vi) and re-create to change confinement.
+
+2) Raw kernel text ABI (write a spec line to the control device):
+     echo 'run rootfs=/containers/demo host=myhost exec=/bin/sh arg=/init.sh' > /dev/krunc
+     cat /dev/krunc                         # list containers the kernel tracks
+     echo 'kill <pid>' > /dev/krunc         # stop one (pid from `cat /dev/krunc`)
+
+Peek at what the kernel enforced (after a container ran):
+     ls -l /sys/fs/cgroup/krunc/            # cgroups krunc created
+     dmesg | grep -i krunc                  # module log lines
+
+     rmmod krunc        # unload (run `exec 3>&-` style: close any fds first)
+     poweroff -f        # quit QEMU
+============================================================
+EOF
+
+# Respawn an interactive shell with a controlling tty so job control works; if
+# the shell exits, start another (use `poweroff -f` to actually quit).
+while true; do
+	setsid cttyhack /bin/sh 2>/dev/null || /bin/sh
+done
