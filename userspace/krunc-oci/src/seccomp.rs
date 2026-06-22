@@ -14,10 +14,9 @@
 //! ```
 //!
 //! Only the x86-64 native ABI is targeted (the kernel krunc runs on). Rules that
-//! carry argument matchers are compiled coarsely — the action is applied to the
-//! whole syscall, ignoring the argument predicate — so the default
-//! containerd/Docker profile (which uses a few) compiles and the bulk of an
-//! allow-list policy is preserved.
+//! carry argument matchers are rejected rather than silently mis-compiled into a
+//! weaker, number-only policy (see [`OciError::Unsupported`]); the runtime-spec
+//! requires applying a configured property as specified or erroring.
 
 use crate::{OciError, Seccomp};
 use krunc_abi::MAX_SECCOMP;
@@ -104,13 +103,13 @@ pub fn compile(s: &Seccomp) -> Result<Vec<u8>, OciError> {
     // not exist on this architecture and are skipped, matching libseccomp.
     let mut rules: Vec<(u32, u32)> = Vec::new();
     for rule in &s.syscalls {
-        // Argument matchers are compiled coarsely: the action is applied to the
-        // whole syscall, ignoring the argument predicate. krunc's generator is
-        // number-based and does not emit argument comparisons; the default
-        // containerd/Docker seccomp profile relies on a few arg matchers (e.g.
-        // clone/personality), so rejecting them would make krunc unusable as a
-        // containerd runtime. Coarsening keeps the rest of an allow-list profile
-        // intact while letting those handful of syscalls match unconditionally.
+        // Argument matchers are rejected rather than silently mis-compiled into a
+        // weaker, number-only policy: the runtime-spec requires applying a
+        // configured property as specified or erroring, and silently dropping the
+        // argument predicate would weaken the syscall filter the caller asked for.
+        if !rule.args.is_empty() {
+            return Err(OciError::Unsupported("seccomp argument matchers"));
+        }
         let ret = action_ret(&rule.action, rule.errno_ret)?;
         for name in &rule.names {
             if let Some(nr) = syscall_nr(name) {
@@ -607,9 +606,10 @@ mod tests {
     }
 
     #[test]
-    fn arg_matchers_coarsened_not_rejected() {
-        // Argument matchers are compiled coarsely (name-only) so the default
-        // containerd/Docker profile, which uses a few of them, still compiles.
+    fn arg_matchers_rejected() {
+        // Argument matchers are rejected (not silently coarsened): krunc cannot
+        // honor the argument predicate, so per the runtime-spec it must error
+        // rather than install a weaker policy than the caller specified.
         let s = Seccomp {
             default_action: "SCMP_ACT_ALLOW".into(),
             default_errno_ret: None,
@@ -621,8 +621,7 @@ mod tests {
                 args: vec![serde_json::json!({"index": 1})],
             }],
         };
-        let prog = compile(&s).expect("arg-matched rule should compile coarsely");
-        assert!(!prog.is_empty());
+        assert!(matches!(compile(&s), Err(OciError::Unsupported(_))));
     }
 
     #[test]

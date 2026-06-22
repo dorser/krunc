@@ -202,25 +202,30 @@ enables Rust and the namespaces, and compiles `kernel-patch/krunc_exports.c`
 into vmlinux. Once the kernel is built once, `scripts/run-test.sh` is the fast
 iteration loop.
 
-### Run containers by hand (docker-style)
+### Run containers by hand
 
-Three ways to drive it, from highest-level to lowest:
+krunc is a **strict** OCI runtime: it faithfully applies the subset of
+`config.json` it supports and, per the runtime-spec (`create`: *"if the runtime
+cannot apply a property as specified, it MUST generate an error"*), it **rejects**
+any config carrying a property it cannot honor — it never silently ignores or
+weakens one. So drive it with a bundle inside that subset:
 
 ```sh
-# 1) Real docker-style: containerd + nerdctl drive krunc as their OCI runtime.
-scripts/setup-containerd-image.sh   # once: stage containerd/nerdctl + a busybox image
-scripts/run-containerd.sh           # boots QEMU; inside the guest:
-#   nerdctl run --rm --runtime /bin/krunc --net none busybox echo hello
-#   ctr run --rm --runc-binary /bin/krunc docker.io/library/busybox:latest d echo hi
-
-# 2) krunc's own docker-style one-shot CLI (no daemon):
 scripts/run-interactive.sh          # boots QEMU to a shell; inside:
-#   krunc run busybox -- echo hello
-#   krunc run busybox -- cat /proc/self/status   # caps dropped
-
-# 3) The runc/OCI lifecycle directly:
-#   krunc create demo --bundle /bundle && krunc start demo && krunc delete demo
+#   krunc run busybox -- echo hello                 # one-shot (create+start+wait+delete)
+#   krunc run busybox -- cat /proc/self/status      # caps dropped
+#   krunc create demo --bundle /bundle              # the runc/OCI lifecycle directly
+#   krunc start demo ; krunc state demo ; krunc delete demo
 ```
+
+A runc-compatible CLI means containerd *can* drive krunc as its runtime
+(`scripts/run-containerd.sh`, krunc as the `io.containerd.runc.v2` runc binary).
+However, containerd's/nerdctl's **default** generated configs include properties
+krunc does not model — a device cgroup (`linux.resources.devices`), `sysctls`,
+argument-matched seccomp rules, and (for `-it`) `process.terminal` — so krunc
+**rejects** them rather than running a container that does not match its spec.
+Driving krunc from containerd therefore requires reducing the runtime config to
+krunc's supported subset (or implementing those properties spec-faithfully).
 
 Verified on: Linux 6.18, rustc 1.78.0, bindgen 0.65.1, clang/LLVM 18, x86-64.
 
@@ -229,18 +234,24 @@ Verified on: Linux 6.18, rustc 1.78.0, bindgen 0.65.1, clang/LLVM 18, x86-64.
 This is a **proof of concept** with a deliberately hardened (narrow) boundary;
 it is not production software. Notable simplifications and known limitations:
 
-- **Boundary.** Fixed text + ioctl command formats; argv/env are bounded.
-  A large subset of the OCI `config.json` is honored (args, env, root, hostname,
-  namespaces, capabilities, seccomp, cgroups pids/memory/cpu, mounts, masked/
-  read-only paths, rlimits, oom score, user, Landlock-sealed read-only rootfs);
-  devices, hooks and user-namespace mapping are not yet.
-- **containerd / nerdctl (working).** Real containerd v2.3 drives krunc through
-  the standard `io.containerd.runc.v2` shim with krunc as the runc binary, so the
-  docker-compatible `nerdctl run --runtime /bin/krunc … busybox echo …` and
-  `ctr run --runc-binary /bin/krunc …` both run a container, stream its stdout
-  back and propagate the exit code (`scripts/run-containerd.sh`). tty/`-t`
-  (console-socket) and CNI networking (`--net none` is used) are not yet wired;
-  a native `containerd-shim-krunc-v2` remains optional future work.
+- **Config boundary (strict, per runtime-spec).** krunc applies a defined subset
+  of `config.json` (args, env, cwd, root, hostname, namespaces, capabilities,
+  seccomp [no argument matchers], cgroups pids/memory/cpu, mounts, masked/
+  read-only paths, rlimits, oom score, user, Landlock-sealed read-only rootfs)
+  and **rejects** — rather than silently ignoring — any other configured property
+  (e.g. `process.terminal`, `linux.sysctl`, `linux.devices`,
+  `linux.resources.devices`, `hooks`, seccomp argument matchers, user-namespace
+  mappings). This follows the runtime-spec `create` rule that a runtime MUST error
+  on a property it cannot apply, and avoids quietly running a container that does
+  not match its requested configuration.
+- **containerd / nerdctl.** krunc is runc-CLI-compatible, so containerd's
+  `io.containerd.runc.v2` shim can drive it (krunc as the runc binary). But the
+  default configs containerd/nerdctl generate use properties outside krunc's
+  subset (above), so krunc rejects them — `ctr run`/`nerdctl run` with default
+  configs are refused by design. A reduced runtime config (or implementing those
+  properties spec-faithfully) is required to run under containerd. The
+  `--console-socket` terminal handoff and CNI networking are runc/containerd
+  conventions outside the runtime-spec and are not implemented.
 - **Privilege.** `run`/`create`/`kill` require the caller to be privileged
   (namespace creation needs `CAP_SYS_ADMIN`); there is no per-caller
   authorization beyond the device's file permissions.

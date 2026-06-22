@@ -148,19 +148,22 @@ not in one shot.
   `krunc_domain` vision), and it achieves the immutability that a chroot-based
   `root.readonly` cannot. Host-verified in QEMU: the container's `touch /` is
   **denied**, `touch /tmp` is **allowed**.
-- **M10 (done) — real containerd / nerdctl e2e.** containerd v2.3 drives krunc
-  as its OCI runtime through the standard `io.containerd.runc.v2` shim (krunc is
-  the runc binary): `ctr run --runc-binary /bin/krunc …` and the
-  docker-compatible `nerdctl run --runtime /bin/krunc …busybox echo …` both run a
-  container, stream its stdout back (the kernel-cloned init inherits the shim's
-  stdio fifos) and propagate the exit code. Two compatibility fixes made this
-  work on stock containerd-generated configs: the CLI now prepares the rootfs
-  like runc (creates mount destinations, PATH-resolves `argv[0]`), and the kernel
-  installs the seccomp filter while still privileged so the default
-  containerd/Docker profile (no `noNewPrivileges`, arg matchers) loads. The
-  bounding set inside the container is exactly nerdctl's default
-  (`0x…a80425fb`) — krunc enforces the policy containerd supplies. Reproduce with
-  `scripts/setup-containerd-image.sh` + `scripts/run-containerd.sh`.
+- **M10 — containerd integration (mechanism works; configs strictly gated).**
+  krunc is runc-CLI-compatible, so containerd v2.3's `io.containerd.runc.v2` shim
+  drives it (krunc as the runc binary), and the kernel-cloned init inherits the
+  shim's stdio fifos. **However**, krunc is a *strict* runtime: per the
+  runtime-spec `create` rule (a runtime MUST error on a property it cannot apply),
+  it rejects configs carrying properties outside its supported subset. containerd's
+  and nerdctl's default configs include a device cgroup (`linux.resources.devices`),
+  `sysctls`, and argument-matched seccomp, so `ctr run`/`nerdctl run` with default
+  configs are **rejected by design** (krunc refuses rather than silently dropping
+  those properties). Earlier shortcuts that silently weakened the policy to make
+  containerd "work" (coarsening seccomp arg matchers) were reverted as
+  convention-driven, non-spec compromises. Running under containerd requires a
+  reduced runtime config within krunc's subset, or implementing those properties
+  spec-faithfully (a future, in-spec item — e.g. the device cgroup). The
+  CLI-rootfs prep (create mount destinations, PATH-resolve `argv[0]` per the
+  spec's execvp semantics) and the privileged-time seccomp install remain.
 - **mounts (done) — full containerd mount set.** The kernel now materializes
   nested mountpoints (`krunc_mkdir` → `vfs_mkdir`) before each filesystem mount,
   so a stock containerd/nerdctl `/dev/pts`, `/dev/shm`, `/dev/mqueue`,

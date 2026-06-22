@@ -13,6 +13,7 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -41,6 +42,11 @@ pub struct OciConfig {
     /// Filesystem mounts to perform in the container.
     #[serde(default)]
     pub mounts: Vec<OciMount>,
+    /// Any other top-level `config.json` properties krunc does not model. A
+    /// non-whitelisted entry here is rejected (the runtime-spec requires the
+    /// runtime to apply every configured property or error).
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 /// A `config.json` top-level `mounts[]` entry.
@@ -86,6 +92,9 @@ pub struct Process {
     pub rlimits: Vec<OciRlimit>,
     /// Adjust the process OOM-killer score.
     pub oom_score_adj: Option<i32>,
+    /// Other `process` properties krunc does not model (rejected if present).
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 /// `config.json` `process.rlimits[]`.
@@ -175,6 +184,10 @@ pub struct Linux {
     pub readonly_paths: Vec<String>,
     /// seccomp syscall policy (compiled to a BPF program for the kernel).
     pub seccomp: Option<Seccomp>,
+    /// Other `linux` properties krunc does not model (rejected if present) —
+    /// e.g. `sysctl`, `devices`, `rootfsPropagation`, `intelRdt`.
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 /// `config.json` `linux.seccomp`: the syscall policy. krunc compiles the
@@ -223,6 +236,10 @@ pub struct Resources {
     pub memory: Option<Memory>,
     /// cpu controller.
     pub cpu: Option<Cpu>,
+    /// Other `resources` controllers krunc does not model (rejected if present)
+    /// — e.g. `devices` (the device cgroup), `blockIO`, `hugepageLimits`.
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 /// `config.json` `linux.resources.cpu` (the subset krunc enforces).
@@ -336,6 +353,11 @@ pub enum OciError {
     UnknownCapability(String),
     /// A field uses a feature krunc does not (yet) support.
     Unsupported(&'static str),
+    /// A configured `config.json` property krunc cannot apply. Per the OCI
+    /// runtime-spec (create: "if the runtime cannot apply a property as
+    /// specified, it MUST generate an error"), krunc rejects rather than
+    /// silently ignoring it.
+    UnsupportedProperty(String),
     /// The translated spec violated an ABI bound.
     Abi(krunc_abi::AbiError),
 }
@@ -347,6 +369,9 @@ impl fmt::Display for OciError {
             OciError::Missing(s) => write!(f, "config.json: missing required field {s}"),
             OciError::UnknownCapability(c) => write!(f, "unknown capability {c}"),
             OciError::Unsupported(s) => write!(f, "unsupported config.json feature: {s}"),
+            OciError::UnsupportedProperty(s) => {
+                write!(f, "config.json sets {s}, which krunc cannot apply (the OCI runtime-spec requires the runtime to error rather than ignore it)")
+            }
             OciError::Abi(e) => write!(f, "spec exceeds ABI limits: {e}"),
         }
     }
@@ -529,15 +554,53 @@ fn mount_flags(options: &[String]) -> (u64, bool) {
     (flags, is_bind)
 }
 
+/// Reject any configured property krunc does not model and therefore cannot
+/// apply. The OCI runtime-spec's `create` operation requires: "if the runtime
+/// cannot apply a property as specified in the configuration, it MUST generate
+/// an error and a new container MUST NOT be created." Silently ignoring a
+/// property would violate that, so krunc fails closed.
+fn reject_unmodeled(
+    scope: &str,
+    extra: &HashMap<String, serde_json::Value>,
+    allow: &[&str],
+) -> Result<(), OciError> {
+    for key in extra.keys() {
+        if !allow.contains(&key.as_str()) {
+            let prefix = if scope.is_empty() { String::new() } else { format!("{scope}.") };
+            return Err(OciError::UnsupportedProperty(format!("{prefix}{key}")));
+        }
+    }
+    Ok(())
+}
+
 /// Translate a parsed OCI config (from `bundle`) into a validated [`DomainSpec`].
 pub fn config_to_spec(bundle: &Path, cfg: &OciConfig) -> Result<DomainSpec, OciError> {
     let process = cfg.process.as_ref().ok_or(OciError::Missing("process"))?;
     if process.args.is_empty() {
         return Err(OciError::Missing("process.args"));
     }
+    // A terminal must be allocated when `process.terminal` is true (runtime-spec
+    // config: a pseudoterminal pair is allocated and duplicated on the process's
+    // stdio). krunc does not allocate terminals, so it must reject — not ignore —
+    // the request. (How a runtime hands the terminal master to its caller, e.g.
+    // runc's `--console-socket`, is a CLI convention outside the runtime-spec.)
+    if process.terminal {
+        return Err(OciError::UnsupportedProperty("process.terminal".into()));
+    }
     let root = cfg.root.as_ref().ok_or(OciError::Missing("root"))?;
     if root.path.is_empty() {
         return Err(OciError::Missing("root.path"));
+    }
+
+    // Fail closed on any configured property krunc does not model/apply. `annotations`
+    // is caller metadata (not applied to the container) and is allowed through.
+    reject_unmodeled("", &cfg.extra, &["annotations"])?;
+    reject_unmodeled("process", &process.extra, &[])?;
+    if let Some(linux) = &cfg.linux {
+        reject_unmodeled("linux", &linux.extra, &[])?;
+        if let Some(res) = &linux.resources {
+            reject_unmodeled("linux.resources", &res.extra, &[])?;
+        }
     }
 
     let mut namespaces = 0u32;
@@ -834,6 +897,56 @@ mod tests {
             parse_config(r#"{"process":{"args":["/x"]},"root":{"path":"r"}}"#).unwrap();
         let spec = config_to_spec(Path::new("/b"), &cfg).unwrap();
         assert!(!spec.caps_present);
+    }
+
+    #[test]
+    fn terminal_rejected() {
+        // process.terminal=true: krunc cannot allocate a terminal, so it must
+        // error rather than silently run the process without one.
+        let cfg = parse_config(
+            r#"{"process":{"args":["/x"],"terminal":true},"root":{"path":"r"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            config_to_spec(Path::new("/b"), &cfg),
+            Err(OciError::UnsupportedProperty(_))
+        ));
+    }
+
+    #[test]
+    fn unmodeled_property_rejected() {
+        // linux.sysctl is not applied by krunc -> rejected, not silently ignored.
+        let cfg = parse_config(
+            r#"{"process":{"args":["/x"]},"root":{"path":"r"},"linux":{"sysctl":{"a.b":"0"}}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            config_to_spec(Path::new("/b"), &cfg),
+            Err(OciError::UnsupportedProperty(_))
+        ));
+    }
+
+    #[test]
+    fn unmodeled_resource_rejected() {
+        // linux.resources.devices (the device cgroup) is not applied -> rejected.
+        let cfg = parse_config(
+            r#"{"process":{"args":["/x"]},"root":{"path":"r"},"linux":{"resources":{"devices":[{"allow":false,"access":"rwm"}]}}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            config_to_spec(Path::new("/b"), &cfg),
+            Err(OciError::UnsupportedProperty(_))
+        ));
+    }
+
+    #[test]
+    fn annotations_allowed() {
+        // annotations are caller metadata (not applied to the container) -> allowed.
+        let cfg = parse_config(
+            r#"{"process":{"args":["/x"]},"root":{"path":"r"},"annotations":{"foo":"bar"}}"#,
+        )
+        .unwrap();
+        assert!(config_to_spec(Path::new("/b"), &cfg).is_ok());
     }
 
     #[test]
