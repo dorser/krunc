@@ -50,8 +50,24 @@ Each is independently verifiable and committed.
 - **M8 — Lifetime enforcement (Pillar 2).** Wire the domain as the unifying owner
   of the above; design + prototype the BPF-LSM per-domain policy + kill-on-escape
   path; document the in-tree LSM (Landlock-extended) as the mainline form.
-- **M9 — OCI conformance.** Run `opencontainers/runtime-tools` validation against
-  the Rust CLI; green for supported features; precisely report the unsupported.
+- **M9 — OCI conformance (partial — measured).** The official
+  `opencontainers/runtime-tools` `runtimetest` validator runs as a container
+  under krunc (harness: `scripts/qemu-conformance-init.sh` + `make-initramfs.sh`
+  with `RUNTIMETEST=<binary>`). Against a config within krunc's supported subset it
+  passes **237 of 249** MUST-level checks: hostname, cwd, env, `process.user`,
+  capabilities (all five sets), rlimits, `oomScoreAdj`, `noNewPrivs`, namespaces,
+  mounts, `maskedPaths`, `readonlyPaths` all conform. The **12 failures are all the
+  OCI default `/dev` devices/symlinks** (`/dev/null`, `/dev/zero`, `/dev/full`,
+  `/dev/random`, `/dev/urandom`, `/dev/tty`, `/dev/ptmx` + `/dev/fd|stdin|stdout|
+  stderr`), which krunc does not auto-create — a deliberate consequence of its
+  strict "do exactly what's configured" stance (it also no longer auto-mounts the
+  SHOULD default filesystems `/proc`,`/sys`). Whether to provide these
+  runtime-supplied defaults is part of the strict-minimal-vs-spec-complete decision
+  (see the deferred A/B/C fork). Mount options: krunc now implements the flag-based
+  options the spec lists as MUST (`defaults`, `async`, `atime`, `dirsync`,
+  `lazytime`, `iversion`, `loud`, …); the propagation options (`private`/`rprivate`/
+  `rshared`/`rslave`) need a separate `mount(2)` propagation call krunc does not yet
+  make, so they remain rejected (not silently dropped).
 - **M10 (done — see below) — containerd e2e.** Real containerd + offline busybox
   OCI image + krunc runtime; `ctr run` and `nerdctl run`. A native Rust
   `containerd-shim-krunc-v2` remains optional future work.

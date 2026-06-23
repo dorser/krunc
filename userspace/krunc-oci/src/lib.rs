@@ -544,17 +544,22 @@ fn mount_flags(options: &[String]) -> (u64, bool) {
     const MS_NOEXEC: u64 = 8;
     const MS_SYNCHRONOUS: u64 = 16;
     const MS_REMOUNT: u64 = 32;
+    const MS_DIRSYNC: u64 = 128;
     const MS_BIND: u64 = 4096;
     const MS_REC: u64 = 16384;
+    const MS_SILENT: u64 = 32768;
     const MS_NOATIME: u64 = 1024;
     const MS_NODIRATIME: u64 = 2048;
     const MS_RELATIME: u64 = 1 << 21;
+    const MS_I_VERSION: u64 = 1 << 23;
     const MS_STRICTATIME: u64 = 1 << 24;
+    const MS_LAZYTIME: u64 = 1 << 25;
 
     let mut flags = 0u64;
     let mut is_bind = false;
     for opt in options {
         match opt.as_str() {
+            "defaults" => {} // rw,suid,dev,exec,async,relatime — i.e. no special flags
             "ro" => flags |= MS_RDONLY,
             "rw" => flags &= !MS_RDONLY,
             "nosuid" => flags |= MS_NOSUID,
@@ -564,11 +569,22 @@ fn mount_flags(options: &[String]) -> (u64, bool) {
             "noexec" => flags |= MS_NOEXEC,
             "exec" => flags &= !MS_NOEXEC,
             "sync" => flags |= MS_SYNCHRONOUS,
+            "async" => flags &= !MS_SYNCHRONOUS,
+            "dirsync" => flags |= MS_DIRSYNC,
             "remount" => flags |= MS_REMOUNT,
             "noatime" => flags |= MS_NOATIME,
+            "atime" => flags &= !MS_NOATIME,
             "nodiratime" => flags |= MS_NODIRATIME,
+            "diratime" => flags &= !MS_NODIRATIME,
             "relatime" => flags |= MS_RELATIME,
+            "norelatime" => flags &= !MS_RELATIME,
             "strictatime" => flags |= MS_STRICTATIME,
+            "nostrictatime" => flags &= !MS_STRICTATIME,
+            "lazytime" => flags |= MS_LAZYTIME,
+            "nolazytime" => flags &= !MS_LAZYTIME,
+            "iversion" => flags |= MS_I_VERSION,
+            "noiversion" => flags &= !MS_I_VERSION,
+            "loud" => flags &= !MS_SILENT,
             "bind" => {
                 flags |= MS_BIND;
                 is_bind = true;
@@ -577,24 +593,27 @@ fn mount_flags(options: &[String]) -> (u64, bool) {
                 flags |= MS_BIND | MS_REC;
                 is_bind = true;
             }
-            _ => {} // "defaults" (no-op); other non-flag options rejected by check_mount_options
+            _ => {} // unreachable: check_mount_options screens unknown options first
         }
     }
     (flags, is_bind)
 }
 
-/// Reject mount `options` krunc cannot apply. krunc translates only the MS_* flag
-/// options (see [`mount_flags`]); filesystem data options (`size=`, `mode=`, …)
-/// and mount-propagation options (`private`, `shared`, `slave`, `unbindable` and
-/// their recursive forms) are not applied, so — per the runtime-spec create rule
-/// (a runtime MUST error on a property it cannot apply) — they are rejected
-/// rather than silently dropped. `defaults` is accepted as a no-op.
+/// Reject mount `options` krunc cannot apply. krunc implements the flag-based
+/// `MS_*` options the runtime-spec lists as MUST (see [`mount_flags`]).
+/// Filesystem data options (`size=`, `mode=`, …) and the mount-propagation
+/// options (`private`, `shared`, `slave`, `unbindable` and their recursive
+/// forms — which require a separate `mount(2)` propagation call krunc does not
+/// yet make) are rejected rather than silently dropped, per the create rule
+/// ("a runtime MUST error on a property it cannot apply").
 fn check_mount_options(options: &[String]) -> Result<(), OciError> {
     for opt in options {
         match opt.as_str() {
-            "ro" | "rw" | "nosuid" | "suid" | "nodev" | "dev" | "noexec" | "exec" | "sync"
-            | "remount" | "noatime" | "nodiratime" | "relatime" | "strictatime" | "bind"
-            | "rbind" | "defaults" => {}
+            "defaults" | "ro" | "rw" | "nosuid" | "suid" | "nodev" | "dev" | "noexec" | "exec"
+            | "sync" | "async" | "dirsync" | "remount" | "noatime" | "atime" | "nodiratime"
+            | "diratime" | "relatime" | "norelatime" | "strictatime" | "nostrictatime"
+            | "lazytime" | "nolazytime" | "iversion" | "noiversion" | "loud" | "bind"
+            | "rbind" => {}
             _ => {
                 return Err(OciError::UnsupportedProperty(format!(
                     "mounts[].options: {opt}"
@@ -1090,6 +1109,23 @@ mod tests {
             config_to_spec(Path::new("/b"), &cfg),
             Err(OciError::UnsupportedProperty(_))
         ));
+    }
+
+    #[test]
+    fn must_mount_option_flags_applied() {
+        // The runtime-spec lists these flag options as MUST-implement; krunc maps
+        // them to MS_* flags rather than rejecting them. `defaults` is a no-op.
+        let cfg = parse_config(
+            r#"{"process":{"args":["/x"]},"root":{"path":"r"},"mounts":[{"destination":"/m","type":"tmpfs","source":"tmpfs","options":["defaults","nosuid","async","dirsync","lazytime","iversion"]}]}"#,
+        )
+        .unwrap();
+        let spec = config_to_spec(Path::new("/b"), &cfg).unwrap();
+        let f = spec.mounts[0].flags;
+        assert_eq!(f & 2, 2, "nosuid (MS_NOSUID)");
+        assert_eq!(f & 128, 128, "dirsync (MS_DIRSYNC)");
+        assert_eq!(f & (1 << 25), 1 << 25, "lazytime (MS_LAZYTIME)");
+        assert_eq!(f & (1 << 23), 1 << 23, "iversion (MS_I_VERSION)");
+        assert_eq!(f & 16, 0, "async clears MS_SYNCHRONOUS");
     }
 
     #[test]
