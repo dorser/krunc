@@ -92,7 +92,7 @@ echo "[vm] krunc state oci1   (expect: running)"
 /bin/krunc state oci1 | grep -E '"status"|"pid"' | sed 's/^/[vm]   /'
 echo "[vm] ----- kernel-applied confinement, host view of /proc/$CPID/status -----"
 grep -E "^(CapBnd|CapPrm|CapEff|NoNewPrivs|Seccomp|Uid|Gid):" /proc/$CPID/status 2>/dev/null | sed 's/^/[vm]   /'
-echo "[vm]   expected: CapBnd 00000000200004e1 (6 bounded), CapEff/CapPrm 0 (none granted), NoNewPrivs 1, Seccomp 2, Uid/Gid 65534"
+echo "[vm]   expected: CapBnd 00000000200004e1 (6 bounded), CapEff/CapPrm 0 (none granted), NoNewPrivs 1, Uid/Gid 65534"
 echo "[vm]   RLIMIT_NOFILE: $(grep -E '^Max open files' /proc/$CPID/limits 2>/dev/null)   (expect soft 256 hard 512)"
 echo "[vm]   oom_score_adj = $(cat /proc/$CPID/oom_score_adj 2>/dev/null)   (expect -500)"
 # Give the container's probes time to run (memhog OOM ~1s, cpuhog ~3s) and the

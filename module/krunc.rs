@@ -95,15 +95,10 @@ extern "C" {
     /// Create directory `path` (one level) in the current task's mount namespace
     /// so a nested mountpoint can be materialized inside a just-mounted parent.
     fn krunc_mkdir(path: *const c_char, mode: u16) -> c_int;
-    /// Install a kernel-resident classic-BPF seccomp program (`len` instructions)
-    /// on the current task. Must be called after no_new_privs is set.
-    fn krunc_seccomp_install(insns: *const c_void, len: c_uint) -> c_int;
     /// Apply one resource limit (`setrlimit`) to the current task before exec.
     fn krunc_apply_rlimit(resource: c_uint, soft: u64, hard: u64) -> c_int;
     /// Set the current task's OOM-killer score adjustment before exec.
     fn krunc_set_oom_score_adj(adj: c_int);
-    /// Seal a Landlock domain allowing writes only beneath `paths` (`n` entries).
-    fn krunc_landlock_restrict_writes(paths: *const *const c_char, n: c_int) -> c_int;
     // msleep() is exported by mainline.
     fn msleep(msecs: c_uint);
 }
@@ -143,8 +138,6 @@ const MAX_SPEC: usize = 16 * 1024;
 const MAX_RLIMITS: usize = 32;
 /// Maximum number of mount entries accepted from the spec.
 const MAX_MOUNTS: usize = 64;
-/// Stack-array bound for the Landlock writable-path pointer list.
-const MAX_PATHS_ARR: usize = 64;
 /// Maximum length of a single string field in the binary spec.
 const MAX_STR: usize = 4096;
 /// krunc-abi wire magic and version (see the `krunc-abi` crate).
@@ -201,7 +194,6 @@ struct ContainerCtx {
     envp: KVec<KVec<u8>>,      // each NUL-terminated; empty -> default env
     cap_sets: CapSets,         // the five capability sets applied before exec
     no_new_privs: bool,        // set no_new_privs before exec
-    seccomp: KVec<u8>,         // compiled sock_filter[] blob (empty = no seccomp)
     masked: KVec<KVec<u8>>,    // paths over-mounted to be inaccessible (each NUL-terminated)
     readonly: KVec<KVec<u8>>,  // paths remounted read-only (each NUL-terminated)
     rlimits: KVec<RLimit>,     // resource limits applied before exec
@@ -209,7 +201,6 @@ struct ContainerCtx {
     uid: u32,                  // target uid (process.user.uid)
     gid: u32,                  // target gid (process.user.gid)
     mounts: KVec<MountSpec>,   // mounts to perform (exactly config.mounts[], in order)
-    landlock_rw: KVec<KVec<u8>>, // Landlock writable paths (empty = no fs seal)
     ctrl: Option<Arc<ContainerControl>>, // Some -> two-phase (created) container
 }
 
@@ -439,12 +430,10 @@ fn handle_text_command(buf: &[u8]) -> Result {
         KVec::new(),
         KVec::new(),
         KVec::new(),
-        KVec::new(),
         None,
         0,
         0,
         default_proc_sys_mounts()?,
-        KVec::new(),
     )?;
     pr_info!("started container id={} pid={}\n", id, pid);
     Ok(())
@@ -634,7 +623,6 @@ struct DecodedSpec {
     cap_inheritable: u64,
     cap_ambient: u64,
     flags: u64,
-    seccomp: KVec<u8>,
     masked: KVec<KVec<u8>>,
     readonly: KVec<KVec<u8>>,
     rlimits: KVec<RLimit>,
@@ -642,7 +630,6 @@ struct DecodedSpec {
     uid: u32,
     gid: u32,
     mounts: KVec<MountSpec>,
-    landlock_rw: KVec<KVec<u8>>,
 }
 
 /// The five Linux capability sets applied to the container before exec.
@@ -787,7 +774,6 @@ fn decode_spec(buf: &[u8]) -> Result<DecodedSpec> {
         cap_inheritable: 0,
         cap_ambient: 0,
         flags: 0,
-        seccomp: KVec::new(),
         masked: KVec::new(),
         readonly: KVec::new(),
         rlimits: KVec::new(),
@@ -795,7 +781,6 @@ fn decode_spec(buf: &[u8]) -> Result<DecodedSpec> {
         uid: 0,
         gid: 0,
         mounts: KVec::new(),
-        landlock_rw: KVec::new(),
     };
     let mut seen: u64 = 0; // bitset of section tags already parsed (tags < 64)
     for _ in 0..count {
@@ -835,12 +820,6 @@ fn decode_spec(buf: &[u8]) -> Result<DecodedSpec> {
                 d.cap_inheritable = sr.u64()?;
                 d.cap_ambient = sr.u64()?;
             }
-            10 => {
-                // SECCOMP: a raw sock_filter[] blob; copy verbatim (8 bytes/insn).
-                let mut v: KVec<u8> = KVec::new();
-                v.extend_from_slice(payload, GFP_KERNEL)?;
-                d.seccomp = v;
-            }
             11 => d.masked = read_strvec_k(&mut sr)?, // MASKED_PATHS
             12 => d.readonly = read_strvec_k(&mut sr)?, // RO_PATHS
             13 => d.rlimits = read_rlimits_k(&mut sr)?, // RLIMITS
@@ -851,7 +830,6 @@ fn decode_spec(buf: &[u8]) -> Result<DecodedSpec> {
                 d.gid = sr.u32()?;
             }
             17 => d.mounts = read_mounts_k(&mut sr)?, // MOUNTS
-            18 => d.landlock_rw = read_strvec_k(&mut sr)?, // LANDLOCK_RW
             // tags 6/7 (uid/gid maps) land in a later milestone.
             _ => {}
         }
@@ -903,7 +881,6 @@ fn create_from_blob(spec: &[u8]) -> Result<(u64, i32)> {
         true,
         cap_sets,
         no_new_privs,
-        d.seccomp,
         d.masked,
         d.readonly,
         d.rlimits,
@@ -911,7 +888,6 @@ fn create_from_blob(spec: &[u8]) -> Result<(u64, i32)> {
         d.uid,
         d.gid,
         d.mounts,
-        d.landlock_rw,
     )
 }
 
@@ -926,7 +902,6 @@ fn spawn(
     paused: bool,
     cap_sets: CapSets,
     no_new_privs: bool,
-    seccomp: KVec<u8>,
     masked: KVec<KVec<u8>>,
     readonly: KVec<KVec<u8>>,
     rlimits: KVec<RLimit>,
@@ -934,7 +909,6 @@ fn spawn(
     uid: u32,
     gid: u32,
     mounts: KVec<MountSpec>,
-    landlock_rw: KVec<KVec<u8>>,
 ) -> Result<(u64, i32)> {
     let ctrl = if paused {
         Some(Arc::new(
@@ -958,7 +932,6 @@ fn spawn(
             envp,
             cap_sets,
             no_new_privs,
-            seccomp,
             masked,
             readonly,
             rlimits,
@@ -966,7 +939,6 @@ fn spawn(
             uid,
             gid,
             mounts,
-            landlock_rw,
             ctrl: ctrl.as_ref().map(|a| a.clone()),
         },
         GFP_KERNEL,
@@ -1082,24 +1054,6 @@ fn apply_mounts(mounts: &KVec<MountSpec>) {
     }
 }
 
-/// Seal a Landlock write-restrict domain granting writes only beneath the given
-/// paths. Applied after no_new_privs so it is un-relaxable for the container's
-/// life. Returns 0 (or leaves the container running unsealed only if Landlock is
-/// absent — `-ENOSYS`, which we tolerate so a non-Landlock kernel still boots).
-fn apply_landlock(rw: &KVec<KVec<u8>>) -> c_int {
-    if rw.is_empty() {
-        return 0;
-    }
-    let mut ptrs = [ptr::null::<c_char>(); MAX_PATHS_ARR];
-    let n = core::cmp::min(rw.len(), MAX_PATHS_ARR);
-    for i in 0..n {
-        ptrs[i] = rw[i].as_ptr() as *const c_char;
-    }
-    // SAFETY: `ptrs[..n]` are NUL-terminated C strings valid for the call; the
-    // helper only reads them.
-    unsafe { krunc_landlock_restrict_writes(ptrs.as_ptr(), n as c_int) }
-}
-
 /// The container's PID 1, run in kernel context inside the new namespaces.
 ///
 /// # Safety
@@ -1188,30 +1142,6 @@ unsafe extern "C" fn container_entry(arg: *mut c_void) -> c_int {
         unsafe { krunc_set_oom_score_adj(adj as c_int) };
     }
 
-    // Sealed syscall policy: install the compiled seccomp program while the init
-    // task is still privileged (kernel context, with CAP_SYS_ADMIN), so the
-    // install succeeds even when the OCI config does not request no_new_privs —
-    // as the default containerd/Docker profile does not. A seccomp filter is
-    // permanent and is inherited across the exec below, and no_new_privs is set
-    // immediately after (in apply_creds) and before exec, so the policy is in
-    // force for the very first userspace instruction and privileges still cannot
-    // be regained. This removes the entry point for entire classes of
-    // kernel-exploit escapes. The blob is a sock_filter[] (8 bytes per insn).
-    if ctx.seccomp.len() >= 8 && ctx.seccomp.len() % 8 == 0 {
-        let count = (ctx.seccomp.len() / 8) as c_uint;
-        // SAFETY: `ctx.seccomp` is a live, 8-byte-aligned-length buffer of
-        // `count` sock_filter records; the helper copies it and does not retain
-        // the pointer.
-        let rc = unsafe { krunc_seccomp_install(ctx.seccomp.as_ptr() as *const c_void, count) };
-        if rc != 0 {
-            pr_err!("krunc: seccomp install failed: {}\n", rc);
-            drop(ctx); // free before exiting
-            // SAFETY: never reached exec; exit cleanly (container does not start
-            // unconfined) rather than return to a non-existent userspace context.
-            unsafe { krunc_exit(rc as c_long) };
-        }
-    }
-
     // Privilege confinement, applied atomically in kernel context just before
     // exec: the capability ceiling + no_new_privs are in force for the very
     // first userspace instruction, with no intermediate userspace process in
@@ -1230,20 +1160,6 @@ unsafe extern "C" fn container_entry(arg: *mut c_void) -> c_int {
             if ctx.cap_sets.present { 1 } else { 0 },
         )
     };
-
-    // Sealed filesystem domain: a Landlock ruleset that permits writes/creation
-    // only beneath the configured scratch paths. Like seccomp it is inherited
-    // across exec and (under no_new_privs) un-relaxable for the container's life,
-    // giving an immutable rootfs. -ENOSYS (a kernel without Landlock) is the only
-    // tolerated failure; any other error is fatal (fail closed).
-    let lrc = apply_landlock(&ctx.landlock_rw);
-    if lrc != 0 && lrc != -38 {
-        pr_err!("krunc: landlock seal failed: {}\n", lrc);
-        drop(ctx); // free before exiting
-        // SAFETY: never reached exec; exit cleanly (do not start a container
-        // missing its seal) rather than return to a non-existent user context.
-        unsafe { krunc_exit(lrc as c_long) };
-    }
 
     // Build argv/envp pointer arrays (into ctx's buffers, which stay valid for
     // the execve call). On a successful exec this function returns normally so

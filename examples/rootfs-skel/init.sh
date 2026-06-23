@@ -61,26 +61,6 @@ if [ "$KRUNC_PIDS_TEST" = 1 ]; then
 		echo "[container]   /proc/sys: read-only, write denied (EROFS)"
 	fi
 
-	echo "[container] --- seccomp (sealed syscall policy) ---"
-	# chmod needs no capability when you own the target, so a denial here is the
-	# seccomp filter at work (not the dropped caps). The policy returns EPERM.
-	if chmod 0700 /tmp 2>/dev/null; then
-		echo "[container]   chmod /tmp: ALLOWED (unexpected -- seccomp not applied)"
-	else
-		echo "[container]   chmod /tmp: blocked by seccomp (EPERM)"
-	fi
-	# Active kill-on-escape: a workload that *attempts* to load a kernel module
-	# (a classic privilege-escalation / escape vector) is KILLED by the policy
-	# (SCMP_ACT_KILL_PROCESS), not merely denied. insmod is run as a child so the
-	# kill takes only it; the container's PID 1 keeps running.
-	insmod /init.sh 2>/dev/null
-	rc=$?
-	if [ "$rc" -ge 128 ]; then
-		echo "[container]   insmod (module load): KILLED by seccomp, signal $((rc - 128)) (active kill-on-escape)"
-	else
-		echo "[container]   insmod (module load): exited rc=$rc (expected SIGKILL/137)"
-	fi
-
 	echo "[container] --- resource limits (rlimits / oom) ---"
 	echo "[container]   RLIMIT_NOFILE (ulimit -n) = $(ulimit -n)  (config soft=256)"
 
@@ -89,20 +69,6 @@ if [ "$KRUNC_PIDS_TEST" = 1 ]; then
 
 	echo "[container] --- mounts (OCI mounts[] applied by the kernel) ---"
 	echo "[container]   /tmp: $(awk '$2=="/tmp"{print $1,$3,$4}' /proc/mounts 2>&-)  (expect tmpfs, nosuid/nodev/noexec)"
-
-	echo "[container] --- Landlock (sealed fs domain: immutable rootfs) ---"
-	if touch /landlock-rootfs-probe 2>/dev/null; then
-		echo "[container]   write to /   : ALLOWED (unexpected -- Landlock not applied)"
-		rm -f /landlock-rootfs-probe 2>/dev/null
-	else
-		echo "[container]   write to /   : DENIED by Landlock (rootfs is immutable)"
-	fi
-	if touch /tmp/landlock-ok 2>/dev/null; then
-		echo "[container]   write to /tmp: ALLOWED (the domain's writable scratch dir)"
-		rm -f /tmp/landlock-ok 2>/dev/null
-	else
-		echo "[container]   write to /tmp: DENIED (unexpected)"
-	fi
 
 	echo "[container] --- memory cgroup limit (memory.max) ---"
 	echo "[container]   memhog allocates until the cgroup OOM-kills it (config max=64 MiB):"

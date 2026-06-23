@@ -18,9 +18,6 @@ if ! grep -q 'krunc_exports.o' kernel/Makefile; then
 	echo 'obj-y += krunc_exports.o' >> kernel/Makefile
 fi
 
-echo "==> apply in-tree seccomp install helpers (filter.c + seccomp.c)"
-bash "$REPO/scripts/patch-kernel-seccomp.sh"
-
 echo "==> base config: defconfig + kvm_guest.config"
 make -j"$JOBS" defconfig
 make -j"$JOBS" kvm_guest.config
