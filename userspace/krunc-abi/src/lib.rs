@@ -854,4 +854,166 @@ mod tests {
         assert_eq!(d.rootfs, "/r");
         assert_eq!(d.argv, vec!["/bin/true".to_string()]);
     }
+
+    /// The decoder runs on untrusted bytes from userspace; in the kernel a panic
+    /// is fatal. This deterministically fuzzes `decode` with random buffers and
+    /// hostile mutations of a valid one (length/count fields set to huge values),
+    /// asserting it always returns a `Result` — never panics, over/under-reads,
+    /// or over-allocates. The PRNG is seeded so any failure reproduces.
+    #[test]
+    fn decode_never_panics_on_arbitrary_input() {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        // splitmix64 PRNG (deterministic, no external dependency).
+        let mut state: u64 = 0x1234_5678_9ABC_DEF0;
+        let mut next = move || {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        };
+        let try_decode = |buf: &[u8]| {
+            catch_unwind(AssertUnwindSafe(|| {
+                let _ = decode(buf);
+            }))
+        };
+
+        // 1. Purely random buffers of varying length.
+        for _ in 0..30_000 {
+            let len = (next() % 1500) as usize;
+            let buf: Vec<u8> = (0..len).map(|_| (next() & 0xff) as u8).collect();
+            assert!(try_decode(&buf).is_ok(), "panicked on random buffer {buf:?}");
+        }
+
+        let valid = sample().encode(Op::Create).unwrap();
+
+        // 2. A valid header (MAGIC+version+op) followed by random section bytes,
+        //    so the fuzzer exercises the section/tag loop and its sub-readers.
+        let header = valid[..12].to_vec();
+        for _ in 0..30_000 {
+            let mut buf = header.clone();
+            let extra = (next() % 300) as usize;
+            buf.extend((0..extra).map(|_| (next() & 0xff) as u8));
+            assert!(try_decode(&buf).is_ok(), "panicked on header+random {buf:?}");
+        }
+
+        // 3. Single-byte mutations at every position of a valid buffer.
+        for pos in 0..valid.len() {
+            for delta in [0x01u8, 0x3f, 0x80, 0xff] {
+                let mut buf = valid.clone();
+                buf[pos] ^= delta;
+                assert!(try_decode(&buf).is_ok(), "panicked on mutation pos={pos} delta={delta:#x}");
+            }
+        }
+
+        // 4. Overwrite each 4-byte window with u32::MAX (hostile length/count
+        //    fields) — the classic decoder over-read / over-allocate trap.
+        for pos in 0..valid.len().saturating_sub(4) {
+            let mut buf = valid.clone();
+            buf[pos..pos + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+            assert!(try_decode(&buf).is_ok(), "panicked on u32::MAX at pos={pos}");
+        }
+    }
+
+    fn sm64(s: &mut u64) -> u64 {
+        *s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *s;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    fn rand_str(s: &mut u64, maxlen: usize) -> String {
+        let n = (sm64(s) as usize % maxlen) + 1;
+        (0..n).map(|_| ((sm64(s) % 26) as u8 + b'a') as char).collect()
+    }
+
+    fn rand_strvec(s: &mut u64, maxn: usize, maxlen: usize) -> Vec<String> {
+        let n = sm64(s) as usize % (maxn + 1);
+        (0..n).map(|_| rand_str(s, maxlen)).collect()
+    }
+
+    /// Encoding then decoding a canonical, in-bounds spec must reproduce it
+    /// exactly, across randomized field values and edge cases (absent optionals,
+    /// negative `oom_score_adj` round-tripped through `u32`, large bitmasks). This
+    /// guards against an asymmetry between the encoder and decoder (a field
+    /// written but not read back, or vice versa).
+    #[test]
+    fn encode_decode_round_trips_random_specs() {
+        let mut state: u64 = 0xCAFE_F00D_1234_5678;
+        for _ in 0..5_000 {
+            let caps_present = sm64(&mut state) & 1 == 0;
+            let oom = if sm64(&mut state) & 1 == 0 {
+                Some(sm64(&mut state) as i32) // exercises negative values via u32
+            } else {
+                None
+            };
+            let n_maps = sm64(&mut state) as usize % 3;
+            let n_rl = sm64(&mut state) as usize % 3;
+            let n_mounts = sm64(&mut state) as usize % 3;
+            let spec = DomainSpec {
+                rootfs: rand_str(&mut state, 24), // required + non-empty for Create
+                hostname: if sm64(&mut state) & 1 == 0 { rand_str(&mut state, 16) } else { String::new() },
+                argv: {
+                    // required: at least one arg.
+                    let mut a = vec![rand_str(&mut state, 16)];
+                    a.extend(rand_strvec(&mut state, 3, 16));
+                    a
+                },
+                env: rand_strvec(&mut state, 4, 16),
+                namespaces: sm64(&mut state) as u32,
+                uid_maps: (0..n_maps)
+                    .map(|_| IdMap {
+                        container_id: sm64(&mut state) as u32,
+                        host_id: sm64(&mut state) as u32,
+                        size: sm64(&mut state) as u32,
+                    })
+                    .collect(),
+                gid_maps: (0..n_maps)
+                    .map(|_| IdMap {
+                        container_id: sm64(&mut state) as u32,
+                        host_id: sm64(&mut state) as u32,
+                        size: sm64(&mut state) as u32,
+                    })
+                    .collect(),
+                flags: sm64(&mut state),
+                caps_present,
+                cap_bounding: if caps_present { sm64(&mut state) } else { 0 },
+                cap_effective: if caps_present { sm64(&mut state) } else { 0 },
+                cap_permitted: if caps_present { sm64(&mut state) } else { 0 },
+                cap_inheritable: if caps_present { sm64(&mut state) } else { 0 },
+                cap_ambient: if caps_present { sm64(&mut state) } else { 0 },
+                seccomp: {
+                    let n = sm64(&mut state) as usize % 16;
+                    (0..n).map(|_| (sm64(&mut state) & 0xff) as u8).collect()
+                },
+                masked_paths: rand_strvec(&mut state, 4, 16),
+                readonly_paths: rand_strvec(&mut state, 4, 16),
+                rlimits: (0..n_rl)
+                    .map(|_| Rlimit {
+                        resource: sm64(&mut state) as u32 % 16,
+                        soft: sm64(&mut state),
+                        hard: sm64(&mut state),
+                    })
+                    .collect(),
+                oom_score_adj: oom,
+                uid: sm64(&mut state) as u32,
+                gid: sm64(&mut state) as u32,
+                mounts: (0..n_mounts)
+                    .map(|_| Mount {
+                        destination: rand_str(&mut state, 16),
+                        fs_type: rand_str(&mut state, 8),
+                        source: rand_str(&mut state, 16),
+                        flags: sm64(&mut state),
+                    })
+                    .collect(),
+                landlock_rw_paths: rand_strvec(&mut state, 4, 16),
+            };
+            let buf = spec.encode(Op::Create).expect("canonical in-bounds spec must encode");
+            let (op, decoded) = decode(&buf).expect("must decode what we encoded");
+            assert_eq!(op, Op::Create);
+            assert_eq!(decoded, spec, "encode/decode round-trip mismatch");
+        }
+    }
 }
