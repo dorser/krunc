@@ -5,6 +5,23 @@ all-Rust, OCI-integrated, mainline-credible **kernel workload/security-domain
 object** (`krunc_domain`). Design: `docs/ARCHITECTURE.md`; threat model:
 `docs/SECURITY.md`.
 
+## Current direction: a self-contained, patch-free module
+The goal is for `krunc.ko` to load on an **unmodified kernel** (no vmlinux source
+patch) — only a vanilla `CONFIG_RUST=y` build, which is inherent to any Rust
+module. Two steps toward that:
+- **DONE — drop seccomp + Landlock.** These were the only confinement layers that
+  required in-tree kernel patches (they used file-static seccomp/Landlock helpers
+  that a module cannot reach). They are removed; hardening is now done entirely
+  from the module (namespaces, capability dropping, `no_new_privs`, in-kernel
+  chroot + mounts, masked/read-only paths, cgroups). Further syscall/LSM-level
+  hardening is deferred to **eBPF-LSM** (attached at runtime, no kernel patch).
+- **NEXT — remove the `krunc_exports.c` shim.** The remaining `vmlinux` patch just
+  exports/wraps internal symbols (`user_mode_thread`, `kernel_execve`,
+  `set_fs_root`, `path_mount`, `vfs_mkdir`, `do_exit`, cred/rlimit helpers). Move
+  this into the module by resolving the symbols at load time via a
+  `kprobe → kallsyms_lookup_name` bootstrap, then delete the shim. Result: a
+  self-contained `.ko` on a vanilla `CONFIG_RUST` kernel.
+
 ## Principles (non-negotiable)
 - **All Rust.** The kernel module and the userspace adapter/CLI are Rust. (The
   v1 Go CLI + Go conformance tool are replaced.)

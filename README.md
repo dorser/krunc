@@ -138,9 +138,9 @@ container's capabilities are dropped to exactly the bounding set
 This is the API a higher-level runtime expects: **containerd** drives an OCI
 runtime through `containerd-shim-runc-v2` (via the `go-runc` client, with
 `BinaryName` selecting the binary). An earlier Go prototype was verified driving
-krunc through the full lifecycle; the project is now all-Rust and a native
-shim plus the remaining confinement (mounts/pivot_root, seccomp, cgroups,
-Landlock) are tracked in [`docs/ROADMAP.md`](docs/ROADMAP.md).
+krunc through the full lifecycle; the project is now all-Rust and the remaining
+work (a self-contained module via runtime symbol resolution, `pivot_root`) is
+tracked in [`docs/ROADMAP.md`](docs/ROADMAP.md).
 
 ## Repository layout
 
@@ -222,7 +222,7 @@ A runc-compatible CLI means containerd *can* drive krunc as its runtime
 (`scripts/run-containerd.sh`, krunc as the `io.containerd.runc.v2` runc binary).
 However, containerd's/nerdctl's **default** generated configs include properties
 krunc does not model — a device cgroup (`linux.resources.devices`), `sysctls`,
-argument-matched seccomp rules, and (for `-it`) `process.terminal` — so krunc
+a `seccomp` profile, and (for `-it`) `process.terminal` — so krunc
 **rejects** them rather than running a container that does not match its spec.
 Driving krunc from containerd therefore requires reducing the runtime config to
 krunc's supported subset (or implementing those properties spec-faithfully).
@@ -236,13 +236,11 @@ it is not production software. Notable simplifications and known limitations:
 
 - **Config boundary (strict, per runtime-spec).** krunc applies a defined subset
   of `config.json` (args, env, cwd, root, hostname, namespaces, capabilities,
-  seccomp [incl. `SCMP_CMP_EQ`/`SCMP_CMP_MASKED_EQ` argument matchers], cgroups
-  pids/memory/cpu, mounts, masked/read-only paths, rlimits, oom score, user,
-  Landlock-sealed read-only rootfs) and **rejects** — rather than silently
-  ignoring — any other configured property (e.g. `process.terminal`,
-  `process.user.umask`, `linux.sysctl`, `linux.devices`, `linux.resources.devices`,
-  `linux.resources.memory.swap`, `hooks`, `seccomp.flags`/`listenerPath`, the
-  ordered/not-equal seccomp comparison operators, user-namespace mappings,
+  cgroups pids/memory/cpu, mounts, masked/read-only paths, rlimits, oom score,
+  user) and **rejects** — rather than silently ignoring — any other configured
+  property (e.g. `process.terminal`, `process.user.umask`, `linux.seccomp`,
+  `root.readonly`, `linux.sysctl`, `linux.devices`, `linux.resources.devices`,
+  `linux.resources.memory.swap`, `hooks`, user-namespace mappings,
   id-mapped mounts, and non-flag mount options such as `size=`/`mode=` or
   propagation flags). Unmodeled fields are rejected at parse time
   (`deny_unknown_fields`), not dropped. This follows the runtime-spec `create`
