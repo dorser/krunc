@@ -7,18 +7,23 @@
 //! ```text
 //!     A = seccomp_data.arch
 //!     if A != AUDIT_ARCH_X86_64: return KILL_PROCESS   // refuse foreign arch
+//!     // one self-contained block per (syscall, rule):
 //!     A = seccomp_data.nr
-//!     if A == nr_1: return action_1                     // per-syscall rules
+//!     if A != nr_1: goto next_block                     // wrong syscall
+//!     <compare each argument matcher; mismatch -> next_block>
+//!     return action_1
 //!     ...
 //!     return default_action
 //! ```
 //!
-//! Only the x86-64 native ABI is targeted (the kernel krunc runs on). Rules that
-//! carry argument matchers are rejected rather than silently mis-compiled into a
-//! weaker, number-only policy (see [`OciError::Unsupported`]); the runtime-spec
-//! requires applying a configured property as specified or erroring.
+//! Only the x86-64 native ABI is targeted (the kernel krunc runs on). The
+//! equality argument matchers (`SCMP_CMP_EQ`, `SCMP_CMP_MASKED_EQ`) are compiled
+//! into real 64-bit BPF comparisons; the ordered and not-equal operators cannot
+//! be expressed without early-exit jumps in this block scheme and are rejected
+//! rather than silently dropped (see [`OciError::Unsupported`]), because the
+//! runtime-spec requires applying a configured property as specified or erroring.
 
-use crate::{OciError, Seccomp};
+use crate::{OciError, Seccomp, SeccompArg};
 use krunc_abi::MAX_SECCOMP;
 
 /// `struct sock_filter` (uapi/linux/filter.h): a single classic-BPF instruction.
@@ -54,14 +59,19 @@ const BPF_JMP: u16 = 0x05;
 const BPF_JEQ: u16 = 0x10;
 const BPF_RET: u16 = 0x06;
 const BPF_K: u16 = 0x00;
+const BPF_ALU: u16 = 0x04;
+const BPF_AND: u16 = 0x50;
 
 const LD_W_ABS: u16 = BPF_LD | BPF_W | BPF_ABS;
 const JMP_JEQ_K: u16 = BPF_JMP | BPF_JEQ | BPF_K;
+const ALU_AND_K: u16 = BPF_ALU | BPF_AND | BPF_K;
 const RET_K: u16 = BPF_RET | BPF_K;
 
 // `struct seccomp_data` field offsets (uapi/linux/seccomp.h).
 const SD_NR: u32 = 0;
 const SD_ARCH: u32 = 4;
+/// Offset of `args[0]`; each argument is a `u64` (low word first on x86-64).
+const SD_ARGS: u32 = 16;
 
 /// `AUDIT_ARCH_X86_64` (uapi/linux/audit.h): the only ABI krunc targets.
 const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
@@ -96,39 +106,32 @@ fn action_ret(action: &str, errno: Option<u32>) -> Result<u32, OciError> {
 }
 
 /// Compile a parsed OCI seccomp policy into a serialized `sock_filter[]` blob.
+///
+/// Each `(syscall, rule)` becomes a self-contained block: load the syscall
+/// number, compare it, then compare each configured argument matcher. Every
+/// mismatch falls through to the next block; only a full match returns the
+/// rule's action. Argument matchers are compiled into real BPF comparisons
+/// (not silently dropped), so the installed filter enforces exactly the
+/// predicate the caller asked for.
 pub fn compile(s: &Seccomp) -> Result<Vec<u8>, OciError> {
     let default_ret = action_ret(&s.default_action, s.default_errno_ret)?;
 
-    // Resolve each rule to (syscall_nr, return value). Unknown syscall names do
-    // not exist on this architecture and are skipped, matching libseccomp.
-    let mut rules: Vec<(u32, u32)> = Vec::new();
-    for rule in &s.syscalls {
-        // Argument matchers are rejected rather than silently mis-compiled into a
-        // weaker, number-only policy: the runtime-spec requires applying a
-        // configured property as specified or erroring, and silently dropping the
-        // argument predicate would weaken the syscall filter the caller asked for.
-        if !rule.args.is_empty() {
-            return Err(OciError::Unsupported("seccomp argument matchers"));
-        }
-        let ret = action_ret(&rule.action, rule.errno_ret)?;
-        for name in &rule.names {
-            if let Some(nr) = syscall_nr(name) {
-                rules.push((nr, ret));
-            }
-        }
-    }
-
-    let mut prog: Vec<SockFilter> = Vec::with_capacity(rules.len() * 2 + 5);
+    let mut prog: Vec<SockFilter> = Vec::new();
     // Architecture guard: a foreign-ABI syscall (e.g. i386 on x86-64) bypasses
     // number-based filters, so refuse it outright.
     prog.push(SockFilter::stmt(LD_W_ABS, SD_ARCH));
     prog.push(SockFilter::jump(JMP_JEQ_K, AUDIT_ARCH_X86_64, 1, 0));
     prog.push(SockFilter::stmt(RET_K, RET_KILL_PROCESS));
-    // Load the syscall number once, then test each rule (first match wins).
-    prog.push(SockFilter::stmt(LD_W_ABS, SD_NR));
-    for (nr, ret) in &rules {
-        prog.push(SockFilter::jump(JMP_JEQ_K, *nr, 0, 1));
-        prog.push(SockFilter::stmt(RET_K, *ret));
+
+    for rule in &s.syscalls {
+        let ret = action_ret(&rule.action, rule.errno_ret)?;
+        // Unknown syscall names do not exist on this architecture and are
+        // skipped, matching libseccomp.
+        for name in &rule.names {
+            if let Some(nr) = syscall_nr(name) {
+                append_syscall_block(&mut prog, nr, &rule.args, ret)?;
+            }
+        }
     }
     prog.push(SockFilter::stmt(RET_K, default_ret));
 
@@ -143,6 +146,86 @@ pub fn compile(s: &Seccomp) -> Result<Vec<u8>, OciError> {
         return Err(OciError::Unsupported("seccomp program exceeds ABI limit"));
     }
     Ok(bytes)
+}
+
+/// Append a block matching syscall `nr` with every matcher in `args` satisfied
+/// (matchers are ANDed, as in the OCI spec); the block returns `ret` on a full
+/// match and otherwise falls through to whatever follows it.
+fn append_syscall_block(
+    prog: &mut Vec<SockFilter>,
+    nr: u32,
+    args: &[SeccompArg],
+    ret: u32,
+) -> Result<(), OciError> {
+    // Indices of jump instructions whose "fail" edge must target the end of the
+    // block (the first instruction after this block's terminating RET).
+    let mut fails: Vec<(usize, bool)> = Vec::new();
+    prog.push(SockFilter::stmt(LD_W_ABS, SD_NR));
+    prog.push(SockFilter::jump(JMP_JEQ_K, nr, 0, 0));
+    fails.push((prog.len() - 1, false));
+    for a in args {
+        emit_arg_eq(prog, &mut fails, a)?;
+    }
+    prog.push(SockFilter::stmt(RET_K, ret));
+    let end = prog.len();
+    for (idx, is_jt) in fails {
+        let off = end - idx - 1;
+        if off > u8::MAX as usize {
+            return Err(OciError::Unsupported("seccomp argument block too large"));
+        }
+        if is_jt {
+            prog[idx].jt = off as u8;
+        } else {
+            prog[idx].jf = off as u8;
+        }
+    }
+    Ok(())
+}
+
+/// Emit one equality argument matcher, comparing the 64-bit syscall argument as
+/// two 32-bit halves. `SCMP_CMP_EQ` requires both halves to equal `value`;
+/// `SCMP_CMP_MASKED_EQ` requires `(arg & valueTwo) == value` per half. Each
+/// failing comparison records a jump to the end of the enclosing block. Ordered
+/// and not-equal operators are rejected rather than mis-compiled.
+fn emit_arg_eq(
+    prog: &mut Vec<SockFilter>,
+    fails: &mut Vec<(usize, bool)>,
+    a: &SeccompArg,
+) -> Result<(), OciError> {
+    if a.index > 5 {
+        return Err(OciError::Unsupported("seccomp argument index out of range"));
+    }
+    let off = SD_ARGS + a.index * 8;
+    let vlo = (a.value & 0xffff_ffff) as u32;
+    let vhi = (a.value >> 32) as u32;
+    match a.op.as_str() {
+        "SCMP_CMP_EQ" => {
+            prog.push(SockFilter::stmt(LD_W_ABS, off));
+            prog.push(SockFilter::jump(JMP_JEQ_K, vlo, 0, 0));
+            fails.push((prog.len() - 1, false));
+            prog.push(SockFilter::stmt(LD_W_ABS, off + 4));
+            prog.push(SockFilter::jump(JMP_JEQ_K, vhi, 0, 0));
+            fails.push((prog.len() - 1, false));
+        }
+        "SCMP_CMP_MASKED_EQ" => {
+            let mlo = (a.value_two & 0xffff_ffff) as u32;
+            let mhi = (a.value_two >> 32) as u32;
+            prog.push(SockFilter::stmt(LD_W_ABS, off));
+            prog.push(SockFilter::stmt(ALU_AND_K, mlo));
+            prog.push(SockFilter::jump(JMP_JEQ_K, vlo, 0, 0));
+            fails.push((prog.len() - 1, false));
+            prog.push(SockFilter::stmt(LD_W_ABS, off + 4));
+            prog.push(SockFilter::stmt(ALU_AND_K, mhi));
+            prog.push(SockFilter::jump(JMP_JEQ_K, vhi, 0, 0));
+            fails.push((prog.len() - 1, false));
+        }
+        _ => {
+            return Err(OciError::Unsupported(
+                "seccomp argument operator (only SCMP_CMP_EQ and SCMP_CMP_MASKED_EQ)",
+            ))
+        }
+    }
+    Ok(())
 }
 
 /// x86-64 syscall name → number (`arch/x86/entry/syscalls/syscall_64.tbl`,
@@ -570,19 +653,21 @@ mod tests {
         };
         let prog = decode(&compile(&s).unwrap());
 
-        // Header: load arch, branch, kill foreign, load nr.
+        // Header: load arch, branch, kill foreign.
         assert_eq!(prog[0], SockFilter::stmt(LD_W_ABS, SD_ARCH));
         assert_eq!(prog[1], SockFilter::jump(JMP_JEQ_K, AUDIT_ARCH_X86_64, 1, 0));
         assert_eq!(prog[2], SockFilter::stmt(RET_K, RET_KILL_PROCESS));
+        // chmod(90) block: load nr, match, ERRNO(EPERM); mismatch falls through.
         assert_eq!(prog[3], SockFilter::stmt(LD_W_ABS, SD_NR));
-        // chmod(90) -> ERRNO(EPERM); fchmodat(268) -> ERRNO(EPERM).
         assert_eq!(prog[4], SockFilter::jump(JMP_JEQ_K, 90, 0, 1));
         assert_eq!(prog[5], SockFilter::stmt(RET_K, RET_ERRNO | 1));
-        assert_eq!(prog[6], SockFilter::jump(JMP_JEQ_K, 268, 0, 1));
-        assert_eq!(prog[7], SockFilter::stmt(RET_K, RET_ERRNO | 1));
+        // fchmodat(268) block.
+        assert_eq!(prog[6], SockFilter::stmt(LD_W_ABS, SD_NR));
+        assert_eq!(prog[7], SockFilter::jump(JMP_JEQ_K, 268, 0, 1));
+        assert_eq!(prog[8], SockFilter::stmt(RET_K, RET_ERRNO | 1));
         // Default allow.
-        assert_eq!(prog[8], SockFilter::stmt(RET_K, RET_ALLOW));
-        assert_eq!(prog.len(), 9);
+        assert_eq!(prog[9], SockFilter::stmt(RET_K, RET_ALLOW));
+        assert_eq!(prog.len(), 10);
     }
 
     #[test]
@@ -606,10 +691,10 @@ mod tests {
     }
 
     #[test]
-    fn arg_matchers_rejected() {
-        // Argument matchers are rejected (not silently coarsened): krunc cannot
-        // honor the argument predicate, so per the runtime-spec it must error
-        // rather than install a weaker policy than the caller specified.
+    fn unsupported_arg_op_rejected() {
+        // EQ and MASKED_EQ compile to real comparisons; ordered/not-equal
+        // operators cannot be expressed in the block scheme without early-exit
+        // jumps, so per the runtime-spec they are rejected rather than dropped.
         let s = Seccomp {
             default_action: "SCMP_ACT_ALLOW".into(),
             default_errno_ret: None,
@@ -618,7 +703,12 @@ mod tests {
                 names: vec!["ioctl".into()],
                 action: "SCMP_ACT_ERRNO".into(),
                 errno_ret: None,
-                args: vec![serde_json::json!({"index": 1})],
+                args: vec![SeccompArg {
+                    index: 1,
+                    value: 0,
+                    value_two: 0,
+                    op: "SCMP_CMP_LT".into(),
+                }],
             }],
         };
         assert!(matches!(compile(&s), Err(OciError::Unsupported(_))));
@@ -631,5 +721,174 @@ mod tests {
             ..Default::default()
         };
         assert!(matches!(compile(&s), Err(OciError::Unsupported(_))));
+    }
+
+    /// A minimal classic-BPF interpreter for the opcode subset this compiler
+    /// emits, used to prove generated filters return the intended action.
+    fn run_bpf(prog: &[SockFilter], data: &[u8]) -> u32 {
+        let mut a: u32 = 0;
+        let mut pc: usize = 0;
+        loop {
+            let insn = prog[pc];
+            if insn.code == LD_W_ABS {
+                let o = insn.k as usize;
+                a = u32::from_le_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]]);
+                pc += 1;
+            } else if insn.code == ALU_AND_K {
+                a &= insn.k;
+                pc += 1;
+            } else if insn.code == JMP_JEQ_K {
+                let take = if a == insn.k { insn.jt } else { insn.jf } as usize;
+                pc += 1 + take;
+            } else if insn.code == RET_K {
+                return insn.k;
+            } else {
+                panic!("interpreter: unhandled opcode {:#06x}", insn.code);
+            }
+        }
+    }
+
+    fn seccomp_data(nr: u32, arch: u32, args: [u64; 6]) -> Vec<u8> {
+        let mut d = Vec::with_capacity(64);
+        d.extend_from_slice(&nr.to_le_bytes());
+        d.extend_from_slice(&arch.to_le_bytes());
+        d.extend_from_slice(&0u64.to_le_bytes()); // instruction_pointer
+        for a in args {
+            d.extend_from_slice(&a.to_le_bytes());
+        }
+        d
+    }
+
+    #[test]
+    fn eq_arg_matcher_compiles_and_runs() {
+        // ioctl(fd, TCGETS=0x5401, ...) -> ERRNO(EPERM); other ioctls allowed.
+        let s = Seccomp {
+            default_action: "SCMP_ACT_ALLOW".into(),
+            default_errno_ret: None,
+            architectures: vec![],
+            syscalls: vec![SeccompSyscall {
+                names: vec!["ioctl".into()],
+                action: "SCMP_ACT_ERRNO".into(),
+                errno_ret: Some(1),
+                args: vec![SeccompArg {
+                    index: 1,
+                    value: 0x5401,
+                    value_two: 0,
+                    op: "SCMP_CMP_EQ".into(),
+                }],
+            }],
+        };
+        let prog = decode(&compile(&s).unwrap());
+
+        // Matching syscall + matching arg -> ERRNO(EPERM).
+        let hit = seccomp_data(16, AUDIT_ARCH_X86_64, [3, 0x5401, 0, 0, 0, 0]);
+        assert_eq!(run_bpf(&prog, &hit), RET_ERRNO | 1);
+        // Right syscall, wrong arg -> falls through to default ALLOW.
+        let wrong_arg = seccomp_data(16, AUDIT_ARCH_X86_64, [3, 0x1234, 0, 0, 0, 0]);
+        assert_eq!(run_bpf(&prog, &wrong_arg), RET_ALLOW);
+        // Different syscall with the same arg value -> ALLOW.
+        let other_call = seccomp_data(0, AUDIT_ARCH_X86_64, [3, 0x5401, 0, 0, 0, 0]);
+        assert_eq!(run_bpf(&prog, &other_call), RET_ALLOW);
+        // Foreign architecture -> killed regardless of arguments.
+        let foreign = seccomp_data(16, 0x4000_0003, [3, 0x5401, 0, 0, 0, 0]);
+        assert_eq!(run_bpf(&prog, &foreign), RET_KILL_PROCESS);
+    }
+
+    #[test]
+    fn eq_arg_matcher_checks_high_word() {
+        // A value above 2^32 must compare both 32-bit halves, not just the low
+        // one, otherwise the filter would match on a truncated argument.
+        let s = Seccomp {
+            default_action: "SCMP_ACT_ALLOW".into(),
+            default_errno_ret: None,
+            architectures: vec![],
+            syscalls: vec![SeccompSyscall {
+                names: vec!["read".into()],
+                action: "SCMP_ACT_KILL_PROCESS".into(),
+                errno_ret: None,
+                args: vec![SeccompArg {
+                    index: 0,
+                    value: 0x1_0000_0002,
+                    value_two: 0,
+                    op: "SCMP_CMP_EQ".into(),
+                }],
+            }],
+        };
+        let prog = decode(&compile(&s).unwrap());
+
+        let exact = seccomp_data(0, AUDIT_ARCH_X86_64, [0x1_0000_0002, 0, 0, 0, 0, 0]);
+        assert_eq!(run_bpf(&prog, &exact), RET_KILL_PROCESS);
+        // Same low word, zero high word -> must NOT match.
+        let low_only = seccomp_data(0, AUDIT_ARCH_X86_64, [0x0000_0002, 0, 0, 0, 0, 0]);
+        assert_eq!(run_bpf(&prog, &low_only), RET_ALLOW);
+    }
+
+    #[test]
+    fn masked_eq_arg_matcher_runs() {
+        // clone with CLONE_NEWUSER-style masked bit set -> ERRNO; mirrors how the
+        // moby/containerd default profile gates clone flags.
+        let s = Seccomp {
+            default_action: "SCMP_ACT_ALLOW".into(),
+            default_errno_ret: None,
+            architectures: vec![],
+            syscalls: vec![SeccompSyscall {
+                names: vec!["clone".into()],
+                action: "SCMP_ACT_ERRNO".into(),
+                errno_ret: Some(22),
+                args: vec![SeccompArg {
+                    index: 0,
+                    value: 0x10,
+                    value_two: 0xff,
+                    op: "SCMP_CMP_MASKED_EQ".into(),
+                }],
+            }],
+        };
+        let prog = decode(&compile(&s).unwrap());
+
+        // (0x110 & 0xff) == 0x10 -> match.
+        let masked_hit = seccomp_data(56, AUDIT_ARCH_X86_64, [0x110, 0, 0, 0, 0, 0]);
+        assert_eq!(run_bpf(&prog, &masked_hit), RET_ERRNO | 22);
+        // (0x120 & 0xff) == 0x20 != 0x10 -> no match.
+        let masked_miss = seccomp_data(56, AUDIT_ARCH_X86_64, [0x120, 0, 0, 0, 0, 0]);
+        assert_eq!(run_bpf(&prog, &masked_miss), RET_ALLOW);
+    }
+
+    #[test]
+    fn multiple_arg_matchers_are_anded() {
+        // Both predicates must hold for the rule to fire (OCI ANDs a rule's args).
+        let s = Seccomp {
+            default_action: "SCMP_ACT_ALLOW".into(),
+            default_errno_ret: None,
+            architectures: vec![],
+            syscalls: vec![SeccompSyscall {
+                names: vec!["socket".into()],
+                action: "SCMP_ACT_ERRNO".into(),
+                errno_ret: Some(1),
+                args: vec![
+                    SeccompArg {
+                        index: 0,
+                        value: 2,
+                        value_two: 0,
+                        op: "SCMP_CMP_EQ".into(),
+                    },
+                    SeccompArg {
+                        index: 1,
+                        value: 1,
+                        value_two: 0,
+                        op: "SCMP_CMP_EQ".into(),
+                    },
+                ],
+            }],
+        };
+        let prog = decode(&compile(&s).unwrap());
+
+        let both = seccomp_data(41, AUDIT_ARCH_X86_64, [2, 1, 0, 0, 0, 0]);
+        assert_eq!(run_bpf(&prog, &both), RET_ERRNO | 1);
+        // First matches, second does not -> no match.
+        let only_first = seccomp_data(41, AUDIT_ARCH_X86_64, [2, 9, 0, 0, 0, 0]);
+        assert_eq!(run_bpf(&prog, &only_first), RET_ALLOW);
+        // Second matches, first does not -> no match.
+        let only_second = seccomp_data(41, AUDIT_ARCH_X86_64, [9, 1, 0, 0, 0, 0]);
+        assert_eq!(run_bpf(&prog, &only_second), RET_ALLOW);
     }
 }

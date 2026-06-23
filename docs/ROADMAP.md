@@ -154,16 +154,20 @@ not in one shot.
   shim's stdio fifos. **However**, krunc is a *strict* runtime: per the
   runtime-spec `create` rule (a runtime MUST error on a property it cannot apply),
   it rejects configs carrying properties outside its supported subset. containerd's
-  and nerdctl's default configs include a device cgroup (`linux.resources.devices`),
-  `sysctls`, and argument-matched seccomp, so `ctr run`/`nerdctl run` with default
-  configs are **rejected by design** (krunc refuses rather than silently dropping
-  those properties). Earlier shortcuts that silently weakened the policy to make
-  containerd "work" (coarsening seccomp arg matchers) were reverted as
-  convention-driven, non-spec compromises. Running under containerd requires a
-  reduced runtime config within krunc's subset, or implementing those properties
-  spec-faithfully (a future, in-spec item — e.g. the device cgroup). The
-  CLI-rootfs prep (create mount destinations, PATH-resolve `argv[0]` per the
-  spec's execvp semantics) and the privileged-time seccomp install remain.
+  and nerdctl's default configs include a device cgroup (`linux.resources.devices`)
+  and `sysctls`, so `ctr run`/`nerdctl run` with default configs are **rejected by
+  design** (krunc refuses rather than silently dropping those properties). An
+  earlier shortcut that silently weakened the policy to make containerd "work"
+  (coarsening seccomp argument matchers into a number-only filter) was reverted as
+  a convention-driven, non-spec compromise; the spec-correct resolution shipped
+  instead — krunc now compiles the equality argument matchers (`SCMP_CMP_EQ`,
+  `SCMP_CMP_MASKED_EQ`, which is all the moby/containerd default profile uses) into
+  real 64-bit BPF comparisons, so argument-matched seccomp is no longer a blocker.
+  Running under containerd still requires a reduced runtime config within krunc's
+  subset, or implementing the remaining properties spec-faithfully (a future,
+  in-spec item — e.g. the device cgroup). The CLI-rootfs prep (create mount
+  destinations, PATH-resolve `argv[0]` per the spec's execvp semantics) and the
+  privileged-time seccomp install remain.
 - **mounts (done) — full containerd mount set.** The kernel now materializes
   nested mountpoints (`krunc_mkdir` → `vfs_mkdir`) before each filesystem mount,
   so a stock containerd/nerdctl `/dev/pts`, `/dev/shm`, `/dev/mqueue`,

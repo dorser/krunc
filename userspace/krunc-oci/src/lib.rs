@@ -190,8 +190,9 @@ pub struct Linux {
     pub extra: HashMap<String, serde_json::Value>,
 }
 
-/// `config.json` `linux.seccomp`: the syscall policy. krunc compiles the
-/// arg-less subset (see [`seccomp::compile`]) into a classic-BPF program.
+/// `config.json` `linux.seccomp`: the syscall policy. krunc compiles it (see
+/// [`seccomp::compile`]) into a classic-BPF program, including `SCMP_CMP_EQ` and
+/// `SCMP_CMP_MASKED_EQ` argument matchers.
 #[derive(Debug, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct Seccomp {
@@ -220,10 +221,29 @@ pub struct SeccompSyscall {
     /// errno returned when `action` is `SCMP_ACT_ERRNO` (default EPERM).
     #[serde(default)]
     pub errno_ret: Option<u32>,
-    /// Argument matchers. krunc does not honor these, so a non-empty list makes
-    /// compilation fail rather than silently weaken the policy.
+    /// Argument matchers (ANDed together). krunc compiles the equality ops
+    /// (`SCMP_CMP_EQ`, `SCMP_CMP_MASKED_EQ`) into real BPF argument comparisons;
+    /// other ops are rejected rather than silently dropped.
     #[serde(default)]
-    pub args: Vec<serde_json::Value>,
+    pub args: Vec<SeccompArg>,
+}
+
+/// One `config.json` `linux.seccomp.syscalls[].args[]` argument matcher.
+#[derive(Debug, Deserialize, Default, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct SeccompArg {
+    /// Index of the syscall argument (0..=5).
+    #[serde(default)]
+    pub index: u32,
+    /// The value to compare against.
+    #[serde(default)]
+    pub value: u64,
+    /// The second value (the mask, for `SCMP_CMP_MASKED_EQ`).
+    #[serde(default)]
+    pub value_two: u64,
+    /// The comparison operator (`SCMP_CMP_*`).
+    #[serde(default)]
+    pub op: String,
 }
 
 /// `config.json` `linux.resources` (the subset krunc enforces via cgroup v2).

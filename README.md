@@ -236,14 +236,15 @@ it is not production software. Notable simplifications and known limitations:
 
 - **Config boundary (strict, per runtime-spec).** krunc applies a defined subset
   of `config.json` (args, env, cwd, root, hostname, namespaces, capabilities,
-  seccomp [no argument matchers], cgroups pids/memory/cpu, mounts, masked/
-  read-only paths, rlimits, oom score, user, Landlock-sealed read-only rootfs)
-  and **rejects** — rather than silently ignoring — any other configured property
-  (e.g. `process.terminal`, `linux.sysctl`, `linux.devices`,
-  `linux.resources.devices`, `hooks`, seccomp argument matchers, user-namespace
-  mappings). This follows the runtime-spec `create` rule that a runtime MUST error
-  on a property it cannot apply, and avoids quietly running a container that does
-  not match its requested configuration.
+  seccomp [incl. `SCMP_CMP_EQ`/`SCMP_CMP_MASKED_EQ` argument matchers], cgroups
+  pids/memory/cpu, mounts, masked/read-only paths, rlimits, oom score, user,
+  Landlock-sealed read-only rootfs) and **rejects** — rather than silently
+  ignoring — any other configured property (e.g. `process.terminal`,
+  `linux.sysctl`, `linux.devices`, `linux.resources.devices`, `hooks`, the
+  ordered/not-equal seccomp comparison operators, user-namespace mappings). This
+  follows the runtime-spec `create` rule that a runtime MUST error on a property
+  it cannot apply, and avoids quietly running a container that does not match its
+  requested configuration.
 - **containerd / nerdctl.** krunc is runc-CLI-compatible, so containerd's
   `io.containerd.runc.v2` shim can drive it (krunc as the runc binary). But the
   default configs containerd/nerdctl generate use properties outside krunc's
