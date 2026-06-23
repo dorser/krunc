@@ -208,7 +208,7 @@ struct ContainerCtx {
     oom_score_adj: Option<i32>, // OOM score adjustment applied before exec
     uid: u32,                  // target uid (process.user.uid)
     gid: u32,                  // target gid (process.user.gid)
-    mounts: KVec<MountSpec>,   // mounts to perform (empty -> default /proc + /sys)
+    mounts: KVec<MountSpec>,   // mounts to perform (exactly config.mounts[], in order)
     landlock_rw: KVec<KVec<u8>>, // Landlock writable paths (empty = no fs seal)
     ctrl: Option<Arc<ContainerControl>>, // Some -> two-phase (created) container
 }
@@ -443,7 +443,7 @@ fn handle_text_command(buf: &[u8]) -> Result {
         None,
         0,
         0,
-        KVec::new(),
+        default_proc_sys_mounts()?,
         KVec::new(),
     )?;
     pr_info!("started container id={} pid={}\n", id, pid);
@@ -695,6 +695,33 @@ fn read_mounts_k(sr: &mut BReader<'_>) -> Result<KVec<MountSpec>> {
             v.push(MountSpec { destination: dest, fs_type, source, flags }, GFP_KERNEL)?;
         }
     }
+    Ok(v)
+}
+
+/// Build the default `/proc` + `/sys` mounts for the raw text-control interface,
+/// which (unlike the OCI ABI path) cannot specify mounts of its own. The OCI
+/// path performs exactly the configured mounts; this default applies only to the
+/// `run …` text command so its demo container still gets a working /proc + /sys.
+fn default_proc_sys_mounts() -> Result<KVec<MountSpec>> {
+    let mut v: KVec<MountSpec> = KVec::new();
+    v.push(
+        MountSpec {
+            destination: to_cvec(b"/proc")?,
+            fs_type: to_cvec(b"proc")?,
+            source: to_cvec(b"proc")?,
+            flags: 0,
+        },
+        GFP_KERNEL,
+    )?;
+    v.push(
+        MountSpec {
+            destination: to_cvec(b"/sys")?,
+            fs_type: to_cvec(b"sysfs")?,
+            source: to_cvec(b"sysfs")?,
+            flags: 0,
+        },
+        GFP_KERNEL,
+    )?;
     Ok(v)
 }
 
@@ -1002,28 +1029,10 @@ fn apply_path_confinement(masked: &KVec<KVec<u8>>, readonly: &KVec<KVec<u8>>) {
 }
 
 /// Perform the container's configured mounts in order, in its private mount
-/// namespace while still privileged. If none are configured, fall back to a
-/// private `/proc` + `/sys` (what an unconfigured container still needs).
+/// namespace while still privileged. Only the mounts in `config.mounts[]` are
+/// performed — krunc adds none of its own (per the runtime-spec, the runtime
+/// performs exactly the configured mounts).
 fn apply_mounts(mounts: &KVec<MountSpec>) {
-    if mounts.is_empty() {
-        // SAFETY: FFI calls with NUL-terminated C string literals.
-        unsafe {
-            krunc_mount(
-                c"proc".as_ptr() as *const c_char,
-                c"/proc".as_ptr() as *const c_char,
-                c"proc".as_ptr() as *const c_char,
-                0,
-            );
-            krunc_mount(
-                c"sysfs".as_ptr() as *const c_char,
-                c"/sys".as_ptr() as *const c_char,
-                c"sysfs".as_ptr() as *const c_char,
-                0,
-            );
-        }
-        return;
-    }
-
     for i in 0..mounts.len() {
         let m = &mounts[i];
         if m.destination.len() <= 1 {
@@ -1137,7 +1146,7 @@ unsafe extern "C" fn container_entry(arg: *mut c_void) -> c_int {
     // Perform the container's mounts (config-driven, in order), while still
     // privileged, in its CLONE_NEWNS mount namespace. The confined container
     // itself cannot do this once capabilities are dropped, so the kernel sets
-    // them up here. With no mounts configured this defaults to /proc + /sys.
+    // them up here. Only the configured mounts are performed (krunc adds none).
     apply_mounts(&ctx.mounts);
 
     // Filesystem confinement, applied while still privileged so a compromised
