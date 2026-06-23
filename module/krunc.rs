@@ -797,6 +797,7 @@ fn decode_spec(buf: &[u8]) -> Result<DecodedSpec> {
         mounts: KVec::new(),
         landlock_rw: KVec::new(),
     };
+    let mut seen: u64 = 0; // bitset of section tags already parsed (tags < 64)
     for _ in 0..count {
         let tag = r.u16()?;
         let _pad = r.u16()?;
@@ -805,6 +806,16 @@ fn decode_spec(buf: &[u8]) -> Result<DecodedSpec> {
             return Err(EINVAL);
         }
         let payload = r.take(len)?;
+        // Reject a duplicate section, matching the userspace ABI encoder/decoder
+        // (krunc-abi), so a hand-crafted blob cannot smuggle a second value past
+        // the first. The shift is guarded by `tag < 64`.
+        if tag < 64 {
+            let bit = 1u64 << tag;
+            if seen & bit != 0 {
+                return Err(EINVAL);
+            }
+            seen |= bit;
+        }
         let mut sr = BReader::new(payload);
         match tag {
             1 => d.rootfs = to_cvec(payload)?,     // ROOTFS
@@ -844,6 +855,11 @@ fn decode_spec(buf: &[u8]) -> Result<DecodedSpec> {
             // tags 6/7 (uid/gid maps) land in a later milestone.
             _ => {}
         }
+    }
+    // No bytes may follow the declared sections (matches krunc-abi, which rejects
+    // trailing bytes) — a strict, exact parse of the wire format.
+    if r.rem() != 0 {
+        return Err(EINVAL);
     }
     Ok(d)
 }
