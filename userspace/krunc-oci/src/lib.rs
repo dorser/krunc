@@ -19,11 +19,10 @@ use std::path::{Path, PathBuf};
 
 use krunc_abi::{
     DomainSpec, IdMap, Mount, Rlimit, NS_CGROUP, NS_IPC, NS_MOUNT, NS_NET, NS_PID, NS_USER, NS_UTS,
-    OPT_NO_NEW_PRIVS, OPT_ROOTFS_RO,
+    OPT_NO_NEW_PRIVS,
 };
 use serde::Deserialize;
 
-pub mod seccomp;
 
 /// The OCI runtime `config.json`, restricted to the fields krunc consumes.
 #[derive(Debug, Deserialize, Default)]
@@ -183,69 +182,10 @@ pub struct Linux {
     /// Paths to remount read-only inside the container.
     #[serde(default)]
     pub readonly_paths: Vec<String>,
-    /// seccomp syscall policy (compiled to a BPF program for the kernel).
-    pub seccomp: Option<Seccomp>,
     /// Other `linux` properties krunc does not model (rejected if present) —
-    /// e.g. `sysctl`, `devices`, `rootfsPropagation`, `intelRdt`.
+    /// e.g. `sysctl`, `devices`, `rootfsPropagation`, `intelRdt`, `seccomp`.
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
-}
-
-/// `config.json` `linux.seccomp`: the syscall policy. krunc compiles it (see
-/// [`seccomp::compile`]) into a classic-BPF program, including `SCMP_CMP_EQ` and
-/// `SCMP_CMP_MASKED_EQ` argument matchers.
-#[derive(Debug, Deserialize, Default)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct Seccomp {
-    /// Action applied to syscalls with no matching rule (e.g. `SCMP_ACT_ALLOW`).
-    pub default_action: String,
-    /// errno returned when `default_action` is `SCMP_ACT_ERRNO` (default EPERM).
-    #[serde(default)]
-    pub default_errno_ret: Option<u32>,
-    /// Target architectures. krunc targets the x86-64 native ABI only; a
-    /// non-`SCMP_ARCH_X86_64` entry is rejected (see [`seccomp::compile`]).
-    #[serde(default)]
-    pub architectures: Vec<String>,
-    /// Per-syscall rules, evaluated in order (first match wins).
-    #[serde(default)]
-    pub syscalls: Vec<SeccompSyscall>,
-}
-
-/// One `config.json` `linux.seccomp.syscalls[]` rule.
-#[derive(Debug, Deserialize, Default)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct SeccompSyscall {
-    /// Syscall names this rule applies to.
-    #[serde(default)]
-    pub names: Vec<String>,
-    /// Action for these syscalls (e.g. `SCMP_ACT_ERRNO`).
-    pub action: String,
-    /// errno returned when `action` is `SCMP_ACT_ERRNO` (default EPERM).
-    #[serde(default)]
-    pub errno_ret: Option<u32>,
-    /// Argument matchers (ANDed together). krunc compiles the equality ops
-    /// (`SCMP_CMP_EQ`, `SCMP_CMP_MASKED_EQ`) into real BPF argument comparisons;
-    /// other ops are rejected rather than silently dropped.
-    #[serde(default)]
-    pub args: Vec<SeccompArg>,
-}
-
-/// One `config.json` `linux.seccomp.syscalls[].args[]` argument matcher.
-#[derive(Debug, Deserialize, Default, Clone)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct SeccompArg {
-    /// Index of the syscall argument (0..=5).
-    #[serde(default)]
-    pub index: u32,
-    /// The value to compare against.
-    #[serde(default)]
-    pub value: u64,
-    /// The second value (the mask, for `SCMP_CMP_MASKED_EQ`).
-    #[serde(default)]
-    pub value_two: u64,
-    /// The comparison operator (`SCMP_CMP_*`).
-    #[serde(default)]
-    pub op: String,
 }
 
 /// `config.json` `linux.resources` (the subset krunc enforces via cgroup v2).
@@ -695,7 +635,6 @@ pub fn config_to_spec(bundle: &Path, cfg: &OciConfig) -> Result<DomainSpec, OciE
     let gid_maps: Vec<IdMap> = Vec::new();
     let mut masked_paths = Vec::new();
     let mut readonly_paths = Vec::new();
-    let mut seccomp = Vec::new();
     if let Some(linux) = &cfg.linux {
         for ns in &linux.namespaces {
             if ns.path.is_some() {
@@ -719,17 +658,18 @@ pub fn config_to_spec(bundle: &Path, cfg: &OciConfig) -> Result<DomainSpec, OciE
         }
         masked_paths = linux.masked_paths.clone();
         readonly_paths = linux.readonly_paths.clone();
-        if let Some(sc) = &linux.seccomp {
-            seccomp = seccomp::compile(sc)?;
-        }
     }
 
     let mut flags = 0u64;
     if process.no_new_privileges {
         flags |= OPT_NO_NEW_PRIVS;
     }
+    // krunc enforced an immutable rootfs via a sealed Landlock domain; with
+    // Landlock removed it can no longer seal the rootfs, so a read-only rootfs is
+    // rejected rather than silently left writable. (It returns once pivot_root +
+    // a read-only mount land, or via an eBPF-LSM.)
     if root.readonly {
-        flags |= OPT_ROOTFS_RO;
+        return Err(OciError::UnsupportedProperty("root.readonly".into()));
     }
 
     // A present `capabilities` object means the caller is managing caps and the
@@ -773,29 +713,6 @@ pub fn config_to_spec(bundle: &Path, cfg: &OciConfig) -> Result<DomainSpec, OciE
         })
         .collect::<Result<Vec<_>, OciError>>()?;
 
-    // For a read-only rootfs, seal an immutable-fs Landlock domain: writes are
-    // allowed only beneath the writable mounts (tmpfs / rw binds) plus /dev (for
-    // device writes such as the shell's /dev/null redirects). This achieves the
-    // immutable rootfs that a chroot-based remount cannot, sealed for life.
-    let landlock_rw_paths = if root.readonly {
-        let mut rw: Vec<String> = cfg
-            .mounts
-            .iter()
-            .filter(|m| {
-                let (flags, is_bind) = mount_flags(&m.options);
-                let ro = flags & 1 != 0; // MS_RDONLY
-                !ro && (m.mount_type == "tmpfs" || is_bind || m.mount_type.is_empty())
-            })
-            .map(|m| m.destination.clone())
-            .collect();
-        if !rw.iter().any(|p| p == "/dev") {
-            rw.push("/dev".into());
-        }
-        rw
-    } else {
-        Vec::new()
-    };
-
     let spec = DomainSpec {
         rootfs: resolve_rootfs(bundle, &root.path),
         hostname: cfg.hostname.clone().unwrap_or_default(),
@@ -811,7 +728,6 @@ pub fn config_to_spec(bundle: &Path, cfg: &OciConfig) -> Result<DomainSpec, OciE
         cap_permitted,
         cap_inheritable,
         cap_ambient,
-        seccomp,
         masked_paths,
         readonly_paths,
         rlimits,
@@ -819,7 +735,6 @@ pub fn config_to_spec(bundle: &Path, cfg: &OciConfig) -> Result<DomainSpec, OciE
         uid: process.user.as_ref().map(|u| u.uid).unwrap_or(0),
         gid: process.user.as_ref().map(|u| u.gid).unwrap_or(0),
         mounts,
-        landlock_rw_paths,
     };
     spec.validate()?;
     Ok(spec)
@@ -850,7 +765,7 @@ mod tests {
           { "type": "RLIMIT_CORE", "soft": 0, "hard": 0 }
         ]
       },
-      "root": { "path": "rootfs", "readonly": true },
+      "root": { "path": "rootfs", "readonly": false },
       "linux": {
         "namespaces": [
           { "type": "pid" }, { "type": "mount" }, { "type": "uts" },
@@ -878,7 +793,7 @@ mod tests {
         assert_eq!(spec.argv, vec!["/bin/sh", "/init.sh"]);
         assert_eq!(spec.env, vec!["PATH=/bin:/sbin", "TERM=linux"]);
         assert_eq!(spec.namespaces, NS_PID | NS_MOUNT | NS_UTS | NS_IPC | NS_NET);
-        assert_eq!(spec.flags, OPT_NO_NEW_PRIVS | OPT_ROOTFS_RO);
+        assert_eq!(spec.flags, OPT_NO_NEW_PRIVS);
         // krunc does not apply user-namespace ID mappings, so the translated
         // spec carries none (and the sample config declares none).
         assert!(spec.uid_maps.is_empty());
@@ -913,9 +828,6 @@ mod tests {
         assert_eq!(spec.mounts[1].flags, 2 | 4 | 8);
         assert_eq!(spec.mounts[2].fs_type, ""); // bind clears the type
         assert_eq!(spec.mounts[2].flags, 4096 | 16384 | 1);
-        // root.readonly -> Landlock seals writes to the tmpfs /tmp (+/dev); the
-        // proc mount and the read-only bind are excluded.
-        assert_eq!(spec.landlock_rw_paths, vec!["/tmp", "/dev"]);
     }
 
     #[test]
@@ -1138,11 +1050,6 @@ mod tests {
             parse_config(r#"{"process":{"args":["/x"],"user":{"uid":0,"gid":0,"umask":18}},"root":{"path":"r"}}"#),
             Err(OciError::Json(_))
         ));
-        // linux.seccomp.flags / listenerPath
-        assert!(matches!(
-            parse_config(r#"{"process":{"args":["/x"]},"root":{"path":"r"},"linux":{"seccomp":{"defaultAction":"SCMP_ACT_ALLOW","flags":["SECCOMP_FILTER_FLAG_LOG"]}}}"#),
-            Err(OciError::Json(_))
-        ));
         // linux.resources.memory.swap
         assert!(matches!(
             parse_config(r#"{"process":{"args":["/x"]},"root":{"path":"r"},"linux":{"resources":{"memory":{"limit":1024,"swap":2048}}}}"#),
@@ -1152,6 +1059,29 @@ mod tests {
         assert!(matches!(
             parse_config(r#"{"process":{"args":["/x"]},"root":{"path":"r"},"mounts":[{"destination":"/d","type":"bind","source":"/s","uidMappings":[{"containerID":0,"hostID":0,"size":1}]}]}"#),
             Err(OciError::Json(_))
+        ));
+    }
+
+    #[test]
+    fn seccomp_and_readonly_rootfs_rejected() {
+        // krunc no longer applies seccomp or seals an immutable rootfs (Landlock
+        // dropped), so both are rejected rather than silently ignored. `linux.seccomp`
+        // is an unmodeled `linux` property; `root.readonly=true` is rejected explicitly.
+        let sc = parse_config(
+            r#"{"process":{"args":["/x"],"cwd":"/"},"root":{"path":"r"},"linux":{"seccomp":{"defaultAction":"SCMP_ACT_ALLOW"}}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            config_to_spec(Path::new("/b"), &sc),
+            Err(OciError::UnsupportedProperty(_))
+        ));
+        let ro = parse_config(
+            r#"{"process":{"args":["/x"],"cwd":"/"},"root":{"path":"r","readonly":true}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            config_to_spec(Path::new("/b"), &ro),
+            Err(OciError::UnsupportedProperty(_))
         ));
     }
 

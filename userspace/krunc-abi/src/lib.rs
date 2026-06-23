@@ -36,8 +36,6 @@ pub const MAX_ARGV: usize = 1024;
 pub const MAX_ENV: usize = 1024;
 /// Maximum number of id-map entries.
 pub const MAX_MAPS: usize = 340;
-/// Maximum size of an opaque seccomp program blob.
-pub const MAX_SECCOMP: usize = 64 * 1024;
 
 /// Maximum number of masked or read-only path entries.
 pub const MAX_PATHS: usize = 256;
@@ -68,7 +66,7 @@ pub const NS_CGROUP: u32 = 0x0200_0000;
 pub const NS_DEFAULT: u32 = NS_MOUNT | NS_UTS | NS_IPC | NS_PID | NS_NET;
 
 // ---- boolean option flags (the `Flags` section, a u64 bitset) ----
-/// Set `no_new_privs` on the domain before exec (required for seccomp).
+/// Set `no_new_privs` on the domain before exec.
 pub const OPT_NO_NEW_PRIVS: u64 = 1 << 0;
 /// Make the rootfs read-only.
 pub const OPT_ROOTFS_RO: u64 = 1 << 1;
@@ -176,9 +174,6 @@ pub struct DomainSpec {
     pub cap_inheritable: u64,
     /// Ambient capability set (inherited by unprivileged `execve`).
     pub cap_ambient: u64,
-    /// Opaque compiled seccomp program (a `struct sock_filter[]` blob). Empty =
-    /// no seccomp.
-    pub seccomp: Vec<u8>,
     /// Paths made inaccessible inside the container (over-mounted so reads see
     /// nothing and writes are inert). Enforced for the container's whole life by
     /// its mount namespace.
@@ -193,12 +188,8 @@ pub struct DomainSpec {
     pub uid: u32,
     /// Target gid the container process runs as (`process.user.gid`; 0 = root).
     pub gid: u32,
-    /// Mounts to perform inside the container, in order (empty = kernel default
-    /// of a private `/proc` + `/sys`).
+    /// Mounts to perform inside the container, in order (empty = no mounts).
     pub mounts: Vec<Mount>,
-    /// If non-empty, enforce a sealed Landlock domain that allows writes only
-    /// beneath these paths (an immutable rootfs with writable scratch dirs).
-    pub landlock_rw_paths: Vec<String>,
 }
 
 // Section tags. Stable wire identifiers; never reuse a value.
@@ -212,7 +203,6 @@ mod tag {
     pub const GID_MAPS: u16 = 7;
     pub const FLAGS: u16 = 8;
     pub const CAP_BOUNDING: u16 = 9;
-    pub const SECCOMP: u16 = 10;
     pub const MASKED_PATHS: u16 = 11;
     pub const RO_PATHS: u16 = 12;
     pub const RLIMITS: u16 = 13;
@@ -220,7 +210,7 @@ mod tag {
     pub const CAP_SETS: u16 = 15;
     pub const USER: u16 = 16;
     pub const MOUNTS: u16 = 17;
-    pub const LANDLOCK_RW: u16 = 18;
+    // 10 (seccomp) and 18 (landlock) retired — never reuse.
 }
 
 /// Errors from encoding or (strict) decoding.
@@ -364,12 +354,10 @@ impl DomainSpec {
         }
         check_len("uid_maps", self.uid_maps.len(), MAX_MAPS)?;
         check_len("gid_maps", self.gid_maps.len(), MAX_MAPS)?;
-        check_len("seccomp", self.seccomp.len(), MAX_SECCOMP)?;
         check_len("masked_paths", self.masked_paths.len(), MAX_PATHS)?;
         check_len("readonly_paths", self.readonly_paths.len(), MAX_PATHS)?;
         check_len("rlimits", self.rlimits.len(), MAX_RLIMITS)?;
         check_len("mounts", self.mounts.len(), MAX_MOUNTS)?;
-        check_len("landlock_rw_paths", self.landlock_rw_paths.len(), MAX_PATHS)?;
         Ok(())
     }
 
@@ -422,9 +410,6 @@ impl DomainSpec {
                 w.u64(self.cap_ambient);
             });
         }
-        if !self.seccomp.is_empty() {
-            emit(tag::SECCOMP, &mut |w| w.bytes(&self.seccomp));
-        }
         if !self.masked_paths.is_empty() {
             emit(tag::MASKED_PATHS, &mut |w| write_strvec(w, &self.masked_paths));
         }
@@ -445,9 +430,6 @@ impl DomainSpec {
         }
         if !self.mounts.is_empty() {
             emit(tag::MOUNTS, &mut |w| write_mounts(w, &self.mounts));
-        }
-        if !self.landlock_rw_paths.is_empty() {
-            emit(tag::LANDLOCK_RW, &mut |w| write_strvec(w, &self.landlock_rw_paths));
         }
 
         w.u32(count);
@@ -625,10 +607,6 @@ pub fn decode(buf: &[u8]) -> Result<(Op, DomainSpec), AbiError> {
                 spec.cap_inheritable = sr.u64()?;
                 spec.cap_ambient = sr.u64()?;
             }
-            tag::SECCOMP => {
-                check_len("seccomp", payload.len(), MAX_SECCOMP)?;
-                spec.seccomp = payload.to_vec();
-            }
             tag::MASKED_PATHS => {
                 spec.masked_paths = read_strvec(&mut sr, "masked_paths", MAX_PATHS)?;
             }
@@ -647,9 +625,6 @@ pub fn decode(buf: &[u8]) -> Result<(Op, DomainSpec), AbiError> {
             }
             tag::MOUNTS => {
                 spec.mounts = read_mounts(&mut sr, "mounts")?;
-            }
-            tag::LANDLOCK_RW => {
-                spec.landlock_rw_paths = read_strvec(&mut sr, "landlock_rw_paths", MAX_PATHS)?;
             }
             _ => { /* unknown tag: ignore for forward-compat */ }
         }
@@ -696,7 +671,6 @@ mod tests {
             cap_permitted: 0x0000_0000_a80c_25fb,
             cap_inheritable: 0,
             cap_ambient: 0,
-            seccomp: vec![0xde, 0xad, 0xbe, 0xef],
             masked_paths: vec!["/proc/kcore".into(), "/proc/sysrq-trigger".into()],
             readonly_paths: vec!["/proc/sys".into(), "/bin".into()],
             rlimits: vec![
@@ -720,7 +694,6 @@ mod tests {
                     flags: 0x0000_000e, // MS_NOSUID|MS_NODEV|MS_NOEXEC
                 },
             ],
-            landlock_rw_paths: vec!["/tmp".into(), "/dev".into()],
         }
     }
 
@@ -984,10 +957,6 @@ mod tests {
                 cap_permitted: if caps_present { sm64(&mut state) } else { 0 },
                 cap_inheritable: if caps_present { sm64(&mut state) } else { 0 },
                 cap_ambient: if caps_present { sm64(&mut state) } else { 0 },
-                seccomp: {
-                    let n = sm64(&mut state) as usize % 16;
-                    (0..n).map(|_| (sm64(&mut state) & 0xff) as u8).collect()
-                },
                 masked_paths: rand_strvec(&mut state, 4, 16),
                 readonly_paths: rand_strvec(&mut state, 4, 16),
                 rlimits: (0..n_rl)
@@ -1008,7 +977,6 @@ mod tests {
                         flags: sm64(&mut state),
                     })
                     .collect(),
-                landlock_rw_paths: rand_strvec(&mut state, 4, 16),
             };
             let buf = spec.encode(Op::Create).expect("canonical in-bounds spec must encode");
             let (op, decoded) = decode(&buf).expect("must decode what we encoded");

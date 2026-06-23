@@ -25,7 +25,7 @@
       { "type": "RLIMIT_CORE", "soft": 0, "hard": 0 }
     ]
   },
-  "root": { "path": "rootfs", "readonly": true },
+  "root": { "path": "rootfs", "readonly": false },
   "linux": {
     "namespaces": [
       { "type": "pid" },
@@ -38,33 +38,7 @@
     "resources": { "pids": { "limit": 16 }, "memory": { "limit": 67108864 },
       "cpu": { "quota": 10000, "period": 100000 } },
     "maskedPaths": ["/proc/kcore", "/proc/sysrq-trigger"],
-    "readonlyPaths": ["/proc/sys", "/etc"],
-    "seccomp": {
-      "defaultAction": "SCMP_ACT_ALLOW",
-      "architectures": ["SCMP_ARCH_X86_64"],
-      "syscalls": [
-        {
-          "names": ["chmod", "fchmod", "fchmodat"],
-          "action": "SCMP_ACT_ERRNO",
-          "errnoRet": 1
-        },
-        {
-          "names": [
-            "ptrace", "keyctl", "add_key", "request_key", "bpf",
-            "userfaultfd", "perf_event_open", "setns"
-          ],
-          "action": "SCMP_ACT_ERRNO",
-          "errnoRet": 1
-        },
-        {
-          "names": [
-            "init_module", "finit_module", "delete_module",
-            "kexec_load", "kexec_file_load"
-          ],
-          "action": "SCMP_ACT_KILL_PROCESS"
-        }
-      ]
-    }
+    "readonlyPaths": ["/proc/sys", "/etc"]
   },
   "mounts": [
     { "destination": "/proc", "type": "proc", "source": "proc" },

@@ -400,9 +400,8 @@ fn gen_id() -> String {
 
 /// Build a hardened OCI `config.json` around `rootfs_abs`, running `args` as
 /// container PID 1. Mirrors `examples/bundle/config.json`: dropped capabilities,
-/// `noNewPrivileges`, a private namespace set, pid/memory cgroup caps, masked &
-/// read-only `/proc` paths, and a seccomp policy that kills module-loading and
-/// kexec attempts.
+/// `noNewPrivileges`, a private namespace set, pid/memory cgroup caps, and
+/// masked & read-only `/proc` paths.
 fn synth_config(rootfs_abs: &str, args: &[String], hostname: &str, terminal: bool) -> String {
     let args_json = args
         .iter()
@@ -444,18 +443,7 @@ fn synth_config(rootfs_abs: &str, args: &[String], hostname: &str, terminal: boo
       "memory": {{ "limit": 268435456 }}
     }},
     "maskedPaths": ["/proc/kcore", "/proc/sysrq-trigger"],
-    "readonlyPaths": ["/proc/sys"],
-    "seccomp": {{
-      "defaultAction": "SCMP_ACT_ALLOW",
-      "architectures": ["SCMP_ARCH_X86_64"],
-      "syscalls": [
-        {{
-          "names": ["init_module", "finit_module", "delete_module",
-                    "kexec_load", "kexec_file_load"],
-          "action": "SCMP_ACT_KILL_PROCESS"
-        }}
-      ]
-    }}
+    "readonlyPaths": ["/proc/sys"]
   }},
   "mounts": [
     {{ "destination": "/proc", "type": "proc", "source": "proc" }},
