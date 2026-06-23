@@ -549,3 +549,32 @@ fn print_version() {
     println!("commit: krunc-poc");
     println!("spec: {OCI_VERSION}");
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn synth_config_parses_under_strict_rules() {
+        // `krunc run` synthesizes this config; it must satisfy the strict
+        // (reject-unmodeled) translation rules so the docker-style path keeps
+        // working. Exercised here because the QEMU demo drives `create` instead.
+        let args = ["/bin/sh".to_string(), "-c".to_string(), "echo hi".to_string()];
+        let json = synth_config("/img/rootfs", &args, "krunc-test", false);
+        let cfg = parse_config(&json).expect("synth config must parse");
+        let spec = config_to_spec(Path::new("/img"), &cfg).expect("synth config must translate");
+        assert_eq!(spec.rootfs, "/img/rootfs");
+        assert_eq!(spec.argv, args);
+    }
+
+    #[test]
+    fn synth_config_with_terminal_is_rejected() {
+        // process.terminal=true is rejected per spec (krunc allocates no PTY), so
+        // `krunc run -t` must fail at translation rather than silently drop it.
+        let args = ["/bin/sh".to_string()];
+        let json = synth_config("/img/rootfs", &args, "krunc-test", true);
+        let cfg = parse_config(&json).expect("synth config must parse");
+        assert!(config_to_spec(Path::new("/img"), &cfg).is_err());
+    }
+}
