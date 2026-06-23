@@ -75,6 +75,61 @@ if [ -x "$CPUHOG" ]; then
 	chmod +x "$ROOT/bundle/rootfs/bin/cpuhog"
 fi
 
+# Optional: OCI conformance bundle running the official opencontainers/
+# runtime-tools `runtimetest` as the container entrypoint (see
+# scripts/qemu-conformance-init.sh). The config stays within krunc's accepted
+# subset; runtimetest (cwd "/") reads /config.json inside the container and
+# compares it against the live state, so the same document is written to the
+# bundle (for krunc) and into the rootfs (for runtimetest).
+RUNTIMETEST="${RUNTIMETEST:-}"
+if [ -n "$RUNTIMETEST" ] && [ -x "$RUNTIMETEST" ]; then
+	mkdir -p "$ROOT"/conformance/rootfs/bin "$ROOT"/conformance/rootfs/proc \
+	         "$ROOT"/conformance/rootfs/tmp
+	cp "$BB" "$ROOT/conformance/rootfs/bin/busybox"
+	ln -sf busybox "$ROOT/conformance/rootfs/bin/sh"
+	cp "$RUNTIMETEST" "$ROOT/conformance/rootfs/bin/runtimetest"
+	chmod +x "$ROOT/conformance/rootfs/bin/runtimetest"
+	cat > "$ROOT/conformance/config.json" <<'CFG'
+{
+  "ociVersion": "1.0.2-dev",
+  "hostname": "krunc-conformance",
+  "process": {
+    "terminal": false,
+    "user": { "uid": 0, "gid": 0 },
+    "args": ["/bin/runtimetest", "--path", "/"],
+    "env": ["PATH=/bin", "TERM=linux", "HOME=/root"],
+    "cwd": "/",
+    "noNewPrivileges": true,
+    "capabilities": {
+      "bounding": ["CAP_KILL", "CAP_CHOWN", "CAP_NET_BIND_SERVICE"],
+      "effective": ["CAP_KILL", "CAP_CHOWN", "CAP_NET_BIND_SERVICE"],
+      "permitted": ["CAP_KILL", "CAP_CHOWN", "CAP_NET_BIND_SERVICE"]
+    },
+    "oomScoreAdj": -100,
+    "rlimits": [
+      { "type": "RLIMIT_NOFILE", "soft": 1024, "hard": 1024 }
+    ]
+  },
+  "root": { "path": "rootfs", "readonly": false },
+  "linux": {
+    "namespaces": [
+      { "type": "pid" }, { "type": "mount" }, { "type": "uts" },
+      { "type": "ipc" }, { "type": "network" }
+    ],
+    "maskedPaths": ["/proc/kcore"],
+    "readonlyPaths": ["/proc/sys"]
+  },
+  "mounts": [
+    { "destination": "/proc", "type": "proc", "source": "proc" },
+    { "destination": "/tmp", "type": "tmpfs", "source": "tmpfs",
+      "options": ["nosuid", "nodev"] }
+  ]
+}
+CFG
+	cp "$ROOT/conformance/config.json" "$ROOT/conformance/rootfs/config.json"
+	echo "==> bundled OCI conformance runtimetest"
+fi
+
 # Optional: prebuilt docker-style images for `krunc run --image <name> <cmd>`.
 # Each subdirectory of $IMAGES is an already-extracted rootfs (carrying its own
 # /dev nodes); `cp -a` preserves those nodes and the cpio below runs as root.
