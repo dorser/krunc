@@ -122,7 +122,7 @@ krunc list ; krunc --version
 
 It reads the OCI bundle's `config.json` (`userspace/krunc-oci`), translates the
 supported subset (`process.args`/`env`, `root.path`, `hostname`,
-`linux.namespaces`, `linux.uid/gidMappings`, `process.capabilities.bounding`,
+`linux.namespaces`, `process.capabilities.bounding`,
 `process.noNewPrivileges`) into a validated binary spec (`userspace/krunc-abi`),
 and drives the module's `create`(paused)/`start`/`state`/`kill`/`delete` ioctls.
 The kernel then applies the confinement — namespaces, in-kernel chroot, **the
@@ -240,11 +240,14 @@ it is not production software. Notable simplifications and known limitations:
   pids/memory/cpu, mounts, masked/read-only paths, rlimits, oom score, user,
   Landlock-sealed read-only rootfs) and **rejects** — rather than silently
   ignoring — any other configured property (e.g. `process.terminal`,
-  `linux.sysctl`, `linux.devices`, `linux.resources.devices`, `hooks`, the
-  ordered/not-equal seccomp comparison operators, user-namespace mappings). This
-  follows the runtime-spec `create` rule that a runtime MUST error on a property
-  it cannot apply, and avoids quietly running a container that does not match its
-  requested configuration.
+  `process.user.umask`, `linux.sysctl`, `linux.devices`, `linux.resources.devices`,
+  `linux.resources.memory.swap`, `hooks`, `seccomp.flags`/`listenerPath`, the
+  ordered/not-equal seccomp comparison operators, user-namespace mappings,
+  id-mapped mounts, and non-flag mount options such as `size=`/`mode=` or
+  propagation flags). Unmodeled fields are rejected at parse time
+  (`deny_unknown_fields`), not dropped. This follows the runtime-spec `create`
+  rule that a runtime MUST error on a property it cannot apply, and avoids quietly
+  running a container that does not match its requested configuration.
 - **containerd / nerdctl.** krunc is runc-CLI-compatible, so containerd's
   `io.containerd.runc.v2` shim can drive it (krunc as the runc binary). But the
   default configs containerd/nerdctl generate use properties outside krunc's

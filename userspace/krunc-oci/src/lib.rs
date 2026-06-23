@@ -51,6 +51,7 @@ pub struct OciConfig {
 
 /// A `config.json` top-level `mounts[]` entry.
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct OciMount {
     /// Mountpoint inside the container.
     pub destination: String,
@@ -99,7 +100,7 @@ pub struct Process {
 
 /// `config.json` `process.rlimits[]`.
 #[derive(Debug, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct OciRlimit {
     /// `RLIMIT_*` name, e.g. `RLIMIT_NOFILE`.
     #[serde(rename = "type")]
@@ -114,7 +115,7 @@ pub struct OciRlimit {
 
 /// `config.json` `process.user`.
 #[derive(Debug, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct User {
     /// Target uid.
     #[serde(default)]
@@ -129,7 +130,7 @@ pub struct User {
 
 /// `config.json` `process.capabilities`.
 #[derive(Debug, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Capabilities {
     /// The bounding set (the ceiling krunc enforces).
     #[serde(default)]
@@ -150,7 +151,7 @@ pub struct Capabilities {
 
 /// `config.json` `root`.
 #[derive(Debug, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Root {
     /// Rootfs path (relative to the bundle unless absolute).
     pub path: String,
@@ -194,7 +195,7 @@ pub struct Linux {
 /// [`seccomp::compile`]) into a classic-BPF program, including `SCMP_CMP_EQ` and
 /// `SCMP_CMP_MASKED_EQ` argument matchers.
 #[derive(Debug, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Seccomp {
     /// Action applied to syscalls with no matching rule (e.g. `SCMP_ACT_ALLOW`).
     pub default_action: String,
@@ -211,7 +212,7 @@ pub struct Seccomp {
 
 /// One `config.json` `linux.seccomp.syscalls[]` rule.
 #[derive(Debug, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SeccompSyscall {
     /// Syscall names this rule applies to.
     #[serde(default)]
@@ -230,7 +231,7 @@ pub struct SeccompSyscall {
 
 /// One `config.json` `linux.seccomp.syscalls[].args[]` argument matcher.
 #[derive(Debug, Deserialize, Default, Clone)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SeccompArg {
     /// Index of the syscall argument (0..=5).
     #[serde(default)]
@@ -264,6 +265,7 @@ pub struct Resources {
 
 /// `config.json` `linux.resources.cpu` (the subset krunc enforces).
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct Cpu {
     /// CFS quota in microseconds per `period` (`<= 0` means unlimited).
     pub quota: Option<i64>,
@@ -275,6 +277,7 @@ pub struct Cpu {
 
 /// `config.json` `linux.resources.pids`.
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct Pids {
     /// Maximum number of pids (`pids.max`).
     pub limit: i64,
@@ -282,6 +285,7 @@ pub struct Pids {
 
 /// `config.json` `linux.resources.memory` (the subset krunc enforces).
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct Memory {
     /// Memory usage hard limit in bytes (`memory.max`). A negative value or
     /// `None` means unlimited.
@@ -341,6 +345,7 @@ pub fn cgroup_config(cfg: &OciConfig) -> CgroupConfig {
 
 /// A `linux.namespaces` entry.
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct Namespace {
     /// Namespace type (`pid`, `mount`, `network`, `ipc`, `uts`, `user`, `cgroup`).
     #[serde(rename = "type")]
@@ -351,6 +356,7 @@ pub struct Namespace {
 
 /// A `linux.uidMappings`/`gidMappings` entry.
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct LinuxIdMapping {
     /// First id inside the container.
     #[serde(rename = "containerID")]
@@ -525,8 +531,10 @@ fn rlimit_resource(name: &str) -> Option<u32> {
     })
 }
 
-/// Translate OCI mount `options` into `(MS_* flags, is_bind)`. Data-style options
-/// (`size=`, `mode=`, …) are ignored — krunc applies no per-fs data string.
+/// Translate validated OCI mount `options` into `(MS_* flags, is_bind)`. Options
+/// are first screened by [`check_mount_options`], so the only non-flag string
+/// reaching the catch-all here is `defaults` (a no-op denoting the default
+/// flags); krunc applies no per-fs data string.
 fn mount_flags(options: &[String]) -> (u64, bool) {
     // uapi/linux/mount.h bit values.
     const MS_RDONLY: u64 = 1;
@@ -568,10 +576,32 @@ fn mount_flags(options: &[String]) -> (u64, bool) {
                 flags |= MS_BIND | MS_REC;
                 is_bind = true;
             }
-            _ => {} // data option (size=, mode=, …) or unknown: ignored
+            _ => {} // "defaults" (no-op); other non-flag options rejected by check_mount_options
         }
     }
     (flags, is_bind)
+}
+
+/// Reject mount `options` krunc cannot apply. krunc translates only the MS_* flag
+/// options (see [`mount_flags`]); filesystem data options (`size=`, `mode=`, …)
+/// and mount-propagation options (`private`, `shared`, `slave`, `unbindable` and
+/// their recursive forms) are not applied, so — per the runtime-spec create rule
+/// (a runtime MUST error on a property it cannot apply) — they are rejected
+/// rather than silently dropped. `defaults` is accepted as a no-op.
+fn check_mount_options(options: &[String]) -> Result<(), OciError> {
+    for opt in options {
+        match opt.as_str() {
+            "ro" | "rw" | "nosuid" | "suid" | "nodev" | "dev" | "noexec" | "exec" | "sync"
+            | "remount" | "noatime" | "nodiratime" | "relatime" | "strictatime" | "bind"
+            | "rbind" | "defaults" => {}
+            _ => {
+                return Err(OciError::UnsupportedProperty(format!(
+                    "mounts[].options: {opt}"
+                )))
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Reject any configured property krunc does not model and therefore cannot
@@ -641,8 +671,8 @@ pub fn config_to_spec(bundle: &Path, cfg: &OciConfig) -> Result<DomainSpec, OciE
     }
 
     let mut namespaces = 0u32;
-    let mut uid_maps = Vec::new();
-    let mut gid_maps = Vec::new();
+    let uid_maps: Vec<IdMap> = Vec::new();
+    let gid_maps: Vec<IdMap> = Vec::new();
     let mut masked_paths = Vec::new();
     let mut readonly_paths = Vec::new();
     let mut seccomp = Vec::new();
@@ -655,16 +685,18 @@ pub fn config_to_spec(bundle: &Path, cfg: &OciConfig) -> Result<DomainSpec, OciE
             }
             namespaces |= ns_flag(&ns.ns_type)?;
         }
-        uid_maps = linux
-            .uid_mappings
-            .iter()
-            .map(|m| IdMap { container_id: m.container_id, host_id: m.host_id, size: m.size })
-            .collect();
-        gid_maps = linux
-            .gid_mappings
-            .iter()
-            .map(|m| IdMap { container_id: m.container_id, host_id: m.host_id, size: m.size })
-            .collect();
+        // krunc does not write uid_map/gid_map (kernel-side ID mapping is not yet
+        // implemented), so it cannot apply user-namespace ID mappings. Reject them
+        // rather than silently running the workload with unmapped (overflow)
+        // credentials — the runtime-spec requires erroring on a property that
+        // cannot be applied. (A bare `user` namespace with no mappings is still
+        // created as specified.)
+        if !linux.uid_mappings.is_empty() {
+            return Err(OciError::UnsupportedProperty("linux.uidMappings".into()));
+        }
+        if !linux.gid_mappings.is_empty() {
+            return Err(OciError::UnsupportedProperty("linux.gidMappings".into()));
+        }
         masked_paths = linux.masked_paths.clone();
         readonly_paths = linux.readonly_paths.clone();
         if let Some(sc) = &linux.seccomp {
@@ -707,18 +739,19 @@ pub fn config_to_spec(bundle: &Path, cfg: &OciConfig) -> Result<DomainSpec, OciE
         .mounts
         .iter()
         .map(|m| {
+            check_mount_options(&m.options)?;
             let (flags, is_bind) = mount_flags(&m.options);
             // For a bind, the krunc mount helper wants no fs type and the source
             // path; otherwise pass the declared type and source.
             let fs_type = if is_bind { String::new() } else { m.mount_type.clone() };
-            Mount {
+            Ok(Mount {
                 destination: m.destination.clone(),
                 fs_type,
                 source: m.source.clone(),
                 flags,
-            }
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>, OciError>>()?;
 
     // For a read-only rootfs, seal an immutable-fs Landlock domain: writes are
     // allowed only beneath the writable mounts (tmpfs / rw binds) plus /dev (for
@@ -803,8 +836,6 @@ mod tests {
           { "type": "pid" }, { "type": "mount" }, { "type": "uts" },
           { "type": "ipc" }, { "type": "network" }
         ],
-        "uidMappings": [ { "containerID": 0, "hostID": 100000, "size": 65536 } ],
-        "gidMappings": [ { "containerID": 0, "hostID": 100000, "size": 65536 } ],
         "maskedPaths": ["/proc/kcore", "/proc/sysrq-trigger"],
         "readonlyPaths": ["/proc/sys", "/bin"]
       },
@@ -828,10 +859,10 @@ mod tests {
         assert_eq!(spec.env, vec!["PATH=/bin:/sbin", "TERM=linux"]);
         assert_eq!(spec.namespaces, NS_PID | NS_MOUNT | NS_UTS | NS_IPC | NS_NET);
         assert_eq!(spec.flags, OPT_NO_NEW_PRIVS | OPT_ROOTFS_RO);
-        assert_eq!(
-            spec.uid_maps,
-            vec![IdMap { container_id: 0, host_id: 100000, size: 65536 }]
-        );
+        // krunc does not apply user-namespace ID mappings, so the translated
+        // spec carries none (and the sample config declares none).
+        assert!(spec.uid_maps.is_empty());
+        assert!(spec.gid_maps.is_empty());
         let expect_caps = (1u64 << 10) | (1u64 << 5) | (1u64 << 29);
         assert!(spec.caps_present);
         assert_eq!(spec.cap_bounding, expect_caps);
@@ -1007,6 +1038,93 @@ mod tests {
             config_to_spec(Path::new("/b"), &cfg),
             Err(OciError::UnsupportedProperty(_))
         ));
+    }
+
+    #[test]
+    fn id_mappings_rejected() {
+        // krunc does not write uid_map/gid_map, so user-namespace ID mappings
+        // must be rejected rather than silently dropped (which would run the
+        // workload with unmapped, overflow credentials).
+        let uid = parse_config(
+            r#"{"process":{"args":["/x"]},"root":{"path":"r"},"linux":{"namespaces":[{"type":"user"}],"uidMappings":[{"containerID":0,"hostID":100000,"size":65536}]}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            config_to_spec(Path::new("/b"), &uid),
+            Err(OciError::UnsupportedProperty(_))
+        ));
+        let gid = parse_config(
+            r#"{"process":{"args":["/x"]},"root":{"path":"r"},"linux":{"namespaces":[{"type":"user"}],"gidMappings":[{"containerID":0,"hostID":100000,"size":65536}]}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            config_to_spec(Path::new("/b"), &gid),
+            Err(OciError::UnsupportedProperty(_))
+        ));
+    }
+
+    #[test]
+    fn unsupported_mount_option_rejected() {
+        // A tmpfs data option (size=) cannot be applied by krunc (it passes no
+        // per-fs data string), so it is rejected rather than silently dropped --
+        // dropping e.g. `mode=` could even loosen permissions.
+        let cfg = parse_config(
+            r#"{"process":{"args":["/x"]},"root":{"path":"r"},"mounts":[{"destination":"/tmp","type":"tmpfs","source":"tmpfs","options":["nosuid","size=64m"]}]}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            config_to_spec(Path::new("/b"), &cfg),
+            Err(OciError::UnsupportedProperty(_))
+        ));
+    }
+
+    #[test]
+    fn mount_propagation_option_rejected() {
+        // Mount-propagation options are not applied by krunc -> rejected.
+        let cfg = parse_config(
+            r#"{"process":{"args":["/x"]},"root":{"path":"r"},"mounts":[{"destination":"/d","type":"bind","source":"/s","options":["rbind","rprivate"]}]}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            config_to_spec(Path::new("/b"), &cfg),
+            Err(OciError::UnsupportedProperty(_))
+        ));
+    }
+
+    #[test]
+    fn unknown_struct_fields_rejected() {
+        // Unmodeled fields in leaf structs must not be silently dropped by serde:
+        // deny_unknown_fields turns each into a parse error. These are all real
+        // runtime-spec fields krunc does not apply.
+        // process.user.umask
+        assert!(matches!(
+            parse_config(r#"{"process":{"args":["/x"],"user":{"uid":0,"gid":0,"umask":18}},"root":{"path":"r"}}"#),
+            Err(OciError::Json(_))
+        ));
+        // linux.seccomp.flags / listenerPath
+        assert!(matches!(
+            parse_config(r#"{"process":{"args":["/x"]},"root":{"path":"r"},"linux":{"seccomp":{"defaultAction":"SCMP_ACT_ALLOW","flags":["SECCOMP_FILTER_FLAG_LOG"]}}}"#),
+            Err(OciError::Json(_))
+        ));
+        // linux.resources.memory.swap
+        assert!(matches!(
+            parse_config(r#"{"process":{"args":["/x"]},"root":{"path":"r"},"linux":{"resources":{"memory":{"limit":1024,"swap":2048}}}}"#),
+            Err(OciError::Json(_))
+        ));
+        // per-mount uidMappings (id-mapped mounts)
+        assert!(matches!(
+            parse_config(r#"{"process":{"args":["/x"]},"root":{"path":"r"},"mounts":[{"destination":"/d","type":"bind","source":"/s","uidMappings":[{"containerID":0,"hostID":0,"size":1}]}]}"#),
+            Err(OciError::Json(_))
+        ));
+    }
+
+    #[test]
+    fn parses_example_bundle() {
+        // The shipped manual-testing bundle must always parse and translate under
+        // the strict rules (guards against drift between it and the parser).
+        let json = include_str!("../../../examples/bundle/config.json");
+        let cfg = parse_config(json).expect("example bundle must parse");
+        config_to_spec(Path::new("/bundle"), &cfg).expect("example bundle must translate");
     }
 
     #[test]
