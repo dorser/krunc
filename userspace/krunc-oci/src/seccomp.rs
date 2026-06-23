@@ -924,4 +924,102 @@ mod tests {
         let only_second = seccomp_data(41, AUDIT_ARCH_X86_64, [9, 1, 0, 0, 0, 0]);
         assert_eq!(run_bpf(&prog, &only_second), RET_ALLOW);
     }
+
+    fn sm64(s: &mut u64) -> u64 {
+        *s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *s;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// Fuzz the compiler with random policies. Every program it accepts is loaded
+    /// into the kernel, so it MUST be a well-formed classic-BPF filter: all jumps
+    /// in bounds, only known opcodes, and it always terminates at a `RET`. We
+    /// prove this by interpreting each accepted program over arbitrary
+    /// `seccomp_data` — the interpreter indexes `prog[pc]` (an out-of-bounds jump
+    /// panics) and `pc` strictly increases (so a missing terminator runs off the
+    /// end and panics). A clean return for every input means the program is sound.
+    #[test]
+    fn compiled_seccomp_filters_are_well_formed() {
+        let names = [
+            "read", "write", "ioctl", "clone", "socket", "chmod", "kill", "openat", "mmap",
+            "ptrace", "not_a_real_syscall",
+        ];
+        let actions = [
+            "SCMP_ACT_ALLOW", "SCMP_ACT_ERRNO", "SCMP_ACT_KILL_PROCESS", "SCMP_ACT_KILL",
+            "SCMP_ACT_LOG", "SCMP_ACT_TRAP", "SCMP_ACT_NOTIFY",
+        ];
+        let ops = [
+            "SCMP_CMP_EQ", "SCMP_CMP_MASKED_EQ", "SCMP_CMP_NE", "SCMP_CMP_LT", "SCMP_CMP_GE",
+            "bogus_op",
+        ];
+        let arches = ["SCMP_ARCH_X86_64", "SCMP_ARCH_X86", "SCMP_ARCH_AARCH64"];
+
+        let mut state = 0x5EED_1234_ABCD_0001u64;
+        for _ in 0..3_000 {
+            let n_rules = (sm64(&mut state) % 6) as usize;
+            let mut syscalls = Vec::new();
+            for _ in 0..n_rules {
+                let n_names = (sm64(&mut state) % 4) as usize + 1;
+                let rnames = (0..n_names)
+                    .map(|_| names[sm64(&mut state) as usize % names.len()].to_string())
+                    .collect();
+                let n_args = (sm64(&mut state) % 3) as usize;
+                let args = (0..n_args)
+                    .map(|_| SeccompArg {
+                        index: (sm64(&mut state) % 8) as u32, // includes out-of-range (>5)
+                        value: sm64(&mut state),
+                        value_two: sm64(&mut state),
+                        op: ops[sm64(&mut state) as usize % ops.len()].to_string(),
+                    })
+                    .collect();
+                syscalls.push(SeccompSyscall {
+                    names: rnames,
+                    action: actions[sm64(&mut state) as usize % actions.len()].to_string(),
+                    errno_ret: if sm64(&mut state) & 1 == 0 {
+                        Some((sm64(&mut state) % 4096) as u32)
+                    } else {
+                        None
+                    },
+                    args,
+                });
+            }
+            let n_arch = (sm64(&mut state) % 3) as usize;
+            let architectures = (0..n_arch)
+                .map(|_| arches[sm64(&mut state) as usize % arches.len()].to_string())
+                .collect();
+            let s = Seccomp {
+                default_action: actions[sm64(&mut state) as usize % actions.len()].to_string(),
+                default_errno_ret: None,
+                architectures,
+                syscalls,
+            };
+            if let Ok(bytes) = compile(&s) {
+                assert_eq!(bytes.len() % 8, 0, "program is not a whole number of instructions");
+                let prog = decode(&bytes);
+                assert!(!prog.is_empty() && prog.len() <= BPF_MAXINSNS, "bad program length");
+                for _ in 0..16 {
+                    let arch = if sm64(&mut state) & 1 == 0 {
+                        AUDIT_ARCH_X86_64
+                    } else {
+                        sm64(&mut state) as u32
+                    };
+                    let data = seccomp_data(
+                        sm64(&mut state) as u32,
+                        arch,
+                        [
+                            sm64(&mut state),
+                            sm64(&mut state),
+                            sm64(&mut state),
+                            sm64(&mut state),
+                            sm64(&mut state),
+                            sm64(&mut state),
+                        ],
+                    );
+                    let _ret = run_bpf(&prog, &data); // panics if the program is malformed
+                }
+            }
+        }
+    }
 }
