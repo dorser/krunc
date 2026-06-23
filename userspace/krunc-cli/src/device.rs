@@ -83,6 +83,19 @@ impl Device {
         Ok((cmd.id, cmd.pid))
     }
 
+    /// Send a raw, pre-encoded spec blob through the create ioctl. Used by the
+    /// `__decode-check` self-test to drive malformed blobs straight at the
+    /// kernel's binary decoder (the real untrusted boundary).
+    pub fn create_raw(&self, blob: &[u8]) -> io::Result<(u64, i32)> {
+        let mut cmd = KruncCmd {
+            spec_ptr: blob.as_ptr() as u64,
+            spec_len: blob.len() as u32,
+            ..Default::default()
+        };
+        self.ioctl(NR_CREATE, &mut cmd)?;
+        Ok((cmd.id, cmd.pid))
+    }
+
     /// Release a created domain so its entrypoint execs.
     pub fn start(&self, id: u64) -> io::Result<()> {
         let mut cmd = KruncCmd { id, ..Default::default() };

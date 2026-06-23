@@ -147,6 +147,12 @@ echo "[vm] krunc delete oci1"
 
 ############################################################################
 echo
+echo "===== DEMO 3b: kernel binary-decoder robustness (malformed ioctl specs) ====="
+echo "[vm] krunc __decode-check   (sends malformed specs straight at decode_spec)"
+/bin/krunc __decode-check | sed 's/^/[vm] /'
+
+############################################################################
+echo
 echo "================ DEMO 4: unload the runtime cleanly ================"
 exec 3>&-                 # close the control device so the module is unused
 if rmmod krunc; then

@@ -66,6 +66,7 @@ fn main() {
         "delete" => do_delete(&root, &flags, args),
         "list" => do_list(&root),
         "features" => println!(r#"{{"ociVersionMin":"1.0.0","ociVersionMax":"1.0.2-dev"}}"#),
+        "__decode-check" => do_decode_check(),
         other => die(format!("unknown command {other:?}")),
     }
 }
@@ -548,6 +549,81 @@ fn print_version() {
     println!("runc version {VERSION}");
     println!("commit: krunc-poc");
     println!("spec: {OCI_VERSION}");
+}
+
+/// Self-test (used by the QEMU demo): drive malformed binary specs straight at
+/// the kernel's `decode_spec` via the create ioctl and confirm each is rejected
+/// gracefully — the kernel must never panic, over-read, or accept a malformed
+/// blob. This verifies the real untrusted boundary (the userspace `krunc-abi`
+/// decoder is fuzz-tested separately). The happy path (a valid blob is accepted)
+/// is covered by the normal create demo, so here every case must be rejected.
+fn do_decode_check() {
+    use krunc_abi::{DomainSpec, Op};
+
+    let dev = Device::open().unwrap_or_else(|e| die(format!("open /dev/krunc: {e}")));
+    let base = DomainSpec {
+        rootfs: "/bundle/rootfs".into(),
+        argv: vec!["/bin/sh".into()],
+        ..Default::default()
+    }
+    .encode(Op::Create)
+    .expect("encode base spec");
+
+    let mut cases: Vec<(&str, Vec<u8>)> = vec![
+        ("empty", Vec::new()),
+        ("bad-magic", {
+            let mut b = base.clone();
+            b[0] ^= 0xff;
+            b
+        }),
+        ("truncated", base[..base.len() / 2].to_vec()),
+        ("trailing-byte", {
+            let mut b = base.clone();
+            b.push(0);
+            b
+        }),
+    ];
+    // Section length field (offset 20..24) set to u32::MAX: an over-read attempt.
+    if base.len() >= 24 {
+        let mut b = base.clone();
+        b[20..24].copy_from_slice(&u32::MAX.to_le_bytes());
+        cases.push(("huge-section-len", b));
+    }
+    // Duplicate the first section (and bump the section count): the kernel must
+    // reject a repeated tag rather than silently take the second value.
+    if base.len() >= 24 {
+        let seclen = u32::from_le_bytes([base[20], base[21], base[22], base[23]]) as usize;
+        if let Some(end) = 24usize.checked_add(seclen) {
+            if end <= base.len() {
+                let mut b = base.clone();
+                let count = u32::from_le_bytes([b[12], b[13], b[14], b[15]]);
+                let first = b[16..end].to_vec();
+                b[12..16].copy_from_slice(&count.wrapping_add(1).to_le_bytes());
+                b.extend_from_slice(&first);
+                cases.push(("duplicate-section", b));
+            }
+        }
+    }
+
+    let mut failures = 0;
+    for (name, blob) in &cases {
+        match dev.create_raw(blob) {
+            Err(_) => println!("[decode-check]   {name}: rejected (ok)"),
+            Ok((id, _)) => {
+                let _ = dev.delete(id); // clean up the unexpected container
+                eprintln!("[decode-check]   {name}: ACCEPTED (FAIL)");
+                failures += 1;
+            }
+        }
+    }
+    if failures == 0 {
+        println!(
+            "[decode-check] all {} malformed blobs rejected; kernel decoder is robust",
+            cases.len()
+        );
+    } else {
+        die(format!("[decode-check] {failures} malformed blob(s) accepted"));
+    }
 }
 
 #[cfg(test)]
