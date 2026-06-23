@@ -116,6 +116,18 @@ fn action_ret(action: &str, errno: Option<u32>) -> Result<u32, OciError> {
 pub fn compile(s: &Seccomp) -> Result<Vec<u8>, OciError> {
     let default_ret = action_ret(&s.default_action, s.default_errno_ret)?;
 
+    // krunc compiles syscall numbers for the x86-64 native ABI only and kills
+    // foreign-architecture syscalls outright; it cannot apply per-architecture
+    // rules for any other architecture, so a configured non-x86-64 architecture
+    // is rejected rather than silently ignored.
+    for arch in &s.architectures {
+        if arch != "SCMP_ARCH_X86_64" {
+            return Err(OciError::Unsupported(
+                "seccomp architecture other than SCMP_ARCH_X86_64",
+            ));
+        }
+    }
+
     let mut prog: Vec<SockFilter> = Vec::new();
     // Architecture guard: a foreign-ABI syscall (e.g. i386 on x86-64) bypasses
     // number-based filters, so refuse it outright.
@@ -721,6 +733,27 @@ mod tests {
             ..Default::default()
         };
         assert!(matches!(compile(&s), Err(OciError::Unsupported(_))));
+    }
+
+    #[test]
+    fn nonnative_architecture_rejected() {
+        // krunc handles only x86-64 syscall numbers; a config requesting rules for
+        // another architecture cannot be applied as specified, so it is rejected.
+        let s = Seccomp {
+            default_action: "SCMP_ACT_ALLOW".into(),
+            default_errno_ret: None,
+            architectures: vec!["SCMP_ARCH_X86_64".into(), "SCMP_ARCH_X86".into()],
+            syscalls: vec![],
+        };
+        assert!(matches!(compile(&s), Err(OciError::Unsupported(_))));
+        // The native architecture alone is accepted.
+        let ok = Seccomp {
+            default_action: "SCMP_ACT_ALLOW".into(),
+            default_errno_ret: None,
+            architectures: vec!["SCMP_ARCH_X86_64".into()],
+            syscalls: vec![],
+        };
+        assert!(compile(&ok).is_ok());
     }
 
     /// A minimal classic-BPF interpreter for the opcode subset this compiler

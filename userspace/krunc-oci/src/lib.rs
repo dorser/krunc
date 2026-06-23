@@ -202,7 +202,8 @@ pub struct Seccomp {
     /// errno returned when `default_action` is `SCMP_ACT_ERRNO` (default EPERM).
     #[serde(default)]
     pub default_errno_ret: Option<u32>,
-    /// Target architectures (informational; krunc targets x86-64 only).
+    /// Target architectures. krunc targets the x86-64 native ABI only; a
+    /// non-`SCMP_ARCH_X86_64` entry is rejected (see [`seccomp::compile`]).
     #[serde(default)]
     pub architectures: Vec<String>,
     /// Per-syscall rules, evaluated in order (first match wins).
