@@ -6,7 +6,7 @@ Now I have all the evidence I need. Here is the comprehensive, fully-cited resea
 
 # Post-Setup Linux Container Escapes & Continuous Kernel Confinement for `krunc`
 
-**Context.** `krunc` (`krunc`) is a proof-of-concept Rust kernel module that performs container orchestration entirely inside the kernel: `user_mode_thread()` + `container_entry()` + `kernel_execve()`. The README and `docs/DESIGN.md` §9 already identify *"no seccomp, no capability dropping, no user-namespace uid/gid mapping"* as the first class of next steps. This report underpins exactly those next steps, but extends the question: how does krunc keep a container contained for its **entire lifetime**, not just at setup?
+**Context.** `krunc` is a proof-of-concept Rust kernel module that performs container orchestration entirely inside the kernel: `user_mode_thread()` + `container_entry()` + `kernel_execve()`. The README and `docs/DESIGN.md` §9 already identify *"no seccomp, no capability dropping, no user-namespace uid/gid mapping"* as the first class of next steps. This report underpins exactly those next steps, but extends the question: how does krunc keep a container contained for its **entire lifetime**, not just at setup?
 
 ---
 
@@ -483,9 +483,9 @@ Install a seccomp filter with `SECCOMP_FILTER_FLAG_NEW_LISTENER` for a subset of
 | [kernel.org credentials](https://www.kernel.org/doc/html/latest/security/credentials.html) | `struct cred`, cap sets, `prepare_creds`/`commit_creds` |
 | [man7 capabilities](https://www.man7.org/linux/man-pages/man7/capabilities.7.html) | Cap definitions: `CAP_DAC_READ_SEARCH`/`open_by_handle_at`, `CAP_SYS_ADMIN` operations |
 | [gVisor security](https://gvisor.dev/docs/architecture_guide/security/) | Sentry threat model, syscall interception, ~50 host syscall surface |
-| `krunc/docs/DESIGN.md` §9 | Current krunc limitations: no seccomp, no cap drop, chroot not pivot_root |
-| `krunc/module/krunc.rs:51-70` | FFI bindings: `krunc_spawn`, `kernel_execve`, `krunc_chroot`, `krunc_kill` |
-| `krunc/module/krunc.rs:42-48` | CLONE_NEW* flags, two-phase create/start gate |
+| `docs/DESIGN.md` §9 | Current krunc limitations: no seccomp, no cap drop, chroot not pivot_root |
+| `module/krunc.rs:51-70` | FFI bindings: `krunc_spawn`, `kernel_execve`, `krunc_chroot`, `krunc_kill` |
+| `module/krunc.rs:42-48` | CLONE_NEW* flags, two-phase create/start gate |
 
 ---
 

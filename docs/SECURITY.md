@@ -138,7 +138,7 @@ intentional. The approved runtime mechanisms are:
   `bpf`, `socket_*`) keyed to the domain via `bpf_get_current_cgroup_id()`, and
   **kill on violation** via `bpf_send_signal(SIGKILL)` while returning `-EPERM`.
   This is the active-response path and the natural integration point for
-  BPF-LSM-based runtime security (e.g. the author's micromize work).
+  BPF-LSM-based runtime security (e.g. the author's micromize OSS project).
 - **Mainline form:** if krunc graduates, the domain object would be (or register)
   a **built-in LSM** so "may this task do X?" is answered natively by "which
   `krunc_domain` is it in?" — the FreeBSD `prison_check()` model.
