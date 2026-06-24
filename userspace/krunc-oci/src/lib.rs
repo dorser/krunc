@@ -182,8 +182,11 @@ pub struct Linux {
     /// Paths to remount read-only inside the container.
     #[serde(default)]
     pub readonly_paths: Vec<String>,
+    /// Kernel sysctls to set in the container's namespaces (`name` -> `value`).
+    #[serde(default)]
+    pub sysctl: HashMap<String, String>,
     /// Other `linux` properties krunc does not model (rejected if present) —
-    /// e.g. `sysctl`, `devices`, `rootfsPropagation`, `intelRdt`, `seccomp`.
+    /// e.g. `devices`, `rootfsPropagation`, `intelRdt`, `seccomp`.
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
 }
@@ -635,6 +638,7 @@ pub fn config_to_spec(bundle: &Path, cfg: &OciConfig) -> Result<DomainSpec, OciE
     let gid_maps: Vec<IdMap> = Vec::new();
     let mut masked_paths = Vec::new();
     let mut readonly_paths = Vec::new();
+    let mut sysctls: Vec<String> = Vec::new();
     if let Some(linux) = &cfg.linux {
         for ns in &linux.namespaces {
             if ns.path.is_some() {
@@ -658,6 +662,16 @@ pub fn config_to_spec(bundle: &Path, cfg: &OciConfig) -> Result<DomainSpec, OciE
         }
         masked_paths = linux.masked_paths.clone();
         readonly_paths = linux.readonly_paths.clone();
+        // Translate linux.sysctl into "<relpath>=<value>" entries (the sysctl name
+        // with `.` -> `/`), validating each name so it cannot escape /proc/sys and
+        // each value so it is a single safe line. Sorted for a deterministic spec.
+        let mut entries: Vec<(String, String)> = linux
+            .sysctl
+            .iter()
+            .map(|(k, v)| Ok((sysctl_relpath(k)?, sysctl_value(v)?.to_string())))
+            .collect::<Result<Vec<_>, OciError>>()?;
+        entries.sort();
+        sysctls = entries.into_iter().map(|(p, v)| format!("{p}={v}")).collect();
     }
 
     let mut flags = 0u64;
@@ -737,9 +751,44 @@ pub fn config_to_spec(bundle: &Path, cfg: &OciConfig) -> Result<DomainSpec, OciE
         uid: process.user.as_ref().map(|u| u.uid).unwrap_or(0),
         gid: process.user.as_ref().map(|u| u.gid).unwrap_or(0),
         mounts,
+        sysctls,
     };
     spec.validate()?;
     Ok(spec)
+}
+
+/// Convert an OCI sysctl name (e.g. `net.ipv4.ip_forward`) into a path relative
+/// to `/proc/sys` (`net/ipv4/ip_forward`), rejecting anything that could escape
+/// `/proc/sys`: path traversal (`..`), absolute or trailing-slash names, empty
+/// components, or characters outside the conventional sysctl set.
+fn sysctl_relpath(name: &str) -> Result<String, OciError> {
+    let bad = || OciError::UnsupportedProperty(format!("linux.sysctl name {name:?}"));
+    if name.is_empty() {
+        return Err(bad());
+    }
+    if !name
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'/' | b'_' | b'-'))
+    {
+        return Err(bad());
+    }
+    let rel = name.replace('.', "/");
+    if rel.starts_with('/') || rel.ends_with('/') || rel.split('/').any(|c| c.is_empty() || c == "..")
+    {
+        return Err(bad());
+    }
+    Ok(rel)
+}
+
+/// Validate a sysctl value: a single line with no NUL or newline (so it cannot be
+/// used to inject additional writes). Returned unchanged.
+fn sysctl_value(value: &str) -> Result<&str, OciError> {
+    if value.bytes().any(|b| b == 0 || b == b'\n') {
+        return Err(OciError::UnsupportedProperty(format!(
+            "linux.sysctl value {value:?}"
+        )));
+    }
+    Ok(value)
 }
 
 #[cfg(test)]
@@ -950,15 +999,39 @@ mod tests {
 
     #[test]
     fn unmodeled_property_rejected() {
-        // linux.sysctl is not applied by krunc -> rejected, not silently ignored.
+        // an unmodeled linux property (rootfsPropagation) -> rejected, not silently
+        // ignored.
         let cfg = parse_config(
-            r#"{"process":{"args":["/x"]},"root":{"path":"r"},"linux":{"sysctl":{"a.b":"0"}}}"#,
+            r#"{"process":{"args":["/x"]},"root":{"path":"r"},"linux":{"rootfsPropagation":"private"}}"#,
         )
         .unwrap();
         assert!(matches!(
             config_to_spec(Path::new("/b"), &cfg),
             Err(OciError::UnsupportedProperty(_))
         ));
+    }
+
+    #[test]
+    fn sysctl_applied_and_path_safe() {
+        // linux.sysctl is modeled: names become /proc/sys-relative paths.
+        let cfg = parse_config(
+            r#"{"process":{"args":["/x"],"cwd":"/"},"root":{"path":"r"},"linux":{"sysctl":{"net.ipv4.ip_forward":"1"}}}"#,
+        )
+        .unwrap();
+        let spec = config_to_spec(Path::new("/b"), &cfg).unwrap();
+        assert_eq!(spec.sysctls, vec!["net/ipv4/ip_forward=1".to_string()]);
+        // a path-traversal sysctl name is rejected (cannot escape /proc/sys).
+        let evil = parse_config(
+            r#"{"process":{"args":["/x"],"cwd":"/"},"root":{"path":"r"},"linux":{"sysctl":{"../secret":"x"}}}"#,
+        )
+        .unwrap();
+        assert!(config_to_spec(Path::new("/b"), &evil).is_err());
+        // a value with a newline (write-injection attempt) is rejected.
+        let nl = parse_config(
+            "{\"process\":{\"args\":[\"/x\"],\"cwd\":\"/\"},\"root\":{\"path\":\"r\"},\"linux\":{\"sysctl\":{\"kernel.foo\":\"a\\nb\"}}}",
+        )
+        .unwrap();
+        assert!(config_to_spec(Path::new("/b"), &nl).is_err());
     }
 
     #[test]

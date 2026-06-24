@@ -75,6 +75,9 @@ if [ "$KRUNC_PIDS_TEST" = 1 ]; then
 		echo "[container]   /tmp    : NOT writable (unexpected)"
 	fi
 
+	echo "[container] --- sysctls (linux.sysctl applied by the kernel) ---"
+	echo "[container]   net.ipv4.ip_forward = $(cat /proc/sys/net/ipv4/ip_forward 2>&-)  (config requests 1)"
+
 	echo "[container] --- resource limits (rlimits / oom) ---"
 	echo "[container]   RLIMIT_NOFILE (ulimit -n) = $(ulimit -n)  (config soft=256)"
 

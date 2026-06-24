@@ -97,6 +97,8 @@ extern "C" {
     /// Create directory `path` (one level) in the current task's mount namespace
     /// so a nested mountpoint can be materialized inside a just-mounted parent.
     fn krunc_mkdir(path: *const c_char, mode: u16) -> c_int;
+    /// Write `data` (`len` bytes) to the file at `path` (e.g. a /proc/sys sysctl).
+    fn krunc_write_file(path: *const c_char, data: *const c_char, len: usize) -> c_int;
     /// Apply one resource limit (`setrlimit`) to the current task before exec.
     fn krunc_apply_rlimit(resource: c_uint, soft: u64, hard: u64) -> c_int;
     /// Set the current task's OOM-killer score adjustment before exec.
@@ -206,6 +208,7 @@ struct ContainerCtx {
     uid: u32,                  // target uid (process.user.uid)
     gid: u32,                  // target gid (process.user.gid)
     mounts: KVec<MountSpec>,   // mounts to perform (exactly config.mounts[], in order)
+    sysctls: KVec<KVec<u8>>,   // each "relpath=value"; written under /proc/sys before exec
     ctrl: Option<Arc<ContainerControl>>, // Some -> two-phase (created) container
 }
 
@@ -440,6 +443,7 @@ fn handle_text_command(buf: &[u8]) -> Result {
         0,
         0,
         default_proc_sys_mounts()?,
+        KVec::new(),
     )?;
     pr_info!("started container id={} pid={}\n", id, pid);
     Ok(())
@@ -636,6 +640,7 @@ struct DecodedSpec {
     uid: u32,
     gid: u32,
     mounts: KVec<MountSpec>,
+    sysctls: KVec<KVec<u8>>,
 }
 
 /// The five Linux capability sets applied to the container before exec.
@@ -787,6 +792,7 @@ fn decode_spec(buf: &[u8]) -> Result<DecodedSpec> {
         uid: 0,
         gid: 0,
         mounts: KVec::new(),
+        sysctls: KVec::new(),
     };
     let mut seen: u64 = 0; // bitset of section tags already parsed (tags < 64)
     for _ in 0..count {
@@ -836,6 +842,7 @@ fn decode_spec(buf: &[u8]) -> Result<DecodedSpec> {
                 d.gid = sr.u32()?;
             }
             17 => d.mounts = read_mounts_k(&mut sr)?, // MOUNTS
+            18 => d.sysctls = read_strvec_k(&mut sr)?, // SYSCTLS
             // tags 6/7 (uid/gid maps) land in a later milestone.
             _ => {}
         }
@@ -896,6 +903,7 @@ fn create_from_blob(spec: &[u8]) -> Result<(u64, i32)> {
         d.uid,
         d.gid,
         d.mounts,
+        d.sysctls,
     )
 }
 
@@ -918,6 +926,7 @@ fn spawn(
     uid: u32,
     gid: u32,
     mounts: KVec<MountSpec>,
+    sysctls: KVec<KVec<u8>>,
 ) -> Result<(u64, i32)> {
     let ctrl = if paused {
         Some(Arc::new(
@@ -949,6 +958,7 @@ fn spawn(
             uid,
             gid,
             mounts,
+            sysctls,
             ctrl: ctrl.as_ref().map(|a| a.clone()),
         },
         GFP_KERNEL,
@@ -1030,6 +1040,50 @@ fn apply_path_confinement(masked: &KVec<KVec<u8>>, readonly: &KVec<KVec<u8>>) {
 /// namespace while still privileged. Only the mounts in `config.mounts[]` are
 /// performed — krunc adds none of its own (per the runtime-spec, the runtime
 /// performs exactly the configured mounts).
+/// Apply each sysctl (a NUL-terminated `relpath=value`) by writing `value` to
+/// `/proc/sys/<relpath>` from kernel context, while still privileged and in the
+/// container's namespaces. A failure (e.g. a sysctl absent on this kernel, or a
+/// non-namespaced one) is logged but not fatal.
+fn apply_sysctls(sysctls: &KVec<KVec<u8>>) {
+    for i in 0..sysctls.len() {
+        let entry = &sysctls[i];
+        // entry is "relpath=value\0"; the first '=' splits it (relpath has none).
+        let eq = match entry.iter().position(|&b| b == b'=') {
+            Some(e) => e,
+            None => continue,
+        };
+        // value = bytes after '=' up to (but excluding) the trailing NUL.
+        let end = if entry.last() == Some(&0) {
+            entry.len() - 1
+        } else {
+            entry.len()
+        };
+        if eq + 1 > end {
+            continue;
+        }
+        let value = &entry[eq + 1..end];
+        // Build a NUL-terminated "/proc/sys/<relpath>" path.
+        let mut path: KVec<u8> = KVec::new();
+        if path.extend_from_slice(b"/proc/sys/", GFP_KERNEL).is_err()
+            || path.extend_from_slice(&entry[..eq], GFP_KERNEL).is_err()
+            || path.push(0, GFP_KERNEL).is_err()
+        {
+            continue;
+        }
+        // SAFETY: `path` is NUL-terminated; `value` ptr+len describe a valid slice.
+        let rc = unsafe {
+            krunc_write_file(
+                path.as_ptr() as *const c_char,
+                value.as_ptr() as *const c_char,
+                value.len(),
+            )
+        };
+        if rc != 0 {
+            pr_err!("krunc: sysctl write failed (entry {}): {}\n", i, rc);
+        }
+    }
+}
+
 fn apply_mounts(mounts: &KVec<MountSpec>) {
     for i in 0..mounts.len() {
         let m = &mounts[i];
@@ -1160,6 +1214,12 @@ unsafe extern "C" fn container_entry(arg: *mut c_void) -> c_int {
     // itself cannot do this once capabilities are dropped, so the kernel sets
     // them up here. Only the configured mounts are performed (krunc adds none).
     apply_mounts(&ctx.mounts);
+
+    // Apply sysctls (config.json `linux.sysctl`) now: after /proc is mounted but
+    // *before* read-only-paths confinement, which may remount /proc/sys read-only.
+    // Done while still privileged, in the container's namespaces. Each entry is a
+    // NUL-terminated "relpath=value"; write `value` to /proc/sys/<relpath>.
+    apply_sysctls(&ctx.sysctls);
 
     // Filesystem confinement, applied while still privileged so a compromised
     // workload cannot undo it later (it lives in the container's mount namespace

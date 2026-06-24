@@ -38,7 +38,8 @@
     "resources": { "pids": { "limit": 16 }, "memory": { "limit": 67108864 },
       "cpu": { "quota": 10000, "period": 100000 } },
     "maskedPaths": ["/proc/kcore", "/proc/sysrq-trigger"],
-    "readonlyPaths": ["/proc/sys", "/etc"]
+    "readonlyPaths": ["/proc/sys", "/etc"],
+    "sysctl": { "net.ipv4.ip_forward": "1" }
   },
   "mounts": [
     { "destination": "/proc", "type": "proc", "source": "proc" },

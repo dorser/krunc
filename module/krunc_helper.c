@@ -98,6 +98,7 @@ void krunc_set_oom_score_adj(int adj);
 int krunc_mount(const char *dev, const char *dir, const char *fstype,
 		unsigned long flags);
 int krunc_mkdir(const char *path, umode_t mode);
+int krunc_write_file(const char *path, const char *data, size_t len);
 pid_t krunc_spawn(int (*fn)(void *), void *arg, unsigned long flags);
 int krunc_execve(const char *filename, const char *const *argv,
 		 const char *const *envp);
@@ -320,6 +321,27 @@ int krunc_mkdir(const char *path, umode_t mode)
 	return err;
 }
 EXPORT_SYMBOL_GPL(krunc_mkdir);
+
+/* Write @data (@len bytes) to the file at @path (e.g. a /proc/sys sysctl) from
+ * kernel context, before exec. filp_open/kernel_write/filp_close are exported by
+ * mainline, so this needs no kallsyms resolution. Used to apply OCI sysctls in
+ * the container's namespaces while still privileged. */
+int krunc_write_file(const char *path, const char *data, size_t len)
+{
+	struct file *f;
+	loff_t pos = 0;
+	ssize_t n;
+
+	f = filp_open(path, O_WRONLY, 0);
+	if (IS_ERR(f))
+		return PTR_ERR(f);
+	n = kernel_write(f, data, len, &pos);
+	filp_close(f, NULL);
+	if (n < 0)
+		return (int)n;
+	return (size_t)n == len ? 0 : -EIO;
+}
+EXPORT_SYMBOL_GPL(krunc_write_file);
 
 /* ---- kallsyms bootstrap + symbol resolution ---- */
 

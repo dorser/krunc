@@ -45,6 +45,8 @@ pub const MAX_RLIMITS: usize = 32;
 
 /// Maximum number of mount entries.
 pub const MAX_MOUNTS: usize = 64;
+/// Max sysctls in a spec.
+pub const MAX_SYSCTLS: usize = 64;
 
 // ---- clone(2) namespace flags (uapi/linux/sched.h) ----
 /// `CLONE_NEWNS` — mount namespace.
@@ -190,6 +192,11 @@ pub struct DomainSpec {
     pub gid: u32,
     /// Mounts to perform inside the container, in order (empty = no mounts).
     pub mounts: Vec<Mount>,
+    /// Sysctls to set before exec, each `name=value` where `name` is the sysctl
+    /// path with `.` replaced by `/` (e.g. `net/ipv4/ip_forward=1`). The module
+    /// writes each under `/proc/sys/` while still privileged, in the container's
+    /// namespaces.
+    pub sysctls: Vec<String>,
 }
 
 // Section tags. Stable wire identifiers; never reuse a value.
@@ -210,6 +217,7 @@ mod tag {
     pub const CAP_SETS: u16 = 15;
     pub const USER: u16 = 16;
     pub const MOUNTS: u16 = 17;
+    pub const SYSCTLS: u16 = 18;
     // 10 (seccomp) and 18 (landlock) retired — never reuse.
 }
 
@@ -358,6 +366,7 @@ impl DomainSpec {
         check_len("readonly_paths", self.readonly_paths.len(), MAX_PATHS)?;
         check_len("rlimits", self.rlimits.len(), MAX_RLIMITS)?;
         check_len("mounts", self.mounts.len(), MAX_MOUNTS)?;
+        check_len("sysctls", self.sysctls.len(), MAX_SYSCTLS)?;
         Ok(())
     }
 
@@ -430,6 +439,9 @@ impl DomainSpec {
         }
         if !self.mounts.is_empty() {
             emit(tag::MOUNTS, &mut |w| write_mounts(w, &self.mounts));
+        }
+        if !self.sysctls.is_empty() {
+            emit(tag::SYSCTLS, &mut |w| write_strvec(w, &self.sysctls));
         }
 
         w.u32(count);
@@ -626,6 +638,9 @@ pub fn decode(buf: &[u8]) -> Result<(Op, DomainSpec), AbiError> {
             tag::MOUNTS => {
                 spec.mounts = read_mounts(&mut sr, "mounts")?;
             }
+            tag::SYSCTLS => {
+                spec.sysctls = read_strvec(&mut sr, "sysctls", MAX_SYSCTLS)?;
+            }
             _ => { /* unknown tag: ignore for forward-compat */ }
         }
     }
@@ -694,6 +709,7 @@ mod tests {
                     flags: 0x0000_000e, // MS_NOSUID|MS_NODEV|MS_NOEXEC
                 },
             ],
+            sysctls: vec!["net/ipv4/ip_forward=1".into()],
         }
     }
 
@@ -977,6 +993,7 @@ mod tests {
                         flags: sm64(&mut state),
                     })
                     .collect(),
+                sysctls: rand_strvec(&mut state, 3, 16),
             };
             let buf = spec.encode(Op::Create).expect("canonical in-bounds spec must encode");
             let (op, decoded) = decode(&buf).expect("must decode what we encoded");
