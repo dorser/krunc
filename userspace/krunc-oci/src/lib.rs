@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 
 use krunc_abi::{
     DomainSpec, IdMap, Mount, Rlimit, NS_CGROUP, NS_IPC, NS_MOUNT, NS_NET, NS_PID, NS_USER, NS_UTS,
-    OPT_NO_NEW_PRIVS,
+    OPT_NO_NEW_PRIVS, OPT_ROOTFS_RO,
 };
 use serde::Deserialize;
 
@@ -664,12 +664,14 @@ pub fn config_to_spec(bundle: &Path, cfg: &OciConfig) -> Result<DomainSpec, OciE
     if process.no_new_privileges {
         flags |= OPT_NO_NEW_PRIVS;
     }
-    // krunc enforced an immutable rootfs via a sealed Landlock domain; with
-    // Landlock removed it can no longer seal the rootfs, so a read-only rootfs is
-    // rejected rather than silently left writable. (It returns once pivot_root +
-    // a read-only mount land, or via an eBPF-LSM.)
+    // A read-only rootfs is enforced by the kernel module: it bind-mounts the
+    // rootfs onto itself and, once the submounts are in place, remounts it
+    // read-only (MS_REMOUNT|MS_BIND|MS_RDONLY) so the rootfs files are immutable
+    // while writable submounts (e.g. /tmp) stay writable. The module fails closed
+    // (refuses to exec) if it cannot apply the seal, so this is never silently
+    // left writable.
     if root.readonly {
-        return Err(OciError::UnsupportedProperty("root.readonly".into()));
+        flags |= OPT_ROOTFS_RO;
     }
 
     // A present `capabilities` object means the caller is managing caps and the
@@ -1079,10 +1081,8 @@ mod tests {
             r#"{"process":{"args":["/x"],"cwd":"/"},"root":{"path":"r","readonly":true}}"#,
         )
         .unwrap();
-        assert!(matches!(
-            config_to_spec(Path::new("/b"), &ro),
-            Err(OciError::UnsupportedProperty(_))
-        ));
+        let ro_spec = config_to_spec(Path::new("/b"), &ro).unwrap();
+        assert!(ro_spec.flags & OPT_ROOTFS_RO != 0);
     }
 
     #[test]

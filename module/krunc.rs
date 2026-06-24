@@ -146,6 +146,8 @@ const MAX_STR: usize = 4096;
 const ABI_VERSION: u32 = 1;
 /// `OPT_NO_NEW_PRIVS` from the krunc-abi `flags` section.
 const OPT_NO_NEW_PRIVS: u64 = 1 << 0;
+/// `OPT_ROOTFS_RO` from the krunc-abi `flags` section: seal the rootfs read-only.
+const OPT_ROOTFS_RO: u64 = 1 << 1;
 
 /// ioctl command numbers (we match on the _IOC_NR only, so the exact size/dir
 /// bits the userspace side encodes do not need to agree precisely).
@@ -196,6 +198,7 @@ struct ContainerCtx {
     envp: KVec<KVec<u8>>,      // each NUL-terminated; empty -> default env
     cap_sets: CapSets,         // the five capability sets applied before exec
     no_new_privs: bool,        // set no_new_privs before exec
+    readonly_rootfs: bool,     // seal the rootfs read-only (bind + remount-ro) before exec
     masked: KVec<KVec<u8>>,    // paths over-mounted to be inaccessible (each NUL-terminated)
     readonly: KVec<KVec<u8>>,  // paths remounted read-only (each NUL-terminated)
     rlimits: KVec<RLimit>,     // resource limits applied before exec
@@ -428,6 +431,7 @@ fn handle_text_command(buf: &[u8]) -> Result {
         flags,
         false,
         CapSets::default(),
+        false,
         false,
         KVec::new(),
         KVec::new(),
@@ -866,6 +870,7 @@ fn create_from_blob(spec: &[u8]) -> Result<(u64, i32)> {
     };
     let ns = if d.ns != 0 { d.ns as c_ulong } else { ALL_NS };
     let no_new_privs = d.flags & OPT_NO_NEW_PRIVS != 0;
+    let readonly_rootfs = d.flags & OPT_ROOTFS_RO != 0;
     let cap_sets = CapSets {
         present: d.cap_present,
         bounding: d.cap_bounding,
@@ -883,6 +888,7 @@ fn create_from_blob(spec: &[u8]) -> Result<(u64, i32)> {
         true,
         cap_sets,
         no_new_privs,
+        readonly_rootfs,
         d.masked,
         d.readonly,
         d.rlimits,
@@ -904,6 +910,7 @@ fn spawn(
     paused: bool,
     cap_sets: CapSets,
     no_new_privs: bool,
+    readonly_rootfs: bool,
     masked: KVec<KVec<u8>>,
     readonly: KVec<KVec<u8>>,
     rlimits: KVec<RLimit>,
@@ -934,6 +941,7 @@ fn spawn(
             envp,
             cap_sets,
             no_new_privs,
+            readonly_rootfs,
             masked,
             readonly,
             rlimits,
@@ -1070,6 +1078,38 @@ unsafe extern "C" fn container_entry(arg: *mut c_void) -> c_int {
         unsafe { krunc_set_hostname(ctx.hostname.as_ptr() as *const c_char, hlen) };
     }
 
+    // For a read-only rootfs: make the mount tree private and turn the rootfs into
+    // a mount of its own *before* chroot (while `rootfs` is still an absolute host
+    // path), so it can be sealed read-only once the submounts are in place. Making
+    // the tree private first stops the bind from propagating to the host.
+    if ctx.readonly_rootfs {
+        // SAFETY: FFI call, NUL-terminated literal path, this task's mount ns.
+        unsafe {
+            krunc_mount(
+                ptr::null(),
+                c"/".as_ptr() as *const c_char,
+                ptr::null(),
+                MS_REC | MS_PRIVATE,
+            );
+        }
+        // SAFETY: `rootfs` is NUL-terminated; bind it onto itself so it becomes a
+        // mount that can be remounted read-only after the submounts exist.
+        let rc = unsafe {
+            krunc_mount(
+                ctx.rootfs.as_ptr() as *const c_char,
+                ctx.rootfs.as_ptr() as *const c_char,
+                ptr::null(),
+                MS_BIND | MS_REC,
+            )
+        };
+        if rc != 0 {
+            pr_err!("krunc: bind-mount rootfs for read-only seal failed: {}\n", rc);
+            drop(ctx);
+            // SAFETY: never reached exec; exit cleanly (fail closed).
+            unsafe { krunc_exit(rc as c_long) };
+        }
+    }
+
     // SAFETY: `rootfs` is NUL-terminated.
     let cr = unsafe { krunc_chroot(ctx.rootfs.as_ptr() as *const c_char) };
     if cr != 0 {
@@ -1142,6 +1182,31 @@ unsafe extern "C" fn container_entry(arg: *mut c_void) -> c_int {
     if let Some(adj) = ctx.oom_score_adj {
         // SAFETY: FFI call into the vmlinux helper, operating on `current`.
         unsafe { krunc_set_oom_score_adj(adj as c_int) };
+    }
+
+    // Seal the rootfs read-only now that the submounts (/proc, /sys, /tmp, …) are
+    // in place: after chroot, "/" is the rootfs bind mount, and MS_REMOUNT|MS_BIND
+    // *without* MS_REC remounts only that mount, so the writable submounts on top
+    // stay writable while the rootfs files become immutable. Done while still
+    // privileged (before the cap drop). Fail closed: a requested-but-unenforced
+    // read-only rootfs is a security hole, so refuse to exec if the seal fails.
+    if ctx.readonly_rootfs {
+        // SAFETY: FFI call, NUL-terminated literal path, operating on this task's
+        // (already chrooted) mount namespace.
+        let rc = unsafe {
+            krunc_mount(
+                ptr::null(),
+                c"/".as_ptr() as *const c_char,
+                ptr::null(),
+                MS_REMOUNT | MS_BIND | MS_RDONLY,
+            )
+        };
+        if rc != 0 {
+            pr_err!("krunc: sealing read-only rootfs failed: {}\n", rc);
+            drop(ctx);
+            // SAFETY: never reached exec; exit cleanly (fail closed).
+            unsafe { krunc_exit(rc as c_long) };
+        }
     }
 
     // Privilege confinement, applied atomically in kernel context just before

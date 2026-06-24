@@ -60,6 +60,20 @@ if [ "$KRUNC_PIDS_TEST" = 1 ]; then
 	else
 		echo "[container]   /proc/sys: read-only, write denied (EROFS)"
 	fi
+	# read-only rootfs (root.readonly): the kernel bind-mounts the rootfs and
+	# remounts it read-only, so its files are immutable even to uid 0, while a
+	# writable mount like /tmp (a separate mount on top) stays writable.
+	touch /should-not-exist 2>/dev/null
+	if [ -e /should-not-exist ]; then
+		echo "[container]   rootfs / : WRITABLE (unexpected)"
+	else
+		echo "[container]   rootfs / : read-only, write denied (EROFS)"
+	fi
+	if touch /tmp/krunc-ok 2>/dev/null; then
+		echo "[container]   /tmp    : writable (scratch mount stays rw)"
+	else
+		echo "[container]   /tmp    : NOT writable (unexpected)"
+	fi
 
 	echo "[container] --- resource limits (rlimits / oom) ---"
 	echo "[container]   RLIMIT_NOFILE (ulimit -n) = $(ulimit -n)  (config soft=256)"
