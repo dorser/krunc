@@ -1,0 +1,84 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * krunc_lsm_loader.c - load + attach krunc's BPF-LSM kill-on-escape program and
+ * mark a container's cgroup as guarded. Runs in the (host) init context between
+ * `krunc create` and `krunc start`, so the policy is in force before the
+ * container's entrypoint executes.
+ *
+ *   krunc_lsm_loader <krunc_lsm.bpf.o> <cgroup-dir> <link-pin-path>
+ *     e.g. krunc_lsm_loader /krunc_lsm.bpf.o /sys/fs/cgroup/krunc/oci1 \
+ *                           /sys/fs/bpf/krunc_lsm
+ *
+ * It pins the attach link so the program stays attached after this process
+ * exits, then inserts the container's cgroup id (cgroup v2: the cgroup directory
+ * inode number, which is what bpf_get_current_cgroup_id() returns) into the
+ * `guarded` map.
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+#include <sys/stat.h>
+#include <bpf/libbpf.h>
+#include <bpf/bpf.h>
+
+int main(int argc, char **argv)
+{
+	if (argc != 4) {
+		fprintf(stderr, "usage: %s <bpf.o> <cgroup-dir> <link-pin>\n", argv[0]);
+		return 2;
+	}
+	const char *obj_path = argv[1];
+	const char *cgroup_dir = argv[2];
+	const char *pin_path = argv[3];
+
+	struct stat st;
+	if (stat(cgroup_dir, &st)) {
+		fprintf(stderr, "stat(%s): %s\n", cgroup_dir, strerror(errno));
+		return 1;
+	}
+	__u64 cgid = (__u64)st.st_ino; /* cgroup v2 id == cgroup dir inode */
+
+	struct bpf_object *obj = bpf_object__open_file(obj_path, NULL);
+	if (!obj || libbpf_get_error(obj)) {
+		fprintf(stderr, "open %s failed\n", obj_path);
+		return 1;
+	}
+	if (bpf_object__load(obj)) {
+		fprintf(stderr, "load failed: %s\n", strerror(errno));
+		return 1;
+	}
+
+	struct bpf_program *prog =
+		bpf_object__find_program_by_name(obj, "krunc_file_open");
+	if (!prog) {
+		fprintf(stderr, "program krunc_file_open not found\n");
+		return 1;
+	}
+	struct bpf_link *link = bpf_program__attach(prog);
+	if (!link || libbpf_get_error(link)) {
+		fprintf(stderr, "attach failed: %s\n", strerror(errno));
+		return 1;
+	}
+	/* Persist the attachment past our exit. */
+	if (bpf_link__pin(link, pin_path)) {
+		fprintf(stderr, "pin %s: %s\n", pin_path, strerror(errno));
+		return 1;
+	}
+
+	int mapfd = bpf_object__find_map_fd_by_name(obj, "guarded");
+	if (mapfd < 0) {
+		fprintf(stderr, "map 'guarded' not found\n");
+		return 1;
+	}
+	__u8 one = 1;
+	if (bpf_map_update_elem(mapfd, &cgid, &one, BPF_ANY)) {
+		fprintf(stderr, "map update: %s\n", strerror(errno));
+		return 1;
+	}
+
+	printf("krunc_lsm: guarding cgroup %s (id %llu); kill-on-escape armed\n",
+	       cgroup_dir, (unsigned long long)cgid);
+	return 0;
+}

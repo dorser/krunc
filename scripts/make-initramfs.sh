@@ -77,6 +77,27 @@ if [ -x "$CPUHOG" ]; then
 	chmod +x "$ROOT/bundle/rootfs/bin/cpuhog"
 fi
 
+# Optional: BPF-LSM kill-on-escape demo (M8). If the BPF artifacts were built
+# (scripts/build-bpf.sh), stage the loadable LSM object + static loader and a
+# minimal "escape" bundle whose PID 1 opens a tripwire file. The demo init
+# (scripts/qemu-bpflsm-init.sh) guards the container's cgroup, so the open is
+# denied and the container is SIGKILL'd by the BPF-LSM program.
+if [ -f "$REPO/module/krunc_lsm.bpf.o" ] && [ -x "$REPO/module/krunc_lsm_loader" ]; then
+	cp "$REPO/module/krunc_lsm.bpf.o" "$ROOT/krunc_lsm.bpf.o"
+	cp "$REPO/module/krunc_lsm_loader" "$ROOT/bin/krunc_lsm_loader"
+	chmod +x "$ROOT/bin/krunc_lsm_loader"
+	mkdir -p "$ROOT"/esc/rootfs/bin "$ROOT"/esc/rootfs/proc \
+	         "$ROOT"/esc/rootfs/sys "$ROOT"/esc/rootfs/dev "$ROOT"/esc/rootfs/tmp
+	cp "$BB" "$ROOT/esc/rootfs/bin/busybox"
+	ln -sf busybox "$ROOT/esc/rootfs/bin/sh"
+	ln -sf busybox "$ROOT/esc/rootfs/bin/cat"
+	ln -sf busybox "$ROOT/esc/rootfs/bin/echo"
+	# the tripwire: if the BPF-LSM fails to deny+kill, cat prints this content.
+	printf 'ESCAPE-SUCCEEDED-BPF-LSM-FAILED\n' > "$ROOT/esc/rootfs/krunc-escape"
+	cp "$REPO/examples/bundle/esc-config.json" "$ROOT/esc/config.json"
+	chmod +x "$ROOT/esc/rootfs/bin/busybox"
+fi
+
 # Optional: OCI conformance bundle running the official opencontainers/
 # runtime-tools `runtimetest` as the container entrypoint (see
 # scripts/qemu-conformance-init.sh). The config stays within krunc's accepted

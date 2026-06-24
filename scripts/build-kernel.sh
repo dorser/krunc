@@ -44,6 +44,22 @@ scripts/config \
 	--enable SERIAL_8250 --enable SERIAL_8250_CONSOLE \
 	--enable SAMPLES --enable SAMPLE_RUST --module SAMPLE_RUST_MISC_DEVICE
 
+# Optional (M8): a kernel that can run krunc's patch-free BPF-LSM kill-on-escape
+# program (scripts/build-bpf.sh + run-bpflsm.sh). Enabled with KRUNC_BPF_LSM=1.
+# Adds BPF + the BPF LSM (already in the default CONFIG_LSM list), BTF (for the
+# CO-RE vmlinux.h), and FUNCTION_TRACER -> DYNAMIC_FTRACE_WITH_DIRECT_CALLS, which
+# BPF trampolines (and thus LSM attach) require. All config-only; no source patch.
+if [ "${KRUNC_BPF_LSM:-0}" = 1 ]; then
+	echo "==> KRUNC_BPF_LSM=1: enabling BPF-LSM + BTF + ftrace direct calls"
+	scripts/config \
+		--enable BPF --enable BPF_SYSCALL --enable BPF_JIT --enable BPF_JIT_ALWAYS_ON \
+		--enable BPF_LSM --enable BPF_EVENTS \
+		--enable DEBUG_INFO_BTF --enable DEBUG_INFO_DWARF4 \
+		--disable DEBUG_INFO_BTF_MODULES \
+		--enable FUNCTION_TRACER --enable DYNAMIC_FTRACE \
+		--disable WERROR
+fi
+
 make -j"$JOBS" olddefconfig
 
 echo "==> sanity: CONFIG_RUST must be y"

@@ -1,0 +1,28 @@
+{
+  "ociVersion": "1.0.2-dev",
+  "process": {
+    "terminal": false,
+    "user": { "uid": 0, "gid": 0 },
+    "args": [
+      "/bin/sh", "-c",
+      "echo '[container] PID 1 alive; opening tripwire /krunc-escape (BPF-LSM should kill+deny)'; exec /bin/busybox cat /krunc-escape"
+    ],
+    "cwd": "/",
+    "noNewPrivileges": true
+  },
+  "root": { "path": "rootfs", "readonly": false },
+  "linux": {
+    "namespaces": [
+      { "type": "pid" },
+      { "type": "mount" },
+      { "type": "uts" },
+      { "type": "ipc" },
+      { "type": "network" }
+    ],
+    "cgroupsPath": "krunc/esc",
+    "resources": { "pids": { "limit": 64 } }
+  },
+  "mounts": [
+    { "destination": "/proc", "type": "proc", "source": "proc" }
+  ]
+}
