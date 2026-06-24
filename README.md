@@ -186,6 +186,9 @@ docs/
 
 ## Build & run
 
+> **New here? See [`QUICKSTART.md`](QUICKSTART.md)** for a step-by-step,
+> copy-pasteable walkthrough (provision a VM → build the kernel → run a container).
+
 krunc needs a kernel built with `CONFIG_RUST=y` (plus `CONFIG_KPROBES` and
 `CONFIG_KALLSYMS_ALL`, which let the helper module resolve the kernel primitives
 it needs at load time — **no kernel source patch**), so everything is built and
