@@ -1,1 +1,1 @@
-obj-m := krunc.o
+obj-m := krunc.o krunc_helper.o

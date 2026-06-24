@@ -13,6 +13,7 @@ mount -t devtmpfs dev  /dev             2>/dev/null
 mount -t tmpfs    tmp  /tmp             2>/dev/null
 mount -t cgroup2  cgrp /sys/fs/cgroup   2>/dev/null
 
+insmod /krunc_helper.ko 2>/dev/null || echo "WARNING: insmod /krunc_helper.ko failed"
 if insmod /krunc.ko 2>/dev/null; then
 	echo "krunc.ko loaded -> $(ls -l /dev/krunc 2>/dev/null)"
 else

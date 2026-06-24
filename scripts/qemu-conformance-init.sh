@@ -32,6 +32,7 @@ if [ ! -d /conformance ]; then
 fi
 
 echo "[vm] loading krunc.ko ..."
+insmod /krunc_helper.ko || { echo "[vm] insmod krunc_helper FAILED"; sleep 2; poweroff -f; }
 insmod /krunc.ko || { echo "[vm] insmod FAILED"; sleep 2; poweroff -f; }
 echo "[vm] /dev/krunc: $(ls -l /dev/krunc 2>/dev/null)"
 

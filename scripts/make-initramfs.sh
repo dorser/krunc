@@ -7,6 +7,7 @@ OUT="${OUT:-$HOME/krunc-initramfs.cpio.gz}"
 BB="$(command -v busybox || echo /bin/busybox)"
 [ -x "$BB" ] || { echo "busybox-static not found (apt install busybox-static)"; exit 1; }
 [ -f "$REPO/module/krunc.ko" ] || { echo "build krunc.ko first (scripts/build-module.sh)"; exit 1; }
+[ -f "$REPO/module/krunc_helper.ko" ] || { echo "build krunc_helper.ko first (scripts/build-module.sh)"; exit 1; }
 KRUNC_BIN="$REPO/userspace/target/x86_64-unknown-linux-musl/release/krunc"
 [ -x "$KRUNC_BIN" ] || { echo "build the CLI first (scripts/build-cli.sh)"; exit 1; }
 
@@ -28,6 +29,7 @@ mkdir -p "$ROOT"/bundle/rootfs/bin "$ROOT"/bundle/rootfs/proc \
 cp "$BB" "$ROOT/bin/busybox"
 ln -sf busybox "$ROOT/bin/sh"
 cp "${INIT:-$REPO/scripts/qemu-init.sh}" "$ROOT/init"
+cp "$REPO/module/krunc_helper.ko" "$ROOT/krunc_helper.ko"
 cp "$REPO/module/krunc.ko" "$ROOT/krunc.ko"
 cp "$KRUNC_BIN" "$ROOT/bin/krunc"
 chmod +x "$ROOT/init" "$ROOT/bin/busybox" "$ROOT/bin/krunc"

@@ -18,7 +18,7 @@ if [ ! -x "$STAGE/croot/bin/containerd" ]; then
 	bash "$REPO/scripts/setup-containerd-image.sh"
 fi
 
-[ -f "$REPO/module/krunc.ko" ] || bash "$REPO/scripts/build-module.sh"
+{ [ -f "$REPO/module/krunc.ko" ] && [ -f "$REPO/module/krunc_helper.ko" ]; } || bash "$REPO/scripts/build-module.sh"
 [ -x "$REPO/userspace/target/x86_64-unknown-linux-musl/release/krunc" ] || bash "$REPO/scripts/build-cli.sh"
 
 echo "==> building containerd initramfs"

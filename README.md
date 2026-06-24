@@ -25,7 +25,7 @@ kernel context. Userspace only submits a one-line spec.
   $ echo 'run rootfs=/c host=demo \      |   /dev/krunc (misc device, Rust)
           exec=/bin/sh arg=/init.sh' \   |        │ write_iter(): parse spec
         > /dev/krunc                     |        ▼
-                                         |   user_mode_thread(CLONE_NEWPID|NEWNS|
+                                         |   krunc_spawn(CLONE_NEWPID|NEWNS|
                                          |        │            NEWUTS|NEWIPC|NEWNET)
                                          |        ▼  (new task = PID 1 of new ns)
                                          |   container_entry()  [kernel context]
@@ -64,11 +64,11 @@ bin  dev  init.sh  proc  sys  tmp
 A container is created without a single userspace orchestration syscall:
 
 1. A `write()` to `/dev/krunc` runs in the calling process's context. The Rust
-   module parses the spec and calls **`user_mode_thread()`** with the namespace
-   clone flags. This is the very primitive the kernel uses to create the real
-   `init` at boot: it makes a task that starts in fresh namespaces and is allowed
-   to later `kernel_execve()` into userspace. With `CLONE_NEWPID` the new task is
-   **PID 1 of a brand-new PID namespace**.
+   module parses the spec and calls **`krunc_spawn()`** (a `kernel_clone()` that,
+   like the primitive the kernel uses to create the real `init` at boot, makes a
+   task that starts in fresh namespaces and is allowed to later `kernel_execve()`
+   into userspace) with the namespace clone flags. With `CLONE_NEWPID` the new
+   task is **PID 1 of a brand-new PID namespace**.
 2. That task runs `container_entry()` in kernel context, which:
    - sets the container hostname in its private UTS namespace,
    - performs an **in-kernel chroot** into the container rootfs,
@@ -148,9 +148,10 @@ tracked in [`docs/ROADMAP.md`](docs/ROADMAP.md).
 module/                Rust kernel module (the runtime itself)
   krunc.rs             misc device, text + ioctl control, binary-spec decode,
                        registry, container_entry (chroot + caps + no_new_privs + exec)
-  Kbuild, Makefile     out-of-tree module build
-kernel-patch/
-  krunc_exports.c      tiny vmlinux shim: krunc_spawn, krunc_apply_creds + helpers
+  krunc_helper.c       small C sibling module: resolves the non-exported kernel
+                       primitives via kprobe→kallsyms_lookup_name and re-exports
+                       krunc_spawn, krunc_apply_creds + helpers (NO vmlinux patch)
+  Kbuild, Makefile     out-of-tree build of both modules
 userspace/             all-Rust userspace (Cargo workspace)
   krunc-abi/           versioned, bounds-checked binary spec (no_std-friendly, no unsafe)
   krunc-oci/           OCI config.json -> DomainSpec translation (serde)
@@ -161,10 +162,11 @@ examples/
 scripts/
   vm-setup.sh          install kernel + Rust-for-Linux toolchain on a test VM
   pin-rust.sh          pin the exact rustc/bindgen the kernel requires
-  build-kernel.sh      configure + build a kernel with CONFIG_RUST + the shim
-  build-module.sh      build the out-of-tree krunc.ko
+  build-kernel.sh      configure + build a vanilla kernel with CONFIG_RUST +
+                       KPROBES/KALLSYMS (no source patch)
+  build-module.sh      build the out-of-tree krunc_helper.ko + krunc.ko
   build-cli.sh         build the static (musl) all-Rust krunc CLI
-  make-initramfs.sh    assemble busybox + krunc.ko + krunc CLI + rootfs/bundle
+  make-initramfs.sh    assemble busybox + krunc_helper.ko + krunc.ko + CLI + rootfs/bundle
   run-qemu.sh          boot the test kernel under QEMU/KVM
   qemu-init.sh         the in-VM demo driver (text + OCI lifecycle + confinement + unload)
   run-interactive.sh   boot to a shell to drive krunc by hand (incl. `krunc run`)
@@ -184,23 +186,26 @@ docs/
 
 ## Build & run
 
-krunc needs a kernel built with `CONFIG_RUST=y` plus a small vmlinux shim, so
-everything is built and tested on a disposable VM (the demo boots the kernel
-under QEMU/KVM, so a module bug never touches the build host). The flow:
+krunc needs a kernel built with `CONFIG_RUST=y` (plus `CONFIG_KPROBES` and
+`CONFIG_KALLSYMS_ALL`, which let the helper module resolve the kernel primitives
+it needs at load time — **no kernel source patch**), so everything is built and
+tested on a disposable VM (the demo boots the kernel under QEMU/KVM, so a module
+bug never touches the build host). The flow:
 
 ```sh
 # on a fresh Ubuntu VM with nested virtualization (e.g. an Azure D-series v5):
 scripts/vm-setup.sh                 # build deps + rustup + clang/lld + qemu + busybox
 # fetch a kernel source tree (linux-6.18 was used here), then:
 scripts/pin-rust.sh   ~/linux-6.18  # install the rustc/bindgen the kernel wants
-REPO=~/krunc KSRC=~/linux-6.18 scripts/build-kernel.sh   # kernel + shim (~5 min, 16 cores)
-scripts/run-test.sh                 # build krunc.ko, make initramfs, boot QEMU demo
+REPO=~/krunc KSRC=~/linux-6.18 scripts/build-kernel.sh   # vanilla kernel (~5 min, 16 cores)
+scripts/run-test.sh                 # build the modules, make initramfs, boot QEMU demo
 ```
 
-`scripts/build-kernel.sh` bases the config on `defconfig` + `kvm_guest.config`,
-enables Rust and the namespaces, and compiles `kernel-patch/krunc_exports.c`
-into vmlinux. Once the kernel is built once, `scripts/run-test.sh` is the fast
-iteration loop.
+`scripts/build-kernel.sh` bases the config on `defconfig` + `kvm_guest.config`
+and enables Rust, the namespaces, and `KPROBES`/`KALLSYMS_ALL`. No source file is
+added to the kernel tree: `module/krunc_helper.ko` resolves the non-exported
+primitives at load time. Once the kernel is built once, `scripts/run-test.sh` is
+the fast iteration loop.
 
 ### Run containers by hand
 
@@ -260,10 +265,14 @@ it is not production software. Notable simplifications and known limitations:
 - **Lifecycle.** The container registry detects liveness lazily (signal-0
   probe) but does not reap; exited containers linger in the table until
   `delete`/unload.
-- **vmlinux shim.** `kernel-patch/krunc_exports.c` exports `krunc_spawn`
-  (clone without `CLONE_VM`), re-exports `user_mode_thread`/`kernel_execve`, and
-  adds thin `krunc_{set_hostname,chroot,kill}` helpers. All policy/logic lives in
-  Rust; the shim only exposes generic primitives.
+- **helper module (no kernel patch).** `module/krunc_helper.c` builds as a tiny
+  C sibling module that resolves the non-exported kernel primitives at load time
+  via `kprobe→kallsyms_lookup_name`, then re-exports `krunc_spawn` (clone without
+  `CLONE_VM`), `krunc_execve`, and thin `krunc_{set_hostname,chroot,kill,…}`
+  helpers for the Rust module. It is `insmod`ed before `krunc.ko`. All policy/logic
+  lives in Rust; the helper only exposes generic primitives. This is what lets
+  krunc run on a **vanilla** `CONFIG_RUST` kernel (with `CONFIG_KPROBES` +
+  `CONFIG_KALLSYMS_ALL`) — no kernel source patch.
 
 See [`docs/DESIGN.md`](docs/DESIGN.md) for the reasoning behind each choice and a
 list of natural next steps (cgroups, pivot_root + mount setup, capability

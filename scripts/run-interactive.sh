@@ -10,7 +10,7 @@ KDIR="${KDIR:-$HOME/linux-6.18}"
 INITRAMFS="${INITRAMFS:-$HOME/krunc-shell-initramfs.cpio.gz}"
 BZ="$KDIR/arch/x86/boot/bzImage"
 
-[ -f "$REPO/module/krunc.ko" ] || bash "$REPO/scripts/build-module.sh"
+{ [ -f "$REPO/module/krunc.ko" ] && [ -f "$REPO/module/krunc_helper.ko" ]; } || bash "$REPO/scripts/build-module.sh"
 [ -x "$REPO/userspace/target/x86_64-unknown-linux-musl/release/krunc" ] || bash "$REPO/scripts/build-cli.sh"
 
 echo "==> building interactive initramfs"

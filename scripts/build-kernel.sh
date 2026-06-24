@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# build-kernel.sh - configure + build linux-6.18 with Rust support, the krunc
-# vmlinux export shim, and a KVM-guest-friendly config for QEMU testing.
+# build-kernel.sh - configure + build a VANILLA linux-6.18 with Rust support and
+# a KVM-guest-friendly config for QEMU testing. No source patch is applied:
+# krunc_helper.ko resolves the non-exported kernel primitives at load time via
+# kprobe→kallsyms_lookup_name (needs CONFIG_KPROBES + CONFIG_KALLSYMS).
 set -euo pipefail
 
 KSRC="${KSRC:-$HOME/linux-6.18}"
@@ -12,12 +14,6 @@ export LLVM=1            # build the whole kernel (and Rust) with clang/lld
 
 cd "$KSRC"
 
-echo "==> install vmlinux export shim (krunc_exports.c)"
-cp "$REPO/kernel-patch/krunc_exports.c" kernel/krunc_exports.c
-if ! grep -q 'krunc_exports.o' kernel/Makefile; then
-	echo 'obj-y += krunc_exports.o' >> kernel/Makefile
-fi
-
 echo "==> base config: defconfig + kvm_guest.config"
 make -j"$JOBS" defconfig
 make -j"$JOBS" kvm_guest.config
@@ -26,16 +22,21 @@ echo "==> enable Rust, namespaces, modules, initramfs"
 # CONFIG_RUST requires rustc >= 1.81 when CALL_PADDING is on (selected by the
 # call-depth-tracking mitigation). We pin rustc 1.78 (the kernel's documented
 # minimum), so disable that mitigation instead. Irrelevant for a PoC.
+#
+# KPROBES + KALLSYMS(_ALL) let krunc_helper.ko resolve the non-exported kernel
+# primitives at load time (kprobe→kallsyms_lookup_name) — this is what makes
+# krunc work on a VANILLA CONFIG_RUST kernel with NO source patch. KALLSYMS_ALL
+# is required because one resolved symbol (uts_sem) is a data object, which plain
+# KALLSYMS omits from the symbol table.
 scripts/config \
 	--enable RUST \
 	--disable MODVERSIONS \
 	--disable MITIGATION_CALL_DEPTH_TRACKING --disable CALL_THUNKS \
 	--disable MODULE_SIG_FORCE \
 	--enable MODULES --enable MODULE_UNLOAD \
+	--enable KPROBES --enable KALLSYMS --enable KALLSYMS_ALL \
 	--enable NAMESPACES \
 	--enable PID_NS --enable UTS_NS --enable IPC_NS --enable NET_NS --enable USER_NS \
-	--enable SECCOMP --enable SECCOMP_FILTER \
-	--enable SECURITY --enable SECURITY_LANDLOCK \
 	--enable CGROUPS --enable CGROUP_PIDS --enable MEMCG \
 	--enable DEVTMPFS --enable DEVTMPFS_MOUNT \
 	--enable BLK_DEV_INITRD --enable RD_GZIP --enable RD_XZ \

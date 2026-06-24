@@ -17,6 +17,7 @@ mount -t tmpfs    run  /run                2>/dev/null
 mount -t cgroup2  cgrp /sys/fs/cgroup      2>/dev/null
 mkdir -p /var/lib/containerd /var/lib/nerdctl /run/containerd /etc/containerd /opt/cni/bin /tmp
 
+insmod /krunc_helper.ko 2>/dev/null || echo "WARNING: insmod /krunc_helper.ko failed"
 if insmod /krunc.ko 2>/dev/null; then
 	echo "krunc.ko loaded -> $(ls -l /dev/krunc 2>/dev/null)"
 else

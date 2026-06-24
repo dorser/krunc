@@ -28,6 +28,7 @@ echo "# host hostname : $(hostname)"
 echo "##################################################################"
 
 echo "[vm] loading krunc.ko ..."
+insmod /krunc_helper.ko || { echo "[vm] insmod krunc_helper FAILED"; sleep 2; poweroff -f; }
 insmod /krunc.ko || { echo "[vm] insmod FAILED"; sleep 2; poweroff -f; }
 echo "[vm] loaded; control device: $(ls -l /dev/krunc 2>/dev/null)"
 

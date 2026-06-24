@@ -62,26 +62,37 @@ kernel context inside the new namespaces:
    returns 0 and the program runs when `container_entry` returns. The task
    becomes the container's userspace PID 1.
 
-## 4. The vmlinux export shim
+## 4. The krunc_helper module (kallsyms shim — no kernel patch)
 
 Out-of-tree modules may only link against `EXPORT_SYMBOL`'d symbols. The
-primitives krunc needs are deliberately *not* exported by mainline, so
-`kernel-patch/krunc_exports.c` is compiled into vmlinux (`obj-y`) and:
+primitives krunc needs (`kernel_clone`, `kernel_execve`, `set_fs_root`,
+`path_mount`, `vfs_mkdir`, `do_exit`, the cred/rlimit helpers, …) are
+deliberately *not* exported by mainline. Rather than patch vmlinux to export
+them — which would defeat the goal of running on an **unmodified** kernel —
+`module/krunc_helper.c` builds as a small C sibling module that:
 
-- **re-exports** `user_mode_thread` and `kernel_execve` (existing, non-static
-  functions);
-- provides three **thin helpers** that wrap struct-/locking-heavy bits so the
-  Rust side never needs `task_struct`/`fs_struct`/`uts`/`pid` layout:
-  `krunc_set_hostname`, `krunc_chroot`, `krunc_kill`.
+- resolves each non-exported symbol **at load time** via
+  `kprobe → kallsyms_lookup_name` (the kprobe trick is needed because
+  `kallsyms_lookup_name` itself stopped being exported in 5.7); then
+- `EXPORT_SYMBOL_GPL`s thin `krunc_*` wrappers — `krunc_spawn` (a `kernel_clone`
+  without `CLONE_VM`), `krunc_execve`, and helpers that wrap the struct-/
+  locking-heavy bits (`krunc_set_hostname`, `krunc_chroot`, `krunc_kill`,
+  `krunc_apply_creds`, `krunc_mount`, `krunc_mkdir`, …) so the Rust side never
+  needs `task_struct`/`fs_struct`/`cred`/`kernel_clone_args` layout.
 
-This keeps the runtime out-of-tree (fast `insmod`/`rmmod` iteration) while only
-requiring the kernel to be built once. Crucially, **all policy and logic remain
-in the Rust module** — the shim only exposes generic primitives comparable to
-what the kernel already provides internally.
+`krunc_helper.ko` is `insmod`ed before `krunc.ko`; the two share the build's
+`Module.symvers`, so `krunc.ko` links against the helper's exports with no extra
+plumbing. The kernel needs only `CONFIG_RUST=y` (for `krunc.ko`), `CONFIG_KPROBES`
+and `CONFIG_KALLSYMS_ALL` (the last because one resolved symbol, `uts_sem`, is a
+data object) — **no source patch**. The struct-heavy work stays in C (with kernel
+headers) precisely so the Rust module never depends on those layouts.
 
-An alternative considered was building krunc in-tree as `obj-y` (which can call
-any symbol with no exports). The export-shim + out-of-tree split was chosen for
-a much faster module edit/build/load loop.
+An alternative considered was building krunc fully in-tree as `obj-y` (which can
+call any symbol with no exports). The kallsyms-helper + out-of-tree split was
+chosen because it runs on a vanilla kernel and keeps a fast `insmod`/`rmmod`
+iteration loop. Crucially, **all policy and logic remain in the Rust module** —
+the helper only exposes generic primitives comparable to what the kernel already
+provides internally.
 
 ## 5. Memory & lifetime details
 

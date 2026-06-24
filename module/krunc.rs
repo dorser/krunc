@@ -17,8 +17,10 @@
 //!   releases it.
 //!
 //! The handful of primitives mainline does not export to modules
-//! (`user_mode_thread`, `kernel_execve`, plus thin `krunc_*` helpers) come from
-//! `kernel/krunc_exports.c`, compiled into vmlinux. All policy lives here.
+//! (`kernel_clone`, `kernel_execve`, plus thin `krunc_*` helpers) come from
+//! `krunc_helper.ko`, a small C sibling module that resolves them at load time
+//! via `kprobe → kallsyms_lookup_name` — so no vmlinux patch is needed. All
+//! policy lives here.
 
 use core::ptr;
 use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
@@ -47,7 +49,7 @@ module! {
     license: "GPL",
 }
 
-// -- FFI: primitives exported by kernel/krunc_exports.c (built into vmlinux) ---
+// -- FFI: primitives exported by krunc_helper.ko (the C kallsyms shim module) ---
 extern "C" {
     /// Create a container init task in fresh namespaces (clones without
     /// CLONE_VM so it does not share the caller's address space). Returns the
@@ -57,7 +59,7 @@ extern "C" {
         arg: *mut c_void,
         flags: c_ulong,
     ) -> c_int;
-    fn kernel_execve(
+    fn krunc_execve(
         filename: *const c_char,
         argv: *const *const c_char,
         envp: *const *const c_char,
@@ -1201,7 +1203,7 @@ unsafe extern "C" fn container_entry(arg: *mut c_void) -> c_int {
     // task's registers to enter the new program and returns 0 here, so we must
     // RETURN (below) for the task to enter userspace. On failure there is no
     // user context to return to, so we exit cleanly instead.
-    let rc = unsafe { kernel_execve(argv_ptr[0], argv_ptr.as_ptr(), envp) };
+    let rc = unsafe { krunc_execve(argv_ptr[0], argv_ptr.as_ptr(), envp) };
     if rc != 0 {
         pr_err!("execve failed: {}\n", rc);
         drop(ctx); // free before exiting
