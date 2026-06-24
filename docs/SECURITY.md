@@ -73,13 +73,15 @@ Ordering is load-bearing: `no_new_privs` before privilege drop (so a SUID
 payload can't gain privilege); rootfs setup before privilege drop; caps/cgroups/
 rlimits before the untrusted rootfs runs. The removed seccomp/Landlock stages
 required kernel source patches; the patch-free immutable rootfs is now enforced
-by `root.readonly` bind+remount-ro, while active policy is planned via eBPF-LSM.
+by `root.readonly` bind+remount-ro, while active kill-on-escape is now
+implemented via patch-free BPF-LSM.
 
 ### Implementation status (verified in QEMU vs. designed)
 
 The pipeline above is the current patch-free flow; the full design adds the
-planned controls called out below. What the current PoC **implements and verifies
-from the host** (see `docs/sample-v2-confinement.txt`):
+remaining planned controls called out below. What the current PoC **implements
+and verifies from the host/VM** (see `docs/sample-v2-confinement.txt` and the
+BPF-LSM tripwire run):
 
 | Control | Status | Evidence (host-side) |
 |---|---|---|
@@ -92,7 +94,7 @@ from the host** (see `docs/sample-v2-confinement.txt`):
 | `maskedPaths` + `readonlyPaths` | done | `/proc/kcore`→0 bytes; `/etc`,`/proc/sys` `EROFS` |
 | OCI `mounts[]` (config-driven, with `nosuid/nodev/noexec/ro`) | done | `/tmp` = `tmpfs rw,nosuid,nodev,noexec` |
 | seccomp (OCI→BPF, installed after `no_new_privs`) | removed (required a kernel source patch) | configs with `linux.seccomp` are rejected; `Seccomp: 0` |
-| **active kill-on-escape** (planned eBPF-LSM replacement) | planned | replaces the removed seccomp `SCMP_ACT_KILL_PROCESS` path with patch-free runtime LSM hooks |
+| **active kill-on-escape** (BPF-LSM replacement) | done | runtime-attached `BPF_PROG_TYPE_LSM` on `file_open`, cgroup-id-keyed `guarded` map, `bpf_send_signal(SIGKILL)`+`-EPERM`; guarded container SIGKILL'd at tripwire `open(2)`, never read the file, `krunc state`=`stopped` |
 | cgroup v2 `pids` | done | kernel denies forks; `pids.current==pids.max` |
 | cgroup v2 `memory` | done | memhog past `memory.max` → memcg OOM kill; `memory.events oom_kill 1` |
 | cgroup v2 `cpu` | done | cpuhog under `cpu.max` throttled; `cpu.stat nr_throttled` climbs |
@@ -100,11 +102,11 @@ from the host** (see `docs/sample-v2-confinement.txt`):
 | `linux.sysctl` | done | `net.ipv4.ip_forward`=1 in the container netns |
 | `pivot_root` (replacing chroot) | deferred | immutability achieved via `root.readonly`; no callable in-kernel `pivot_root` on 6.18 |
 | user-ns uid/gid mapping | planned | — |
-| BPF-LSM rich-context active kill-on-escape | planned | patch-free path/mount/syscall-aware policy attached at runtime |
+| BPF-LSM richer path/mount/syscall policy | planned | extends the patch-free runtime LSM path beyond the VM-verified `file_open` tripwire |
 
-Everything marked *done* is applied **atomically in kernel context before the
-first userspace instruction** and (for the sealed controls) holds for the
-container's whole life.
+Everything marked *done* is armed before the first container userspace
+instruction (setup controls in kernel context; BPF-LSM between create/start) and
+(for the sealed controls) holds for the container's whole life.
 
 ## 4. P2 — lifetime confinement (post-setup escapes)
 
@@ -116,8 +118,9 @@ the domain object *owns and applies atomically*:
 - **seccomp precedent (not used by the current PoC)** — the proven mainline model
   for sealed, inherited, monotonic syscall filtering under `no_new_privs`.
   krunc removed its seccomp implementation because a loadable module needed a
-  kernel source patch for the required helpers; planned eBPF-LSM hooks are the
-  patch-free replacement for active syscall/path/mount-aware policy.
+  kernel source patch for the required helpers; the BPF-LSM kill-on-escape hook is
+  now the patch-free active replacement, with broader syscall/path/mount-aware
+  policy still future work.
 - **capability bounding set** — `PR_CAPBSET_DROP` is monotonically decreasing; a
   workload can never re-grant a dropped capability. Drops `CAP_SYS_ADMIN`,
   `CAP_SYS_MODULE`, `CAP_DAC_READ_SEARCH` (Shocker / `open_by_handle_at`), etc.
@@ -126,8 +129,8 @@ the domain object *owns and applies atomically*:
   **inherited across clone+execve**, **monotonic** ("can only be further
   restricted — never loosened"), un-relaxable from inside. It remains the
   canonical model for `krunc_domain`; `root.readonly` now provides
-  rootfs immutability and planned eBPF-LSM provides path/mount-aware policy
-  without a kernel source patch.
+  rootfs immutability and BPF-LSM now provides patch-free active kill-on-escape;
+  broader path/mount-aware policy remains future work.
 - **cgroup v2** — resource limits (pids/memory/cpu) the kernel enforces
   continuously; closes fork-bomb / memory-exhaustion DoS.
 - **masked/readonly paths + modeled sysctls + device confinement** — block the
@@ -139,23 +142,33 @@ A loadable module **cannot** register native LSM hooks post-boot
 (`security_add_hooks` is not exported; `DEFINE_LSM` lives in `__init`) — this is
 intentional. The approved runtime mechanisms are:
 
-- **BPF-LSM** (`CONFIG_BPF_LSM`, the stackable LSM): attach `BPF_PROG_TYPE_LSM`
-  programs to hooks (`ptrace_access_check`, `sb_mount`, `move_mount`, `task_kill`,
-  `bpf`, `socket_*`) keyed to the domain via `bpf_get_current_cgroup_id()`, and
-  **kill on violation** via `bpf_send_signal(SIGKILL)` while returning `-EPERM`.
-  This is the active-response path and the natural integration point for
-  BPF-LSM-based runtime security (e.g. the author's micromize OSS project).
+- **BPF-LSM** (`CONFIG_BPF_LSM`, the stackable LSM): krunc now attaches a
+  `BPF_PROG_TYPE_LSM` program at runtime to `lsm/file_open`, keyed to the guarded
+  container via `bpf_get_current_cgroup_id()` and a cgroup-id-keyed `guarded` map.
+  Opening the demo tripwire basename `krunc-escape` calls
+  `bpf_send_signal(SIGKILL)` and returns `-EPERM`, so this is an active response
+  (kill + deny), not a passive deny. The static libbpf loader runs between
+  `krunc create` and `krunc start`, pins the link, and inserts the cgroup id
+  before the entrypoint executes. This is patch-free and config-only:
+  `CONFIG_BPF_SYSCALL`, `CONFIG_BPF_LSM`, `CONFIG_DEBUG_INFO_BTF`,
+  `CONFIG_FUNCTION_TRACER` → `CONFIG_DYNAMIC_FTRACE_WITH_DIRECT_CALLS`, and
+  `CONFIG_WERROR` off; reproduce with `KRUNC_BPF_LSM=1 scripts/build-kernel.sh`,
+  then `scripts/build-bpf.sh` and `scripts/run-bpflsm.sh`. QEMU verified the
+  guarded container was SIGKILL'd at tripwire `open(2)`, never read the file,
+  `krunc state` was `stopped`, and there was no kernel panic. Production should
+  fold the loader into the CLI, preferably all-Rust via aya; richer hooks
+  (`ptrace_access_check`, `sb_mount`, `move_mount`, `task_kill`, `bpf`,
+  `socket_*`) remain natural extensions.
 - **Mainline form:** if krunc graduates, the domain object would be (or register)
   a **built-in LSM** so "may this task do X?" is answered natively by "which
   `krunc_domain` is it in?" — the FreeBSD `prison_check()` model.
 
 So: the **PoC enforces P2 today via no_new_privs + cap bounding + cgroup +
-masked/readonly paths, rootfs read-only sealing, and sysctl setup** (all
-module-applicable, with monotonic capability and resource limits), with a
-per-domain **BPF-LSM** kill-on-escape hook as the designed next step; the
-domain object is the **unifying owner** that applies them atomically and ties
-them to one identity;
-**BPF-LSM** and a **built-in LSM** are the active-response / mainline extensions.
+masked/readonly paths, rootfs read-only sealing, sysctl setup, and a per-domain
+BPF-LSM kill-on-escape hook** (module-applicable/config-only, with monotonic
+capability and resource limits plus active response); the domain object is the
+**unifying owner** that applies them atomically and ties them to one identity. A
+**built-in LSM** remains the mainline extension.
 
 ## 5. Tamper-proofness
 
@@ -181,6 +194,7 @@ and response** — *not* VM-grade isolation. Its strongest claims are: (1) it
 removes the runc-init setup-escape class outright, and (2) it makes the workload's
 confinement a sealed, kernel-owned, tamper-proof domain that also shrinks the
 exploitable surface (cap bounding, namespaces, cgroups, masked/readonly paths)
-and is designed to actively kill escape attempts (planned eBPF-LSM).
+and now actively kills the VM-verified tripwire escape attempt via patch-free
+BPF-LSM.
 Where stronger isolation is required, krunc composes with — rather than replaces —
 VM/gVisor isolation.

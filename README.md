@@ -126,7 +126,13 @@ supported subset (`process.args`/`env`, `root.path`, `hostname`,
 `process.noNewPrivileges`) into a validated binary spec (`userspace/krunc-abi`),
 and drives the module's `create`(paused)/`start`/`state`/`kill`/`delete` ioctls.
 The kernel then applies the confinement — namespaces, in-kernel chroot, **the
-capability bounding set and `no_new_privs`** — atomically before exec.
+capability bounding set and `no_new_privs`**, a read-only rootfs (`root.readonly`),
+`linux.sysctl`, mounts and masked/read-only paths — atomically before exec.
+Optionally (M8), a **patch-free BPF-LSM** program adds *active* per-container
+kill-on-escape: attached at runtime and keyed on the container's cgroup, it
+`SIGKILL`s the container the instant it attempts a forbidden action (the
+lifetime-enforcement response that replaces the dropped seccomp kill, with no
+kernel source patch — see [`scripts/run-bpflsm.sh`](scripts/run-bpflsm.sh)).
 
 A captured run is in
 [`docs/sample-v2-confinement.txt`](docs/sample-v2-confinement.txt): the OCI
@@ -152,6 +158,10 @@ module/                Rust kernel module (the runtime itself)
                        primitives via kprobe→kallsyms_lookup_name and re-exports
                        krunc_spawn, krunc_apply_creds + helpers (NO vmlinux patch)
   Kbuild, Makefile     out-of-tree build of both modules
+bpf/                   optional patch-free BPF-LSM kill-on-escape (M8)
+  krunc_lsm.bpf.c      BPF_PROG_TYPE_LSM program: per-cgroup active SIGKILL on a
+                       guarded container's escape attempt (runtime-attached)
+  krunc_lsm_loader.c   static libbpf loader: attaches it + guards a container cgroup
 userspace/             all-Rust userspace (Cargo workspace)
   krunc-abi/           versioned, bounds-checked binary spec (no_std-friendly, no unsafe)
   krunc-oci/           OCI config.json -> DomainSpec translation (serde)
@@ -159,18 +169,22 @@ userspace/             all-Rust userspace (Cargo workspace)
 examples/
   rootfs-skel/init.sh  example container entrypoint (the "app")
   bundle/config.json   example OCI bundle (with caps bounding + noNewPrivileges)
+  bundle/esc-config.json  minimal "escape" bundle for the BPF-LSM demo
 scripts/
   vm-setup.sh          install kernel + Rust-for-Linux toolchain on a test VM
   pin-rust.sh          pin the exact rustc/bindgen the kernel requires
   build-kernel.sh      configure + build a vanilla kernel with CONFIG_RUST +
-                       KPROBES/KALLSYMS (no source patch)
+                       KPROBES/KALLSYMS (no source patch; KRUNC_BPF_LSM=1 adds BPF-LSM)
   build-module.sh      build the out-of-tree krunc_helper.ko + krunc.ko
   build-cli.sh         build the static (musl) all-Rust krunc CLI
+  build-bpf.sh         build the BPF-LSM object + loader (M8)
   make-initramfs.sh    assemble busybox + krunc_helper.ko + krunc.ko + CLI + rootfs/bundle
   run-qemu.sh          boot the test kernel under QEMU/KVM
   qemu-init.sh         the in-VM demo driver (text + OCI lifecycle + confinement + unload)
   run-interactive.sh   boot to a shell to drive krunc by hand (incl. `krunc run`)
   qemu-shell-init.sh   interactive in-VM init (loads krunc.ko, prints a cheatsheet)
+  run-bpflsm.sh        boot the BPF-LSM kill-on-escape demo (M8)
+  qemu-bpflsm-init.sh  in-VM init for the BPF-LSM demo
   setup-containerd-image.sh  stage containerd + nerdctl + a busybox image
   run-containerd.sh    boot a guest where real containerd/nerdctl drive krunc
   qemu-containerd-init.sh    in-VM init that starts containerd with krunc as runtime

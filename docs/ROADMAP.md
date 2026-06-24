@@ -13,8 +13,9 @@ Two steps got us there:
   required in-tree kernel patches (they used file-static seccomp/Landlock helpers
   that a module cannot reach). They are removed; hardening is now done entirely
   from the module (namespaces, capability dropping, `no_new_privs`, in-kernel
-  chroot + mounts, masked/read-only paths, cgroups). Further syscall/LSM-level
-  hardening is deferred to **eBPF-LSM** (attached at runtime, no kernel patch).
+  chroot + mounts, masked/read-only paths, cgroups). Active kill-on-escape is now
+  provided by a patch-free **BPF-LSM** program attached at runtime; broader
+  syscall/LSM-level hardening can build on that path without a kernel patch.
 - **DONE — remove the `krunc_exports.c` vmlinux shim.** The internal symbols it
   exported/wrapped (`kernel_clone`, `kernel_execve`, `set_fs_root`, `path_mount`,
   `vfs_mkdir`, `do_exit`, cred/rlimit helpers, …) are now resolved at load time by
@@ -71,24 +72,37 @@ Each is independently verifiable and committed.
 - **M5 — seccomp.** Userspace compiles the OCI seccomp policy → `sock_filter[]`;
   the kernel installs it after `no_new_privs`. Verify a blocked syscall fails.
   *(Implemented, then REMOVED in the patch-free pivot — see "Current direction";
-  it required an in-tree kernel patch. Future syscall policy is via eBPF-LSM.)*
+  it required an in-tree kernel patch. Active kill-on-escape is now via
+  patch-free BPF-LSM; broader syscall policy remains future work.)*
 - **M6 — cgroup v2.** `cgroupsPath` + resources (pids/memory/cpu); place the task
   in its cgroup atomically. Verify limit enforcement (fork-bomb/alloc capped).
 - **M7 — Landlock seal.** Compile mounts/paths → a Landlock ruleset; seal the
   domain (fs + net + IPC scoping) before exec. Verify it is enforced and
   un-relaxable. *(Implemented, then REMOVED in the patch-free pivot — it required
   an in-tree kernel patch. Rootfs immutability is now provided by
-  `root.readonly`; active fs/path policy via eBPF-LSM.)*
-- **M8 — Lifetime enforcement (Pillar 2).** Wire the domain as the unifying owner
-  of the above; design + prototype the BPF-LSM per-domain policy + kill-on-escape
-  path; document the in-tree LSM (Landlock-extended) as the mainline form.
-  *Feasibility (assessed): this stays patch-free — it needs only kernel **config**
-  (`CONFIG_BPF_SYSCALL` + `CONFIG_BPF_LSM` + `CONFIG_DEBUG_INFO_BTF`; `bpf` is
-  already in the default `CONFIG_LSM` list), not a source patch. The current PoC
-  kernel is built without `CONFIG_BPF_SYSCALL`, so enabling it is the first step.
-  Implementation is a multi-component effort (a `BPF_PROG_TYPE_LSM` program built
-  with clang/CO-RE, a libbpf loader in/alongside the CLI, and cgroup-id-keyed
-  per-domain policy), so it is deferred to its own milestone rather than rushed.*
+  `root.readonly`; active kill-on-escape is now via patch-free BPF-LSM, with
+  broader fs/path policy remaining future work.)*
+- **M8 — Lifetime enforcement (Pillar 2) (done).** krunc now has a
+  patch-free, per-container **BPF-LSM kill-on-escape** active response. A
+  `BPF_PROG_TYPE_LSM` program (`bpf/krunc_lsm.bpf.c`) is attached at runtime to
+  `lsm/file_open` and gated by a BPF hash map `guarded` keyed by cgroup id. For a
+  task whose cgroup id is guarded, opening the demo tripwire basename
+  `krunc-escape` calls `bpf_send_signal(SIGKILL)` and returns `-EPERM`, so the
+  response kills and denies rather than passively denying. `bpf_get_current_cgroup_id()`
+  scopes the policy to exactly the guarded container, not the host or other
+  workloads. A small static libbpf loader (`bpf/krunc_lsm_loader.c`) loads and
+  attaches the program, pins the link, and inserts the container cgroup id (the
+  cgroup dir inode) between `krunc create` and `krunc start`, before the entrypoint
+  executes. Kernel requirements remain config-only: `CONFIG_BPF_SYSCALL`,
+  `CONFIG_BPF_LSM`, `CONFIG_DEBUG_INFO_BTF`, `CONFIG_FUNCTION_TRACER` →
+  `CONFIG_DYNAMIC_FTRACE_WITH_DIRECT_CALLS`, `CONFIG_WERROR` off, with `bpf`
+  already in the default `CONFIG_LSM` list. Reproduce with
+  `KRUNC_BPF_LSM=1 scripts/build-kernel.sh`, then `scripts/build-bpf.sh` and
+  `scripts/run-bpflsm.sh`. QEMU verification: PID 1 printed `alive`, was
+  SIGKILL'd at tripwire `open(2)` before reading the file, `krunc state` showed
+  `stopped`, and there was no kernel panic. Production integration would fold the
+  loader into the CLI, preferably all-Rust via aya; the in-tree LSM remains the
+  mainline form.
 - **M9 — OCI conformance (partial — measured).** The official
   `opencontainers/runtime-tools` `runtimetest` validator runs as a container
   under krunc (harness: `scripts/qemu-conformance-init.sh` + `make-initramfs.sh`
@@ -125,9 +139,10 @@ Each is independently verifiable and committed.
   - ro rootfs write fails; masked path reads empty/denied
   - cgroup limits enforced (fork-bomb / allocation capped)
   - **post-setup escape attempts are denied/killed** while benign ops continue:
-    cgroupfs/release_agent write, cross-domain `setns`/ptrace,
-    `open_by_handle_at` (Shocker), `core_pattern` write, a seccomp-blocked
-    exploit-class syscall, a Landlock-denied path/connect
+    BPF-LSM tripwire open (`krunc-escape`) kills + denies for the guarded cgroup;
+    future coverage can add cgroupfs/release_agent write, cross-domain
+    `setns`/ptrace, `open_by_handle_at` (Shocker), `core_pattern` write,
+    syscall-class and path/connect probes
   - **tamper-proofness:** a workload with code-exec cannot relax seccomp/caps/
     Landlock (no_new_privs holds; bounding set holds; membership irreversible)
 - **OCI conformance:** runtime-tools suite.
@@ -191,6 +206,16 @@ executed in verified increments, not in one shot.
   oom_kill 1`), and **cpu** (`krunc-cpuhog` — a CPU-bound loop under
   `cpu.max=10000 100000` is throttled: `cpu.stat nr_throttled=69`). io is still
   to come.
+- **M8 (done) — BPF-LSM kill-on-escape.** A runtime-attached
+  `BPF_PROG_TYPE_LSM` program on `lsm/file_open`, keyed by cgroup id in the
+  `guarded` map, kills the guarded container with `bpf_send_signal(SIGKILL)` and
+  denies with `-EPERM` when it opens the `krunc-escape` tripwire. The static
+  libbpf loader runs between `krunc create` and `krunc start`, pins the link, and
+  inserts the cgroup id before PID 1 executes. It is patch-free with config-only
+  BPF-LSM requirements (`KRUNC_BPF_LSM=1 scripts/build-kernel.sh`, then
+  `scripts/build-bpf.sh` and `scripts/run-bpflsm.sh`) and was VM-verified: PID 1
+  printed `alive`, was SIGKILL'd at `open(2)` before reading the file,
+  `krunc state` showed `stopped`, and there was no kernel panic.
 - **M5 (implemented, then REMOVED in the patch-free pivot) — seccomp.** The CLI
   compiled the OCI `linux.seccomp` policy into a
   classic-BPF `sock_filter[]` program (`krunc-oci::seccomp`, full x86-64 syscall
@@ -201,7 +226,8 @@ executed in verified increments, not in one shot.
   host-verified in QEMU (`chmod`→`EPERM`, `Seccomp: 2`). **This required an
   in-tree kernel patch, so it was removed in the patch-free pivot** (the helper,
   the patch script, and the compiler are gone; `linux.seccomp` is now rejected).
-  Future syscall/path policy is the planned patch-free eBPF-LSM.
+  Active kill-on-escape is now the patch-free BPF-LSM path; broader syscall/path
+  policy remains future work.
 - **M7 (implemented, then REMOVED in the patch-free pivot) — Landlock sealed fs domain.**
   When `root.readonly` was set, krunc
   derived a Landlock policy that handled the write/create/remove access rights but
@@ -212,7 +238,8 @@ executed in verified increments, not in one shot.
   Host-verified in QEMU (`touch /`→denied, `touch /tmp`→allowed). **This required
   an in-tree kernel patch, so it was removed in the patch-free pivot**; rootfs
   immutability is now enforced patch-free by `root.readonly` bind+remount-ro,
-  and path-aware policy remains planned via eBPF-LSM.
+  active kill-on-escape is now enforced via patch-free BPF-LSM, while broader
+  path-aware policy remains future work.
 - **M10 — containerd integration (mechanism works; configs strictly gated).**
   krunc is runc-CLI-compatible, so containerd v2.3's `io.containerd.runc.v2` shim
   drives it (krunc as the runc binary), and the kernel-cloned init inherits the
@@ -247,6 +274,6 @@ executed in verified increments, not in one shot.
   code (host-verified: `krunc run busybox -- echo`, `CapEff/CapBnd 0`).
 - **Next:** interactive `-t` console-socket support (PTY handoff via `SCM_RIGHTS`
   is prototyped; needs kernel-side `setsid`+`TIOCSCTTY`); M3 follow-up
-  (`pivot_root` remains deferred); M7 user-ns id mapping; M8 lifetime enforcement
-  (BPF-LSM kill-on-escape); M9 conformance; a native Rust
+  (`pivot_root` remains deferred); M7 user-ns id mapping; richer BPF-LSM policy
+  beyond the VM-verified kill-on-escape; M9 conformance; a native Rust
   `containerd-shim-krunc-v2`; and the full `Domain` typestate object + domainfd.
