@@ -61,7 +61,7 @@ security-critical order (verified against runc `standard_init_linux.go`):
 ```
 clone(new namespaces, no CLONE_VM)
  → no_new_privs = 1
- → rootfs setup (chroot today; pivot_root planned) + mounts + mask/readonly paths
+ → rootfs setup (chroot; `pivot_root` deferred) + mounts + sysctls + root.readonly + mask/readonly paths
  → capability bounding/effective/... sets
  → cgroup placement
  → rlimits, oomScoreAdj
@@ -72,8 +72,8 @@ clone(new namespaces, no CLONE_VM)
 Ordering is load-bearing: `no_new_privs` before privilege drop (so a SUID
 payload can't gain privilege); rootfs setup before privilege drop; caps/cgroups/
 rlimits before the untrusted rootfs runs. The removed seccomp/Landlock stages
-required kernel source patches; patch-free replacements are planned via
-eBPF-LSM (active policy) and `pivot_root` (immutable rootfs).
+required kernel source patches; the patch-free immutable rootfs is now enforced
+by `root.readonly` bind+remount-ro, while active policy is planned via eBPF-LSM.
 
 ### Implementation status (verified in QEMU vs. designed)
 
@@ -96,9 +96,10 @@ from the host** (see `docs/sample-v2-confinement.txt`):
 | cgroup v2 `pids` | done | kernel denies forks; `pids.current==pids.max` |
 | cgroup v2 `memory` | done | memhog past `memory.max` → memcg OOM kill; `memory.events oom_kill 1` |
 | cgroup v2 `cpu` | done | cpuhog under `cpu.max` throttled; `cpu.stat nr_throttled` climbs |
-| `pivot_root` (replacing chroot) + sysctls | planned | required for an immutable/read-only rootfs without Landlock |
+| `root.readonly` immutable rootfs | done | `touch /`→`EROFS`; `/tmp` writable; bind-mount rootfs + `MS_REMOUNT`&#124;`MS_BIND`&#124;`MS_RDONLY`, fail-closed |
+| `linux.sysctl` | done | `net.ipv4.ip_forward`=1 in the container netns |
+| `pivot_root` (replacing chroot) | deferred | immutability achieved via `root.readonly`; no callable in-kernel `pivot_root` on 6.18 |
 | user-ns uid/gid mapping | planned | — |
-| **Landlock** sealed fs domain (immutable rootfs) | removed (required a kernel source patch) | `root.readonly: true` is rejected; pivot_root + eBPF-LSM are the planned patch-free replacement |
 | BPF-LSM rich-context active kill-on-escape | planned | patch-free path/mount/syscall-aware policy attached at runtime |
 
 Everything marked *done* is applied **atomically in kernel context before the
@@ -124,12 +125,12 @@ the domain object *owns and applies atomically*:
   analog to our object: a ruleset becomes a *sealed domain* attached to the task,
   **inherited across clone+execve**, **monotonic** ("can only be further
   restricted — never loosened"), un-relaxable from inside. It remains the
-  canonical model for `krunc_domain`; planned `pivot_root` provides rootfs
-  immutability and planned eBPF-LSM provides path/mount-aware policy without a
-  kernel source patch.
+  canonical model for `krunc_domain`; `root.readonly` now provides
+  rootfs immutability and planned eBPF-LSM provides path/mount-aware policy
+  without a kernel source patch.
 - **cgroup v2** — resource limits (pids/memory/cpu) the kernel enforces
   continuously; closes fork-bomb / memory-exhaustion DoS.
-- **masked/readonly paths + dropped sysctls + device confinement** — block the
+- **masked/readonly paths + modeled sysctls + device confinement** — block the
   classic misconfig escapes: cgroup-v1 `release_agent`, `/proc/sys/kernel/
   core_pattern`, `/proc/sysrq-trigger`, writable `/sys`, `mknod` device access.
 
@@ -149,10 +150,11 @@ intentional. The approved runtime mechanisms are:
   `krunc_domain` is it in?" — the FreeBSD `prison_check()` model.
 
 So: the **PoC enforces P2 today via no_new_privs + cap bounding + cgroup +
-masked/readonly paths** (all module-applicable, with monotonic capability and
-resource limits), with **pivot_root** and a per-domain **BPF-LSM**
-kill-on-escape hook as the designed next steps; the domain object is the
-**unifying owner** that applies them atomically and ties them to one identity;
+masked/readonly paths, rootfs read-only sealing, and sysctl setup** (all
+module-applicable, with monotonic capability and resource limits), with a
+per-domain **BPF-LSM** kill-on-escape hook as the designed next step; the
+domain object is the **unifying owner** that applies them atomically and ties
+them to one identity;
 **BPF-LSM** and a **built-in LSM** are the active-response / mainline extensions.
 
 ## 5. Tamper-proofness

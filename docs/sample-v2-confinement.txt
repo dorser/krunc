@@ -2,16 +2,17 @@
  krunc - all-Rust pipeline + kernel-applied confinement (QEMU/KVM).
  The kernel, atomically before the container's first userspace
  instruction, sets up namespaces + chroot + a private /proc+/sys,
- masks/over-mounts sensitive paths, remounts paths read-only, drops
- capabilities to the OCI bounding set, and sets no_new_privs. Userspace (the all-Rust krunc CLI) also
- places the container in a cgroup v2 with pids.max. Every control below
- is verified from OUTSIDE the container (host view).
+ masks/over-mounts sensitive paths, remounts paths read-only, seals the
+ rootfs read-only (root.readonly), applies sysctls, drops capabilities
+ to the OCI bounding set, and sets no_new_privs. Userspace (the all-Rust
+ krunc CLI) also places the container in a cgroup v2 with pids.max. Every
+ control below is verified from OUTSIDE the container (host view).
 
  DEMO 1 = unconfined container via the text interface.
  DEMO 2 = launch + kill.
  DEMO 3 = OCI lifecycle via the Rust CLI with the full confinement stack:
-          caps + no_new_privs + masked/readonly
-          paths + cgroup pids (kernel denies forks past pids.max).
+          caps + no_new_privs + masked/readonly paths + read-only rootfs
+          + sysctls + cgroup pids (kernel denies forks past pids.max).
  DEMO 4 = unload the runtime module cleanly.
 
  Reproduce: scripts/run-test.sh   (builds kernel+module+CLI, runs QEMU)
@@ -114,6 +115,10 @@ tmp
 [container]   /proc/sysrq-trigger write: denied
 [container]   /etc: read-only, write denied (EROFS)
 [container]   /proc/sys: read-only, write denied (EROFS)
+[container]   rootfs / : read-only, write denied (EROFS)
+[container]   /tmp    : writable (scratch mount stays rw)
+[container] --- sysctls (linux.sysctl applied by the kernel) ---
+[container]   net.ipv4.ip_forward = 1  (config requests 1)
 [container] --- resource limits (rlimits / oom) ---
 [container]   RLIMIT_NOFILE (ulimit -n) = 256  (config soft=256)
 [container] --- user (process.user) ---

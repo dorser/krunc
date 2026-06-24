@@ -61,8 +61,10 @@ Each is independently verifiable and committed.
   and a shared versioned ABI crate. Shrink the C shim to the minimal export set
   (or move in-tree). No behavior regression vs v1.
 - **M3 — Filesystem confinement.** New mount API (`fsopen`/`fsmount`/`move_mount`/
-  `mount_setattr`), `pivot_root` (replacing chroot), `maskedPaths`,
-  `readonlyPaths`, ro rootfs, `sysctl`. Host-side verification.
+  `mount_setattr`), `maskedPaths`, `readonlyPaths`, ro rootfs, `sysctl`.
+  Host-side verification. `pivot_root` is deferred: on 6.18 only the syscall
+  entry point takes `__user` pointers, with no callable in-kernel helper, and
+  `root.readonly` now provides the immutable-rootfs benefit.
 - **M4 — Privilege confinement.** Capability sets via `cred` lifecycle,
   `no_new_privs`, user (uid/gid/groups), rlimits, oomScoreAdj. Verify `CapEff`,
   `NoNewPrivs`, uid in `/proc/<pid>/status`.
@@ -75,11 +77,18 @@ Each is independently verifiable and committed.
 - **M7 — Landlock seal.** Compile mounts/paths → a Landlock ruleset; seal the
   domain (fs + net + IPC scoping) before exec. Verify it is enforced and
   un-relaxable. *(Implemented, then REMOVED in the patch-free pivot — it required
-  an in-tree kernel patch. Rootfs immutability returns via `pivot_root`; active
-  fs/path policy via eBPF-LSM.)*
+  an in-tree kernel patch. Rootfs immutability is now provided by
+  `root.readonly`; active fs/path policy via eBPF-LSM.)*
 - **M8 — Lifetime enforcement (Pillar 2).** Wire the domain as the unifying owner
   of the above; design + prototype the BPF-LSM per-domain policy + kill-on-escape
   path; document the in-tree LSM (Landlock-extended) as the mainline form.
+  *Feasibility (assessed): this stays patch-free — it needs only kernel **config**
+  (`CONFIG_BPF_SYSCALL` + `CONFIG_BPF_LSM` + `CONFIG_DEBUG_INFO_BTF`; `bpf` is
+  already in the default `CONFIG_LSM` list), not a source patch. The current PoC
+  kernel is built without `CONFIG_BPF_SYSCALL`, so enabling it is the first step.
+  Implementation is a multi-component effort (a `BPF_PROG_TYPE_LSM` program built
+  with clang/CO-RE, a libbpf loader in/alongside the CLI, and cgroup-id-keyed
+  per-domain policy), so it is deferred to its own milestone rather than rushed.*
 - **M9 — OCI conformance (partial — measured).** The official
   `opencontainers/runtime-tools` `runtimetest` validator runs as a container
   under krunc (harness: `scripts/qemu-conformance-init.sh` + `make-initramfs.sh`
@@ -129,10 +138,10 @@ Each is independently verifiable and committed.
 The **true** first-class domain (unprivileged, sealed, inherited, monotonic via
 cred hooks) requires **in-tree** kernel changes — see `docs/ARCHITECTURE.md` §4.
 The loadable-module track delivers the atomic setup (P1) and applies
-seccomp/caps/Landlock/cgroup as a unified, sealed domain enforced for life (P2),
-with BPF-LSM for active per-domain policy; the in-tree LSM is the mainline
-graduation target. This roadmap is large and is executed in verified increments,
-not in one shot.
+no_new_privs/caps/cgroups/masked-readonly paths/root.readonly as a unified,
+sealed domain enforced for life (P2), with BPF-LSM for active per-domain policy;
+the in-tree LSM is the mainline graduation target. This roadmap is large and is
+executed in verified increments, not in one shot.
 
 ## Status
 - M0 (design) done. v1 PoC is the working foundation.
@@ -162,8 +171,17 @@ not in one shot.
   writes are inert, and writes to `/etc` and `/proc/sys` fail with `EROFS`.
   The kernel also performs the bundle's **`mounts[]`** (in order, replacing the
   hard-coded default), translating OCI options to `MS_*` flags — verified by a
-  `tmpfs` `/tmp` mounted `nosuid,nodev,noexec`. (Full `pivot_root` + `root.readonly`
-  and sysctls are still to come.)
+  `tmpfs` `/tmp` mounted `nosuid,nodev,noexec`. **`root.readonly` is now done**:
+  the module makes the mount tree private, bind-mounts the rootfs onto itself
+  before chroot, then remounts `/` with `MS_REMOUNT|MS_BIND|MS_RDONLY`
+  non-recursively after submount setup; it is fail-closed, and QEMU verified
+  `touch /`→`EROFS` while `/tmp` stays writable. **`linux.sysctl` is now done**:
+  the OCI layer validates names and values, emits `SYSCTLS` `relpath=value`
+  entries, and the module writes `/proc/sys/<relpath>` before readonly-path
+  remounts; QEMU verified `net.ipv4.ip_forward=1` in the container netns.
+  `pivot_root` is deferred on 6.18 because only the syscall entry point exists
+  (`__user` pointers, no callable in-kernel helper), and rootfs immutability is
+  already achieved by `root.readonly`.
 - **M6 (done) — cgroup v2.** The CLI creates the cgroup, sets limits, and places
   the container; the kernel enforces them. Three controllers, each verified
   deterministically: **pids** (`krunc-forktest` — `pids.current` pins at
@@ -192,18 +210,20 @@ not in one shot.
   in `security/landlock/syscalls.c`, applied by `scripts/patch-kernel-seccomp.sh`),
   after `no_new_privs`, giving an **immutable rootfs with writable scratch**.
   Host-verified in QEMU (`touch /`→denied, `touch /tmp`→allowed). **This required
-  an in-tree kernel patch, so it was removed in the patch-free pivot** (`root.readonly:
-  true` is now rejected); rootfs immutability returns via `pivot_root` and
-  path-aware policy via the planned eBPF-LSM.
+  an in-tree kernel patch, so it was removed in the patch-free pivot**; rootfs
+  immutability is now enforced patch-free by `root.readonly` bind+remount-ro,
+  and path-aware policy remains planned via eBPF-LSM.
 - **M10 — containerd integration (mechanism works; configs strictly gated).**
   krunc is runc-CLI-compatible, so containerd v2.3's `io.containerd.runc.v2` shim
   drives it (krunc as the runc binary), and the kernel-cloned init inherits the
   shim's stdio fifos. **However**, krunc is a *strict* runtime: per the
   runtime-spec `create` rule (a runtime MUST error on a property it cannot apply),
   it rejects configs carrying properties outside its supported subset. containerd's
-  and nerdctl's default configs include a device cgroup (`linux.resources.devices`)
-  and `sysctls`, so `ctr run`/`nerdctl run` with default configs are **rejected by
-  design** (krunc refuses rather than silently dropping those properties).
+  and nerdctl's default configs include a device cgroup (`linux.resources.devices`),
+  so `ctr run`/`nerdctl run` with default configs can still be **rejected by
+  design** (krunc refuses rather than silently dropping unsupported properties).
+  `linux.sysctl` is now modeled and applied when valid; sysctl write failures are
+  logged but non-fatal because a sysctl may be absent or non-namespaced.
   Containerd's and nerdctl's defaults also carry a `linux.seccomp` profile, which
   krunc now **rejects outright** (seccomp was removed in the patch-free pivot — it
   is no longer a modeled property). (Historically krunc did compile the moby/
@@ -226,7 +246,7 @@ not in one shot.
   command create+start+wait+delete, streaming output and propagating the exit
   code (host-verified: `krunc run busybox -- echo`, `CapEff/CapBnd 0`).
 - **Next:** interactive `-t` console-socket support (PTY handoff via `SCM_RIGHTS`
-  is prototyped; needs kernel-side `setsid`+`TIOCSCTTY`); M3 remainder
-  (`pivot_root`, sysctls); M7 user-ns id mapping; M8 lifetime enforcement
+  is prototyped; needs kernel-side `setsid`+`TIOCSCTTY`); M3 follow-up
+  (`pivot_root` remains deferred); M7 user-ns id mapping; M8 lifetime enforcement
   (BPF-LSM kill-on-escape); M9 conformance; a native Rust
   `containerd-shim-krunc-v2`; and the full `Domain` typestate object + domainfd.

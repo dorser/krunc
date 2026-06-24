@@ -229,7 +229,7 @@ scripts/run-interactive.sh          # boots QEMU to a shell; inside:
 A runc-compatible CLI means containerd *can* drive krunc as its runtime
 (`scripts/run-containerd.sh`, krunc as the `io.containerd.runc.v2` runc binary).
 However, containerd's/nerdctl's **default** generated configs include properties
-krunc does not model — a device cgroup (`linux.resources.devices`), `sysctls`,
+krunc does not model — a device cgroup (`linux.resources.devices`),
 a `seccomp` profile, and (for `-it`) `process.terminal` — so krunc
 **rejects** them rather than running a container that does not match its spec.
 Driving krunc from containerd therefore requires reducing the runtime config to
@@ -244,10 +244,11 @@ it is not production software. Notable simplifications and known limitations:
 
 - **Config boundary (strict, per runtime-spec).** krunc applies a defined subset
   of `config.json` (args, env, cwd, root, hostname, namespaces, capabilities,
-  cgroups pids/memory/cpu, mounts, masked/read-only paths, rlimits, oom score,
-  user) and **rejects** — rather than silently ignoring — any other configured
+  cgroups pids/memory/cpu, mounts, masked/read-only paths, read-only rootfs
+  (`root.readonly`), `linux.sysctl`, rlimits, oom score, user) and **rejects** —
+  rather than silently ignoring — any other configured
   property (e.g. `process.terminal`, `process.user.umask`, `linux.seccomp`,
-  `root.readonly`, `linux.sysctl`, `linux.devices`, `linux.resources.devices`,
+  `linux.devices`, `linux.resources.devices`,
   `linux.resources.memory.swap`, `hooks`, user-namespace mappings,
   id-mapped mounts, and non-flag mount options such as `size=`/`mode=` or
   propagation flags). Unmodeled fields are rejected at parse time
