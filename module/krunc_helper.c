@@ -14,7 +14,15 @@
  * `krunc` module links against.
  *
  * Requirements on the (otherwise unmodified) kernel: CONFIG_RUST=y (for krunc.ko
- * itself), CONFIG_KPROBES=y and CONFIG_KALLSYMS=y. No kernel source patch.
+ * itself), CONFIG_KPROBES=y and CONFIG_KALLSYMS_ALL=y (the latter because one
+ * resolved symbol, uts_sem, is a data object). No kernel source patch.
+ *
+ * CAVEAT (kernel upgrades): kallsyms resolves symbols by NAME only — it confirms
+ * a symbol exists but CANNOT detect a changed prototype. The p_* pointer
+ * signatures below are validated against kernel 6.18; calling a same-named symbol
+ * whose signature drifted on a newer kernel would pass wrong/garbage arguments
+ * (corruption). When moving to a new kernel, re-audit every p_* signature against
+ * that tree (e.g. vfs_mkdir's argument count has changed across versions).
  *
  * All policy/logic lives in the Rust module; these are generic primitives only.
  * The struct-heavy work stays in C (with kernel headers) so the Rust side never
@@ -302,7 +310,13 @@ int krunc_mkdir(const char *path, umode_t mode)
 	 * kallsyms entry — call it directly rather than resolving a pointer. */
 	res = p_vfs_mkdir(mnt_idmap(parent.mnt), d_inode(parent.dentry), dentry, mode);
 	err = IS_ERR(res) ? PTR_ERR(res) : 0;
-	p_end_creating_path(&parent, dentry);
+	/* vfs_mkdir (dentry-returning form) takes ownership of @dentry: on error or
+	 * when it splices a different dentry it has already dput() the one we passed
+	 * in and returns the alternate (or ERR_PTR). We must hand end_creating_path
+	 * the *returned* dentry @res, never the original — exactly as the kernel's
+	 * own do_mkdirat() does. Passing @dentry here would dput() an already-freed
+	 * dentry on the error/splice paths (refcount underflow → use-after-free). */
+	p_end_creating_path(&parent, res);
 	return err;
 }
 EXPORT_SYMBOL_GPL(krunc_mkdir);
