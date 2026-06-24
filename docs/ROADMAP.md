@@ -62,11 +62,15 @@ Each is independently verifiable and committed.
   `NoNewPrivs`, uid in `/proc/<pid>/status`.
 - **M5 — seccomp.** Userspace compiles the OCI seccomp policy → `sock_filter[]`;
   the kernel installs it after `no_new_privs`. Verify a blocked syscall fails.
+  *(Implemented, then REMOVED in the patch-free pivot — see "Current direction";
+  it required an in-tree kernel patch. Future syscall policy is via eBPF-LSM.)*
 - **M6 — cgroup v2.** `cgroupsPath` + resources (pids/memory/cpu); place the task
   in its cgroup atomically. Verify limit enforcement (fork-bomb/alloc capped).
 - **M7 — Landlock seal.** Compile mounts/paths → a Landlock ruleset; seal the
   domain (fs + net + IPC scoping) before exec. Verify it is enforced and
-  un-relaxable.
+  un-relaxable. *(Implemented, then REMOVED in the patch-free pivot — it required
+  an in-tree kernel patch. Rootfs immutability returns via `pivot_root`; active
+  fs/path policy via eBPF-LSM.)*
 - **M8 — Lifetime enforcement (Pillar 2).** Wire the domain as the unifying owner
   of the above; design + prototype the BPF-LSM per-domain policy + kill-on-escape
   path; document the in-tree LSM (Landlock-extended) as the mainline form.
@@ -163,27 +167,28 @@ not in one shot.
   oom_kill 1`), and **cpu** (`krunc-cpuhog` — a CPU-bound loop under
   `cpu.max=10000 100000` is throttled: `cpu.stat nr_throttled=69`). io is still
   to come.
-- **M5 (done) — seccomp.** The CLI compiles the OCI `linux.seccomp` policy into a
+- **M5 (implemented, then REMOVED in the patch-free pivot) — seccomp.** The CLI
+  compiled the OCI `linux.seccomp` policy into a
   classic-BPF `sock_filter[]` program (`krunc-oci::seccomp`, full x86-64 syscall
-  table, 4 unit tests); the kernel installs it on the container **after**
+  table, 4 unit tests); the kernel installed it on the container **after**
   `no_new_privs`, in kernel context just before exec, via an in-tree helper
   (`krunc_seccomp_install` in `kernel/seccomp.c` + `krunc_bpf_prog_create_kern_trans`
-  in `net/core/filter.c`, applied by `scripts/patch-kernel-seccomp.sh`). Because
-  it is sealed under `no_new_privs`, a compromised workload cannot relax it.
-  Host-verified in QEMU: a `chmod` (needs no capability on an owned path) returns
-  `EPERM`, and `/proc/<pid>/status` shows `Seccomp: 2` (filter mode), with no
-  kernel warnings.
-- **M7 (done) — Landlock sealed fs domain.** When `root.readonly` is set, krunc
-  derives a Landlock policy that handles the write/create/remove access rights but
-  grants them only beneath the writable mounts (tmpfs/rw binds) plus `/dev`, and
-  seals it on the container via an in-tree helper (`krunc_landlock_restrict_writes`
+  in `net/core/filter.c`, applied by `scripts/patch-kernel-seccomp.sh`). It was
+  host-verified in QEMU (`chmod`→`EPERM`, `Seccomp: 2`). **This required an
+  in-tree kernel patch, so it was removed in the patch-free pivot** (the helper,
+  the patch script, and the compiler are gone; `linux.seccomp` is now rejected).
+  Future syscall/path policy is the planned patch-free eBPF-LSM.
+- **M7 (implemented, then REMOVED in the patch-free pivot) — Landlock sealed fs domain.**
+  When `root.readonly` was set, krunc
+  derived a Landlock policy that handled the write/create/remove access rights but
+  granted them only beneath the writable mounts (tmpfs/rw binds) plus `/dev`, and
+  sealed it on the container via an in-tree helper (`krunc_landlock_restrict_writes`
   in `security/landlock/syscalls.c`, applied by `scripts/patch-kernel-seccomp.sh`),
-  after `no_new_privs`. Read/execute stay unrestricted, so the container has an
-  **immutable rootfs with writable scratch** — the kernel's own sealed,
-  inherited-across-exec, monotonic domain (the closest existing analog to the
-  `krunc_domain` vision), and it achieves the immutability that a chroot-based
-  `root.readonly` cannot. Host-verified in QEMU: the container's `touch /` is
-  **denied**, `touch /tmp` is **allowed**.
+  after `no_new_privs`, giving an **immutable rootfs with writable scratch**.
+  Host-verified in QEMU (`touch /`→denied, `touch /tmp`→allowed). **This required
+  an in-tree kernel patch, so it was removed in the patch-free pivot** (`root.readonly:
+  true` is now rejected); rootfs immutability returns via `pivot_root` and
+  path-aware policy via the planned eBPF-LSM.
 - **M10 — containerd integration (mechanism works; configs strictly gated).**
   krunc is runc-CLI-compatible, so containerd v2.3's `io.containerd.runc.v2` shim
   drives it (krunc as the runc binary), and the kernel-cloned init inherits the
@@ -192,18 +197,17 @@ not in one shot.
   it rejects configs carrying properties outside its supported subset. containerd's
   and nerdctl's default configs include a device cgroup (`linux.resources.devices`)
   and `sysctls`, so `ctr run`/`nerdctl run` with default configs are **rejected by
-  design** (krunc refuses rather than silently dropping those properties). An
-  earlier shortcut that silently weakened the policy to make containerd "work"
-  (coarsening seccomp argument matchers into a number-only filter) was reverted as
-  a convention-driven, non-spec compromise; the spec-correct resolution shipped
-  instead — krunc now compiles the equality argument matchers (`SCMP_CMP_EQ`,
-  `SCMP_CMP_MASKED_EQ`, which is all the moby/containerd default profile uses) into
-  real 64-bit BPF comparisons, so argument-matched seccomp is no longer a blocker.
-  Running under containerd still requires a reduced runtime config within krunc's
+  design** (krunc refuses rather than silently dropping those properties).
+  Containerd's and nerdctl's defaults also carry a `linux.seccomp` profile, which
+  krunc now **rejects outright** (seccomp was removed in the patch-free pivot — it
+  is no longer a modeled property). (Historically krunc did compile the moby/
+  containerd default profile's `SCMP_CMP_EQ`/`SCMP_CMP_MASKED_EQ` argument matchers
+  into real 64-bit BPF, after an earlier number-only-coarsening shortcut was
+  reverted as a non-spec compromise; that whole seccomp path is now gone.)
+  Running under containerd thus requires a reduced runtime config within krunc's
   subset, or implementing the remaining properties spec-faithfully (a future,
   in-spec item — e.g. the device cgroup). The CLI-rootfs prep (create mount
-  destinations, PATH-resolve `argv[0]` per the spec's execvp semantics) and the
-  privileged-time seccomp install remain.
+  destinations, PATH-resolve `argv[0]` per the spec's execvp semantics) remains.
 - **mounts (done) — full containerd mount set.** The kernel now materializes
   nested mountpoints (`krunc_mkdir` → `vfs_mkdir`) before each filesystem mount,
   so a stock containerd/nerdctl `/dev/pts`, `/dev/shm`, `/dev/mqueue`,

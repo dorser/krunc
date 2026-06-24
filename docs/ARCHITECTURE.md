@@ -8,9 +8,9 @@
 ## 1. The missing noun
 
 A Linux "container" is *emergent*: a userspace runtime composes namespaces +
-cgroups + seccomp + LSM + capabilities, then exits. The kernel never holds an
-object that says "*these tasks are workload X; this is its security domain;
-enforce it for life.*" Contrast FreeBSD, where `struct prison`
+cgroups + capabilities + optional syscall/LSM policy, then exits. The kernel
+never holds an object that says "*these tasks are workload X; this is its
+security domain; enforce it for life.*" Contrast FreeBSD, where `struct prison`
 (`sys/kern/kern_jail.c`) is a first-class object with:
 
 - stable **identity** (`pr_id`) and **lifecycle** (`ALIVE → DYING`),
@@ -35,8 +35,8 @@ krunc_domain {
     cgroup      : cgroup ref      // membership + resource accounting substrate
     // sealed invariants (monotonic after seal):
     cap_ceiling : kernel_cap_t
-    seccomp     : sealed filter chain
-    fs_net_ipc  : sealed access masks  (Landlock-modelled)
+    bpf_lsm     : future active policy hooks
+    fs_net_ipc  : sealed access masks  (Landlock-modelled vision)
     rules       : mount/ptrace/setns/device policy
     state       : Unsealed | Sealed
 }
@@ -82,9 +82,9 @@ it in?":
 
 | Invariant | Mechanism | Properties |
 |---|---|---|
-| syscall surface | **seccomp** (after `no_new_privs`) | inherited, monotonic, tamper-proof; removes kernel-exploit entry points |
+| syscall surface | **seccomp** precedent; removed from PoC (required a kernel source patch) | mainline model for inherited, monotonic filtering; planned eBPF-LSM is the patch-free replacement |
 | capability ceiling | `PR_CAPBSET_DROP` / `cred->cap_bset` | monotonic, irreversible |
-| filesystem / net / IPC | **Landlock** ruleset, sealed before exec | inherited across clone+exec, monotonic, `SCOPE_SIGNAL`/`SCOPE_ABSTRACT_UNIX_SOCKET` stop cross-domain IPC |
+| filesystem / net / IPC | **Landlock** precedent; removed from PoC (required a kernel source patch) | canonical sealed-domain model; planned `pivot_root` + eBPF-LSM replace rootfs immutability and path/mount-aware policy |
 | resources | **cgroup v2** | continuous; DoS containment |
 | sensitive interfaces | masked/ro paths, dropped sysctls, device policy | block release_agent / core_pattern / sysrq / mknod escapes |
 | active per-domain policy + kill | **BPF-LSM** keyed by cgroup id; `bpf_send_signal(SIGKILL)` | runtime hook + active response |
@@ -93,10 +93,13 @@ it in?":
 exported and `DEFINE_LSM` lives in `__init` — a loadable module **cannot** register
 LSM hooks post-boot (intentional). Therefore:
 
-- **PoC (loadable module):** the domain applies seccomp + cap bounding + Landlock
-  + cgroup at creation (these are themselves sealed/inherited/monotonic), tracks
-  the domain by fd/id, and optionally attaches a **BPF-LSM** program for per-domain
-  runtime policy + kill-on-escape (privileged; loadable today).
+- **PoC (loadable module):** the domain applies no_new_privs + cap bounding +
+  cgroup + masked/readonly paths at creation, tracks the domain by fd/id, and is
+  patch-free: it runs on a vanilla `CONFIG_RUST=y` kernel plus `CONFIG_KPROBES`
+  and `CONFIG_KALLSYMS_ALL`. A small sibling `krunc_helper.ko` is loaded before
+  `krunc.ko` and resolves non-exported primitives through a
+  kprobe→`kallsyms_lookup_name` bootstrap. A future **BPF-LSM** program provides
+  per-domain runtime policy + kill-on-escape (privileged; loadable at runtime).
 - **Mainline:** `krunc_domain` becomes an **in-tree LSM, modelled on Landlock**,
   with the `cred_prepare`/`bprm_committing_creds` inheritance hooks and a cred
   blob — giving the *true* first-class, sealed, inherited domain. This is the
@@ -119,18 +122,20 @@ containerd / runc / youki / our CLI        ── USERSPACE ──
 ```
 
 Complex parsing of untrusted input stays in userspace (attack surface); the
-kernel consumes only a validated, fixed-layout blob.
+kernel consumes only a validated, fixed-layout blob. The kernel boundary is now
+patch-free: no in-tree source patch or extra exported symbols are required.
 
 ## 6. ABI
 
 A versioned, `#[repr(C)]`, bounds-checked request: header (`abi_version`, op,
 section offsets/lengths, out `domain_id`/`domainfd`) + a flat bounded payload
 (namespaces, uid/gid maps, argv/env, mounts[], masked/ro paths[], cap sets,
-rlimits[], cgroup limits, seccomp `sock_filter[]`, Landlock rules, user). Kernel
-side: `FromBytes`/`AsBytes`, reject unknown `abi_version`, cap every count/length,
-single `copy_from_user`, validate-before-use. The ABI lives in one Rust crate
-shared (and mirrored) by CLI and module; round-trip property-tested and the
-kernel validator fuzzed from a userspace harness.
+rlimits[], cgroup limits, user). The current binary spec carries no seccomp
+program and no Landlock rules; future active policy is expected to be eBPF-LSM.
+Kernel side: `FromBytes`/`AsBytes`, reject unknown `abi_version`, cap every
+count/length, single `copy_from_user`, validate-before-use. The ABI lives in one
+Rust crate shared (and mirrored) by CLI and module; round-trip property-tested
+and the kernel validator fuzzed from a userspace harness.
 
 ## 7. From v1 to v2
 
@@ -140,7 +145,7 @@ a runc-compatible CLI and verified under QEMU + go-runc. v2:
 
 1. introduce `Domain` (typestate) + the fd/id handle + registry refactor;
 2. extend P1 to the full ordered sequence (uid/gid maps, no_new_privs, new mount
-   API + pivot_root, caps, cgroup placement, user, seccomp, Landlock seal);
+   API + pivot_root, caps, cgroup placement, user, eBPF-LSM policy);
 3. rewrite the userspace adapter in Rust (oci-spec → domain spec);
 4. add BPF-LSM per-domain policy + kill-on-escape (optional, privileged);
 5. extensive verification (see `docs/ROADMAP.md` + `plan`): OCI conformance,

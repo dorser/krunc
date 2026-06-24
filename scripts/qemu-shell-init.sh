@@ -37,8 +37,8 @@ Run containers like docker — one command, see the output:
      krunc create demo --bundle /bundle    # set up + block before exec
      krunc start  demo                      # release -> exec the entrypoint
      krunc state  demo ; krunc list ; krunc kill demo KILL ; krunc delete demo
-   Policy lives in /bundle/config.json (caps, seccomp, Landlock, cgroups,
-   user, mounts). Edit it (vi) and re-create to change confinement.
+   Policy lives in /bundle/config.json (caps, no_new_privs, cgroups,
+   user, mounts, masked/readonly paths). Edit it (vi) and re-create to change confinement.
 
 3) Raw kernel text ABI (write a spec line to the control device):
      echo 'run rootfs=/containers/demo host=h exec=/bin/sh arg=/init.sh' > /dev/krunc

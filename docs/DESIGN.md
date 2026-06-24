@@ -32,10 +32,12 @@ around a `KVec<Container>`); per-open file state is unused.
 
 ## 3. Spawning a container init in fresh namespaces
 
-The key primitive is **`user_mode_thread(fn, arg, flags)`**. The kernel uses it
-at boot to create the real `init` (`user_mode_thread(kernel_init, …)`): it
-creates a task that runs `fn` in kernel context but, unlike a `kthread`, is
-allowed to later `kernel_execve()` and *become a userspace process*.
+The key primitive is **`krunc_spawn(fn, arg, flags)`** — a thin wrapper (in
+`krunc_helper.ko`) around the kernel's **`kernel_clone()`** with a kernel-function
+entry (`.fn`/`.fn_arg`). This is conceptually the same mechanism the kernel uses
+at boot to create the real `init`: it creates a task that runs `fn` in kernel
+context but, unlike a `kthread`, is allowed to later `kernel_execve()` and
+*become a userspace process*.
 
 krunc calls it with the namespace clone flags:
 
@@ -46,9 +48,11 @@ CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWNET | SIGCHL
 Because `write()` runs in the caller's context, the new task is a child of the
 calling process and — thanks to `CLONE_NEWPID` — **PID 1 of a new PID
 namespace**. `SIGCHLD` makes it a reapable child. The other flags give it
-private mount/UTS/IPC/network namespaces. (`user_mode_thread` additionally
-forces `CLONE_VM`, the same transient mm-sharing the kernel's own init creation
-uses; `execve` installs a fresh mm immediately after.)
+private mount/UTS/IPC/network namespaces. Unlike `user_mode_thread()`/
+`kernel_thread()`, `krunc_spawn` deliberately does **not** set `CLONE_VM`: krunc
+may be called from an ordinary (possibly multi-threaded) userspace process, and
+the container init must not share that caller's address space (the child gets its
+own mm, which `execve` replaces).
 
 The new task runs `container_entry()` (a `extern "C"` fn), which, still in
 kernel context inside the new namespaces:
@@ -102,7 +106,7 @@ provides internally.
 - argv strings are copied onto the kernel stack (bounded: ≤ 8 args × ≤ 256 B) so
   the heap context can be **freed before `execve`** — there is no per-container
   leak on the success path. On any failure path the `KBox` is dropped normally.
-- If `user_mode_thread` fails, the leaked context is reclaimed and dropped.
+- If `krunc_spawn` fails, the leaked context is reclaimed and dropped.
 
 ## 6. stdio
 
@@ -211,7 +215,13 @@ kernel's documented minimum) the call-depth-tracking mitigation that selects
 
 ## 9. Limitations and next steps
 
-Current simplifications (see also the README):
+This section describes the **original v1 PoC** baseline. Most of these
+simplifications have since been implemented (cgroups v2, capability dropping, the
+five cap sets, `process.user` uid/gid, config-driven mounts, masked/read-only
+paths, the full OCI runtime-spec create path); see `docs/ROADMAP.md` for current
+status. They are kept here for the design rationale.
+
+Original v1 simplifications (see also the README):
 
 - No cgroups (no CPU/memory/pids limits), no seccomp, no capability dropping, no
   user-namespace uid/gid mapping, no `pivot_root` + full mount setup (a chroot is
@@ -224,11 +234,15 @@ Current simplifications (see also the README):
 Natural next steps, roughly in order of value:
 
 1. **cgroups** — create a cgroup and move the container init into it for
-   CPU/memory/pids limits (in-kernel cgroup APIs).
+   CPU/memory/pids limits (in-kernel cgroup APIs). *(done)*
 2. **Mounts** — `pivot_root` + mount a private `/proc`, `/sys`, `/dev` and
    honor a list of bind/overlay mounts from the spec, from kernel side.
-3. **Privilege reduction** — drop capabilities and install a seccomp filter
-   before `execve`; optional user-namespace mapping.
+   *(mounts done; `pivot_root` still pending — needed for an immutable rootfs.)*
+3. **Privilege reduction** — drop capabilities and apply `no_new_privs` +
+   `process.user` before `execve`. *(done.)* Further syscall/LSM-level hardening
+   is deferred to a future **eBPF-LSM** program (attached at runtime, no kernel
+   patch) rather than seccomp/Landlock, which required in-tree kernel patches and
+   were removed.
 4. **Lifecycle** — track exit (e.g. a `do_wait`/exit hook) to reap and update
    the registry; expose container exit codes.
 5. **Control plane** — an `ioctl`/netlink API with a typed spec for richer
