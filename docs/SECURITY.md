@@ -81,7 +81,7 @@ implemented via patch-free BPF-LSM.
 The pipeline above is the current patch-free flow; the full design adds the
 remaining planned controls called out below. What the current PoC **implements
 and verifies from the host/VM** (see `docs/sample-v2-confinement.txt` and the
-BPF-LSM tripwire run):
+BPF-LSM kill-on-escape run):
 
 | Control | Status | Evidence (host-side) |
 |---|---|---|
@@ -94,7 +94,7 @@ BPF-LSM tripwire run):
 | `maskedPaths` + `readonlyPaths` | done | `/proc/kcore`→0 bytes; `/etc`,`/proc/sys` `EROFS` |
 | OCI `mounts[]` (config-driven, with `nosuid/nodev/noexec/ro`) | done | `/tmp` = `tmpfs rw,nosuid,nodev,noexec` |
 | seccomp (OCI→BPF, installed after `no_new_privs`) | removed (required a kernel source patch) | configs with `linux.seccomp` are rejected; `Seccomp: 0` |
-| **active kill-on-escape** (BPF-LSM replacement) | done | runtime-attached `BPF_PROG_TYPE_LSM` on `file_open`, cgroup-id-keyed `guarded` map, `bpf_send_signal(SIGKILL)`+`-EPERM`; guarded container SIGKILL'd at tripwire `open(2)`, never read the file, `krunc state`=`stopped` |
+| **active kill-on-escape** (BPF-LSM replacement) | done | runtime-attached `BPF_PROG_TYPE_LSM` keyed on the container cgroup, `bpf_send_signal(SIGKILL)`+`-EPERM`; guards real vectors incl. `lsm/userns_create` (nested user-ns) + an `lsm/file_open` tripwire. VM-verified: a guarded container's `unshare(CLONE_NEWUSER)` was denied (`EPERM`) + killed, the user-ns never created, `krunc state`=`stopped` |
 | cgroup v2 `pids` | done | kernel denies forks; `pids.current==pids.max` |
 | cgroup v2 `memory` | done | memhog past `memory.max` → memcg OOM kill; `memory.events oom_kill 1` |
 | cgroup v2 `cpu` | done | cpuhog under `cpu.max` throttled; `cpu.stat nr_throttled` climbs |
@@ -102,7 +102,7 @@ BPF-LSM tripwire run):
 | `linux.sysctl` (namespaced only) | done | `net.ipv4.ip_forward`=1 in the container netns; host-global names (e.g. `kernel.core_pattern`) are **rejected** |
 | `pivot_root` (replacing chroot) | deferred | immutability achieved via `root.readonly`; no callable in-kernel `pivot_root` on 6.18 |
 | user-ns uid/gid mapping | planned | — |
-| BPF-LSM richer path/mount/syscall policy | planned | extends the patch-free runtime LSM path beyond the VM-verified `file_open` tripwire |
+| BPF-LSM richer path/mount/syscall policy | planned | extends the patch-free runtime LSM path beyond the VM-verified `lsm/userns_create` + `lsm/file_open` hooks (e.g. `sb_mount`, `bpf`, `ptrace_access_check`) |
 
 Everything marked *done* is armed before the first container userspace
 instruction (setup controls in kernel context; BPF-LSM between create/start) and
@@ -142,20 +142,25 @@ A loadable module **cannot** register native LSM hooks post-boot
 (`security_add_hooks` is not exported; `DEFINE_LSM` lives in `__init`) — this is
 intentional. The approved runtime mechanisms are:
 
-- **BPF-LSM** (`CONFIG_BPF_LSM`, the stackable LSM): krunc now attaches a
-  `BPF_PROG_TYPE_LSM` program at runtime to `lsm/file_open`, keyed to the guarded
+- **BPF-LSM** (`CONFIG_BPF_LSM`, the stackable LSM): krunc now attaches
+  `BPF_PROG_TYPE_LSM` programs at runtime to **real escape vectors** — primarily
+  `lsm/userns_create` (creating a nested user namespace, a genuine
+  unprivileged-reachable privilege-escalation primitive and the start of many
+  container escapes), plus an `lsm/file_open` tripwire — each keyed to the guarded
   container via `bpf_get_current_cgroup_id()` and a cgroup-id-keyed `guarded` map.
-  Opening the demo tripwire basename `krunc-escape` calls
+  When a guarded container attempts a guarded action (e.g. `unshare(CLONE_NEWUSER)`,
+  or opening the basename `krunc-escape`), the program calls
   `bpf_send_signal(SIGKILL)` and returns `-EPERM`, so this is an active response
   (kill + deny), not a passive deny. The static libbpf loader runs between
-  `krunc create` and `krunc start`, pins the link, and inserts the cgroup id
-  before the entrypoint executes. This is patch-free and config-only:
-  `CONFIG_BPF_SYSCALL`, `CONFIG_BPF_LSM`, `CONFIG_DEBUG_INFO_BTF`,
+  `krunc create` and `krunc start`, attaches every hook, pins the links, and
+  inserts the cgroup id before the entrypoint executes. This is patch-free and
+  config-only: `CONFIG_BPF_SYSCALL`, `CONFIG_BPF_LSM`, `CONFIG_DEBUG_INFO_BTF`,
   `CONFIG_FUNCTION_TRACER` → `CONFIG_DYNAMIC_FTRACE_WITH_DIRECT_CALLS`, and
   `CONFIG_WERROR` off; reproduce with `KRUNC_BPF_LSM=1 scripts/build-kernel.sh`,
-  then `scripts/build-bpf.sh` and `scripts/run-bpflsm.sh`. QEMU verified the
-  guarded container was SIGKILL'd at tripwire `open(2)`, never read the file,
-  `krunc state` was `stopped`, and there was no kernel panic. Production should
+  then `scripts/build-bpf.sh` and `scripts/run-bpflsm.sh`. QEMU verified a guarded
+  container's `unshare(CLONE_NEWUSER)` was **denied (`EPERM`) and the container
+  killed** — the user namespace was never created, `krunc state` was `stopped`,
+  and there was no kernel panic. Production should
   fold the loader into the CLI, preferably all-Rust via aya; richer hooks
   (`ptrace_access_check`, `sb_mount`, `move_mount`, `task_kill`, `bpf`,
   `socket_*`) remain natural extensions.
@@ -194,7 +199,8 @@ and response** — *not* VM-grade isolation. Its strongest claims are: (1) it
 removes the runc-init setup-escape class outright, and (2) it makes the workload's
 confinement a sealed, kernel-owned, tamper-proof domain that also shrinks the
 exploitable surface (cap bounding, namespaces, cgroups, masked/readonly paths)
-and now actively kills the VM-verified tripwire escape attempt via patch-free
+and now actively kills the VM-verified escape attempt (a guarded container's
+nested user-namespace creation) via patch-free
 BPF-LSM.
 Where stronger isolation is required, krunc composes with — rather than replaces —
 VM/gVisor isolation.

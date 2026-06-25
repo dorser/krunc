@@ -85,21 +85,25 @@ Each is independently verifiable and committed.
 - **M8 — Lifetime enforcement (Pillar 2) (done).** krunc now has a
   patch-free, per-container **BPF-LSM kill-on-escape** active response. A
   `BPF_PROG_TYPE_LSM` program (`bpf/krunc_lsm.bpf.c`) is attached at runtime to
-  `lsm/file_open` and gated by a BPF hash map `guarded` keyed by cgroup id. For a
-  task whose cgroup id is guarded, opening the demo tripwire basename
-  `krunc-escape` calls `bpf_send_signal(SIGKILL)` and returns `-EPERM`, so the
+  **real escape vectors** — primarily `lsm/userns_create` (nested user-namespace
+  creation, a genuine unprivileged-reachable privesc primitive), plus an
+  `lsm/file_open` tripwire — each gated by a BPF hash map `guarded` keyed by
+  cgroup id. For a task whose cgroup id is guarded, the guarded action (e.g.
+  `unshare(CLONE_NEWUSER)`, or opening the basename `krunc-escape`) calls
+  `bpf_send_signal(SIGKILL)` and returns `-EPERM`, so the
   response kills and denies rather than passively denying. `bpf_get_current_cgroup_id()`
   scopes the policy to exactly the guarded container, not the host or other
   workloads. A small static libbpf loader (`bpf/krunc_lsm_loader.c`) loads and
-  attaches the program, pins the link, and inserts the container cgroup id (the
+  attaches every program, pins the links, and inserts the container cgroup id (the
   cgroup dir inode) between `krunc create` and `krunc start`, before the entrypoint
   executes. Kernel requirements remain config-only: `CONFIG_BPF_SYSCALL`,
   `CONFIG_BPF_LSM`, `CONFIG_DEBUG_INFO_BTF`, `CONFIG_FUNCTION_TRACER` →
   `CONFIG_DYNAMIC_FTRACE_WITH_DIRECT_CALLS`, `CONFIG_WERROR` off, with `bpf`
   already in the default `CONFIG_LSM` list. Reproduce with
   `KRUNC_BPF_LSM=1 scripts/build-kernel.sh`, then `scripts/build-bpf.sh` and
-  `scripts/run-bpflsm.sh`. QEMU verification: PID 1 printed `alive`, was
-  SIGKILL'd at tripwire `open(2)` before reading the file, `krunc state` showed
+  `scripts/run-bpflsm.sh`. QEMU verification: PID 1 printed `alive`, its
+  `unshare(CLONE_NEWUSER)` was denied (`EPERM`) and the container killed (the
+  user namespace never created), `krunc state` showed
   `stopped`, and there was no kernel panic. Production integration would fold the
   loader into the CLI, preferably all-Rust via aya; the in-tree LSM remains the
   mainline form.
