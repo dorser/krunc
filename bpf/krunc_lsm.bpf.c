@@ -14,12 +14,13 @@
  * `start`. bpf_get_current_cgroup_id() identifies the acting task's cgroup, so
  * the policy applies only to that container — never the host or other workloads.
  *
- * Tripwire (demo policy): opening a file whose basename is "krunc-escape". The
- * file_open LSM hook is reached by ordinary, unprivileged opens (unlike
- * mount/module-load, which the capability check rejects before any LSM hook), so
- * it reliably demonstrates the active kill. A real deployment would guard the
- * genuine escape vectors (e.g. lsm/userns_create, lsm/sb_mount, lsm/bpf,
- * lsm/ptrace_access_check) with the same cgroup-keyed mechanism.
+ * Guarded vectors:
+ *   - lsm/userns_create: creating a (nested) user namespace — a genuine,
+ *     UNPRIVILEGED-reachable privilege-escalation primitive (the starting point of
+ *     many container escapes), and, unlike mount/module-load, not blocked by a
+ *     capability check before the LSM hook, so guarding it here is meaningful.
+ *   - lsm/file_open of a tripwire basename ("krunc-escape"): a controllable demo
+ *     hook showing the same cgroup-keyed active-kill mechanism on a file access.
  *
  * Requires only kernel *config* (CONFIG_BPF_SYSCALL, CONFIG_BPF_LSM,
  * CONFIG_DEBUG_INFO_BTF, and "bpf" in CONFIG_LSM) — consistent with krunc's
@@ -49,6 +50,18 @@ static __always_inline int cgroup_is_guarded(void)
 	__u64 cgid = bpf_get_current_cgroup_id();
 
 	return bpf_map_lookup_elem(&guarded, &cgid) != NULL;
+}
+
+SEC("lsm/userns_create")
+int BPF_PROG(krunc_userns_create, const struct cred *cred)
+{
+	if (!cgroup_is_guarded())
+		return 0;
+
+	/* Active response: kill the container trying to create a user namespace,
+	 * and deny the operation. */
+	bpf_send_signal(9 /* SIGKILL */);
+	return -1 /* -EPERM */;
 }
 
 SEC("lsm/file_open")

@@ -5,7 +5,7 @@
     "user": { "uid": 0, "gid": 0 },
     "args": [
       "/bin/sh", "-c",
-      "echo '[container] PID 1 alive; opening tripwire /krunc-escape (BPF-LSM should kill+deny)'; exec /bin/busybox cat /krunc-escape"
+      "echo '[container] PID 1 alive; creating a user namespace via unshare -U (BPF-LSM should kill+deny)'; exec /bin/busybox unshare -U /bin/busybox echo USERNS-CREATED-MARKER-FAIL"
     ],
     "cwd": "/",
     "noNewPrivileges": true

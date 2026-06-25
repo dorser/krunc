@@ -50,20 +50,27 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	struct bpf_program *prog =
-		bpf_object__find_program_by_name(obj, "krunc_file_open");
-	if (!prog) {
-		fprintf(stderr, "program krunc_file_open not found\n");
-		return 1;
+	/* Attach every LSM program in the object (one per guarded vector) and pin
+	 * each link so the policy persists after this loader exits. */
+	struct bpf_program *prog;
+	int n_attached = 0;
+	bpf_object__for_each_program(prog, obj) {
+		const char *pname = bpf_program__name(prog);
+		struct bpf_link *link = bpf_program__attach(prog);
+		if (!link || libbpf_get_error(link)) {
+			fprintf(stderr, "attach %s failed: %s\n", pname, strerror(errno));
+			return 1;
+		}
+		char pin[512];
+		snprintf(pin, sizeof(pin), "%s_%s", pin_path, pname);
+		if (bpf_link__pin(link, pin)) {
+			fprintf(stderr, "pin %s: %s\n", pin, strerror(errno));
+			return 1;
+		}
+		n_attached++;
 	}
-	struct bpf_link *link = bpf_program__attach(prog);
-	if (!link || libbpf_get_error(link)) {
-		fprintf(stderr, "attach failed: %s\n", strerror(errno));
-		return 1;
-	}
-	/* Persist the attachment past our exit. */
-	if (bpf_link__pin(link, pin_path)) {
-		fprintf(stderr, "pin %s: %s\n", pin_path, strerror(errno));
+	if (n_attached == 0) {
+		fprintf(stderr, "no programs to attach\n");
 		return 1;
 	}
 
@@ -78,7 +85,7 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	printf("krunc_lsm: guarding cgroup %s (id %llu); kill-on-escape armed\n",
-	       cgroup_dir, (unsigned long long)cgid);
+	printf("krunc_lsm: guarding cgroup %s (id %llu); %d kill-on-escape hooks armed\n",
+	       cgroup_dir, (unsigned long long)cgid, n_attached);
 	return 0;
 }

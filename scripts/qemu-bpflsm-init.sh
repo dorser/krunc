@@ -42,22 +42,23 @@ echo "==> arm BPF-LSM on the container cgroup"
 /bin/krunc_lsm_loader /krunc_lsm.bpf.o "$CG" /sys/fs/bpf/krunc_lsm \
 	|| { echo "[vm] loader FAILED"; sleep 1; poweroff -f; }
 
-# 3. Start the container -> its PID 1 opens the tripwire -> BPF-LSM kills it.
+# 3. Start the container -> its PID 1 calls unshare(CLONE_NEWUSER) -> BPF-LSM kills it.
 echo
-echo "==> krunc start esc   (entrypoint opens /krunc-escape)"
+echo "==> krunc start esc   (entrypoint creates a user namespace)"
 /bin/krunc start esc
 sleep 1
 
-# 4. Verdict. The container must be stopped, and the tripwire's content
-#    ("ESCAPE-SUCCEEDED...") must NOT have been printed above (it is only printed
-#    if the open was allowed, i.e. the BPF-LSM did not deny+kill).
+# 4. Verdict. The container must be stopped, and the post-escape marker
+#    ("USERNS-CREATED-MARKER-FAIL") must NOT have been printed above (it prints
+#    only if unshare(CLONE_NEWUSER) was allowed, i.e. the BPF-LSM did not
+#    deny+kill).
 echo
 echo "==> verdict"
 echo "[vm] krunc state esc:"
 /bin/krunc state esc 2>/dev/null | grep -E '"status"|"id"' | sed 's/^/[vm]   /'
-echo "[vm] PASS = status 'stopped' AND the tripwire file's contents were NOT"
-echo "[vm]        printed above (the container's PID 1 was SIGKILL'd at open(2),"
-echo "[vm]        so it never read the file). A printed tripwire line = FAIL."
+echo "[vm] PASS = status 'stopped' AND no 'USERNS-CREATED' marker printed above"
+echo "[vm]        (the container's PID 1 was SIGKILL'd at unshare(CLONE_NEWUSER),"
+echo "[vm]        so the user namespace was never created). A marker line = FAIL."
 /bin/krunc delete esc 2>/dev/null
 
 echo
