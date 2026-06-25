@@ -279,14 +279,19 @@ it is not production software. Notable simplifications and known limitations:
   subset (above), so krunc rejects them — `ctr run`/`nerdctl run` with default
   configs are refused by design. A reduced runtime config (or implementing those
   properties spec-faithfully) is required to run under containerd. The
-  `--console-socket` terminal handoff and CNI networking are runc/containerd
-  conventions outside the runtime-spec and are not implemented.
+  containerd `create` + `--console-socket` terminal handoff and CNI networking are
+  runc/containerd conventions outside the runtime-spec and are not implemented —
+  though **`krunc run -t` does give an interactive pseudo-terminal** (allocated by
+  the CLI: `openpty` + `fork`, the container inherits the slave as its terminal,
+  the CLI relays to the user's tty — no kernel PTY support needed).
 - **Privilege.** `run`/`create`/`kill` require the caller to be privileged
   (namespace creation needs `CAP_SYS_ADMIN`); there is no per-caller
   authorization beyond the device's file permissions.
-- **Lifecycle.** The container registry detects liveness lazily (signal-0
-  probe) but does not reap; exited containers linger in the table until
-  `delete`/unload.
+- **Lifecycle.** A `do_exit` kprobe captures each container init's exit status the
+  instant it terminates, so `state` is zombie-aware (an exited-but-unreaped init
+  reports `stopped`, not `running`) and `krunc state` surfaces the exit code /
+  terminating signal (`org.krunc.exitCode`/`exitSignal`). Entries still linger in
+  the registry table until `delete`/unload.
 - **helper module (no kernel patch).** `module/krunc_helper.c` builds as a tiny
   C sibling module that resolves the non-exported kernel primitives at load time
   via `kprobe→kallsyms_lookup_name`, then re-exports `krunc_spawn` (clone without

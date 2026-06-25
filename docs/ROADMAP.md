@@ -279,17 +279,19 @@ executed in verified increments, not in one shot.
   nested mountpoints (`krunc_mkdir` → `vfs_mkdir`) before each filesystem mount,
   so a stock containerd/nerdctl `/dev/pts`, `/dev/shm`, `/dev/mqueue`,
   `/sys/fs/cgroup`, … all mount inside the just-created `/dev` tmpfs (host-verified
-  under `nerdctl run`). Non-tty stdio works; **interactive `-t` (console-socket
-  PTY + controlling-terminal setup) is not yet wired** — use `--net none` and
-  non-tty for now.
+  under `nerdctl run`). Interactive **`krunc run -t` now works** (a CLI-side pty
+  relay — `openpty` + `fork`, the container inherits the slave as its terminal,
+  the parent relays to the user's tty; no kernel PTY support needed). The
+  containerd `create` + `--console-socket` `SCM_RIGHTS` handoff is the remaining
+  terminal piece.
 - **krunc run (done) — docker-style one-shot.** `krunc run [--image <name>|<name>]
   -- <cmd>` synthesizes a hardened bundle around an extracted rootfs and runs the
   command create+start+wait+delete, streaming output and propagating the exit
-  code (host-verified: `krunc run busybox -- echo`, `CapEff/CapBnd 0`).
-- **Next:** interactive `-t` console-socket support (PTY handoff via `SCM_RIGHTS`
-  is prototyped; needs kernel-side `setsid`+`TIOCSCTTY`); M3 follow-up
-  (`pivot_root` remains deferred); M7 user-ns id mapping; richer BPF-LSM policy
-  beyond the VM-verified escape blocking; M9 conformance; a native Rust
+  code (host-verified: `krunc run busybox -- echo`, `CapEff/CapBnd 0`). Add `-t`
+  for an interactive pseudo-terminal.
+- **Next:** containerd `--console-socket` PTY handoff (`SCM_RIGHTS`) for the
+  `create` lifecycle; M3 follow-up (`pivot_root` remains deferred); richer BPF-LSM
+  policy beyond the VM-verified escape blocking; a native Rust
   `containerd-shim-krunc-v2`; and the full `Domain` typestate object + domainfd.
 
 ## Backlog (post-v1)
@@ -326,9 +328,15 @@ patch-requiring; `pivot_root` deferred). The next phase, prioritized:
   switches its fsuid/fsgid to the mapped namespace-root before entering the
   rootfs. Verified: container is root (uid 0) inside its userns while the host
   sees it as unprivileged uid 100000 (`scripts/qemu-userns-init.sh`).
-- Device cgroup (`linux.resources.devices`); OCI seccomp → eBPF translation
-  (instead of rejecting `linux.seccomp`); `process.terminal`/console-socket PTY;
-  hooks, `rootfsPropagation`, id-mapped mounts, `memory.swap`.
+- Interactive terminal — **`krunc run -t` DONE** (CLI-side pty relay; no kernel
+  PTY needed). Device cgroup (`linux.resources.devices`); the containerd
+  `create` + `--console-socket` `SCM_RIGHTS` PTY handoff; `hooks`,
+  `rootfsPropagation`, id-mapped mounts, `memory.swap`.
+- **Known infeasible patch-free** (would require the abandoned in-tree patch):
+  *OCI seccomp* — `struct seccomp_filter` is opaque and the kernel-context init
+  has no user mm to feed `seccomp(2)`/`seccomp_set_mode_filter`; *`pivot_root`* —
+  6.18 exposes only the syscall entry, no separable `do_pivot_root`. Both need a
+  kernel export (i.e. the in-tree LSM path), so they stay rejected/deferred.
 
 **P2 — lifecycle & robustness**
 - Container reaping + exit-code/signal propagation — **DONE**: a `do_exit` kprobe
