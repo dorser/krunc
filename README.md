@@ -129,10 +129,11 @@ The kernel then applies the confinement — namespaces, in-kernel chroot, **the
 capability bounding set and `no_new_privs`**, a read-only rootfs (`root.readonly`),
 `linux.sysctl`, mounts and masked/read-only paths — atomically before exec.
 Optionally (M8), a **patch-free BPF-LSM** program adds *active* per-container
-kill-on-escape: attached at runtime and keyed on the container's cgroup, it
-`SIGKILL`s the container the instant it attempts a forbidden action (the
-lifetime-enforcement response that replaces the dropped seccomp kill, with no
-kernel source patch — see [`scripts/run-bpflsm.sh`](scripts/run-bpflsm.sh)).
+escape blocking: attached at runtime and keyed on the container's cgroup, it
+**denies** (`-EPERM`) a forbidden action the instant the container attempts it —
+and, in opt-in *kill* mode, also `SIGKILL`s the container (the fail-stop posture
+that replaces the dropped seccomp kill). All with no kernel source patch — see
+[`scripts/run-bpflsm.sh`](scripts/run-bpflsm.sh)).
 
 A captured run is in
 [`docs/sample-v2-confinement.txt`](docs/sample-v2-confinement.txt): the OCI
@@ -158,9 +159,9 @@ module/                Rust kernel module (the runtime itself)
                        primitives via kprobe→kallsyms_lookup_name and re-exports
                        krunc_spawn, krunc_apply_creds + helpers (NO vmlinux patch)
   Kbuild, Makefile     out-of-tree build of both modules
-bpf/                   optional patch-free BPF-LSM kill-on-escape (M8)
-  krunc_lsm.bpf.c      BPF_PROG_TYPE_LSM program: per-cgroup active SIGKILL on a
-                       guarded container's escape attempt (runtime-attached)
+bpf/                   optional patch-free BPF-LSM escape blocking (M8)
+  krunc_lsm.bpf.c      BPF_PROG_TYPE_LSM program: per-cgroup deny (-EPERM), and in
+                       opt-in kill mode SIGKILL, on a guarded container's escape attempt
   krunc_lsm_loader.c   static libbpf loader: attaches it + guards a container cgroup
 userspace/             all-Rust userspace (Cargo workspace)
   krunc-abi/           versioned, bounds-checked binary spec (no_std-friendly, no unsafe)
@@ -183,7 +184,7 @@ scripts/
   qemu-init.sh         the in-VM demo driver (text + OCI lifecycle + confinement + unload)
   run-interactive.sh   boot to a shell to drive krunc by hand (incl. `krunc run`)
   qemu-shell-init.sh   interactive in-VM init (loads krunc.ko, prints a cheatsheet)
-  run-bpflsm.sh        boot the BPF-LSM kill-on-escape demo (M8)
+  run-bpflsm.sh        boot the BPF-LSM escape-blocking demo (M8)
   qemu-bpflsm-init.sh  in-VM init for the BPF-LSM demo
   setup-containerd-image.sh  stage containerd + nerdctl + a busybox image
   run-containerd.sh    boot a guest where real containerd/nerdctl drive krunc

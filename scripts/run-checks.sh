@@ -3,7 +3,7 @@
 # outcomes. A one-command regression check for the test VM: it turns the manual
 # demos into pass/fail assertions (container isolation + confinement, read-only
 # rootfs, sysctls, cgroup limits, clean unload, and — on a BPF-LSM kernel — the
-# active kill-on-escape). Exit code 0 iff every check passed.
+# active escape blocking). Exit code 0 iff every check passed.
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="${REPO:-$HOME/krunc}"
@@ -64,7 +64,7 @@ has    "all demos complete"                            "$L" 'all demos complete'
 no_panic "no kernel panic/oops (lifecycle demo)"       "$L"
 
 if [ "$BPF_LSM" = 1 ]; then
-	echo "==> [2/2] BPF-LSM kill-on-escape demo"
+	echo "==> [2/2] BPF-LSM escape-blocking demo"
 	INIT="$REPO/scripts/qemu-bpflsm-init.sh" OUT="$HOME/krunc-checks-bpf.cpio.gz" bash "$HERE/make-initramfs.sh" >/dev/null 2>&1
 	INITRAMFS="$HOME/krunc-checks-bpf.cpio.gz" timeout 200 bash "$HERE/run-qemu.sh" >/tmp/checks-bpf.log 2>&1 || true
 	B=/tmp/checks-bpf.log

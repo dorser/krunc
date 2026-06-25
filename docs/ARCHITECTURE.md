@@ -87,7 +87,7 @@ it in?":
 | filesystem / net / IPC | **Landlock** precedent; removed from PoC (required a kernel source patch) | canonical sealed-domain model; `root.readonly` plus patch-free BPF-LSM active response replace the removed patched path |
 | resources | **cgroup v2** | continuous; DoS containment |
 | sensitive interfaces | masked/ro paths, dropped sysctls, device policy | block release_agent / core_pattern / sysrq / mknod escapes |
-| active per-domain policy + kill | **BPF-LSM** on `file_open`, cgroup-id-keyed `guarded` map; `bpf_send_signal(SIGKILL)` + `-EPERM` | done: runtime-loaded, patch-free/config-only active response |
+| active per-domain policy + configurable escape enforcement | **BPF-LSM** on `lsm/userns_create` + `lsm/file_open`, cgroup-id-keyed `guarded` map; default deny (`-EPERM`), optional `bpf_send_signal(SIGKILL)` in kill mode | done: runtime-loaded, patch-free/config-only active response |
 
 **Why not native LSM hooks in the module:** `security_add_hooks()` is not
 exported and `DEFINE_LSM` lives in `__init` — a loadable module **cannot** register
@@ -99,10 +99,12 @@ LSM hooks post-boot (intentional). Therefore:
   and `CONFIG_KALLSYMS_ALL`. A small sibling `krunc_helper.ko` is loaded before
   `krunc.ko` and resolves non-exported primitives through a
   kprobe→`kallsyms_lookup_name` bootstrap. A **BPF-LSM** program now provides
-  per-domain runtime policy + kill-on-escape: a static libbpf loader attaches it
-  between `krunc create` and `krunc start`, pins the link, and guards exactly the
-  container cgroup id. This remains patch-free/config-only (`CONFIG_BPF_SYSCALL`,
-  `CONFIG_BPF_LSM`, BTF, BPF trampolines, `CONFIG_WERROR` off).
+  per-domain runtime policy + configurable escape enforcement: a static libbpf
+  loader attaches it between `krunc create` and `krunc start`, pins the link, and
+  guards exactly the container cgroup id. The default mode denies with `-EPERM`;
+  opt-in kill mode additionally sends `SIGKILL`. This remains patch-free/config-only
+  (`CONFIG_BPF_SYSCALL`, `CONFIG_BPF_LSM`, BTF, BPF trampolines, `CONFIG_WERROR`
+  off).
 - **Mainline:** `krunc_domain` becomes an **in-tree LSM, modelled on Landlock**,
   with the `cred_prepare`/`bprm_committing_creds` inheritance hooks and a cred
   blob — giving the *true* first-class, sealed, inherited domain. This is the
@@ -134,8 +136,8 @@ A versioned, `#[repr(C)]`, bounds-checked request: header (`abi_version`, op,
 section offsets/lengths, out `domain_id`/`domainfd`) + a flat bounded payload
 (namespaces, uid/gid maps, argv/env, mounts[], masked/ro paths[], cap sets,
 rlimits[], cgroup limits, user). The current binary spec carries no seccomp
-program and no Landlock rules; active kill-on-escape is supplied by the
-runtime-loaded BPF-LSM path.
+program and no Landlock rules; active escape blocking is supplied by the
+runtime-loaded BPF-LSM path (deny by default, optional SIGKILL in kill mode).
 Kernel side: `FromBytes`/`AsBytes`, reject unknown `abi_version`, cap every
 count/length, single `copy_from_user`, validate-before-use. The ABI lives in one
 Rust crate shared (and mirrored) by CLI and module; round-trip property-tested
@@ -151,8 +153,8 @@ a runc-compatible CLI and verified under QEMU + go-runc. v2:
 2. extend P1 to the full ordered sequence (uid/gid maps, no_new_privs, new mount
    API + pivot_root, caps, cgroup placement, user, richer eBPF-LSM policy);
 3. rewrite the userspace adapter in Rust (oci-spec → domain spec);
-4. extend the implemented BPF-LSM per-domain kill-on-escape (optional,
-   privileged) beyond the VM-verified `file_open` tripwire;
+4. extend the implemented BPF-LSM per-domain escape enforcement (optional,
+   privileged) beyond the VM-verified `lsm/userns_create` + `file_open` hooks;
 5. extensive verification (see `docs/ROADMAP.md` + `plan`): OCI conformance,
    per-confinement host-side assertions, **post-setup escape-attempt tests**, and
    real containerd e2e;

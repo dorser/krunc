@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * krunc_lsm_loader.c - load + attach krunc's BPF-LSM kill-on-escape program and
+ * krunc_lsm_loader.c - load + attach krunc's BPF-LSM escape-blocking program and
  * mark a container's cgroup as guarded. Runs in the (host) init context between
  * `krunc create` and `krunc start`, so the policy is in force before the
  * container's entrypoint executes.

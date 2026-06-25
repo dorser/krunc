@@ -1,10 +1,11 @@
 #!/bin/sh
-# qemu-bpflsm-init.sh - PID 1 of the QEMU guest for the M8 BPF-LSM kill-on-escape
+# qemu-bpflsm-init.sh - PID 1 of the QEMU guest for the M8 BPF-LSM escape-blocking
 # demo. It loads krunc, arms a per-container BPF-LSM policy on the container's
-# cgroup, starts the container, and shows the container is KILLED the instant it
-# opens the tripwire file -- an active response (not just a passive deny) that
-# krunc could not do after dropping seccomp. All patch-free: the kernel only
-# needs CONFIG_BPF_LSM + BTF (+ "bpf" in CONFIG_LSM), no source patch.
+# cgroup (block mode), starts the container, and shows that a real escape attempt
+# (creating a user namespace) is DENIED (-EPERM) the instant it happens while the
+# container keeps running -- the lifetime enforcement krunc lost when seccomp was
+# dropped. ("kill" mode additionally SIGKILLs the container.) All patch-free: the
+# kernel only needs CONFIG_BPF_LSM + BTF (+ "bpf" in CONFIG_LSM), no source patch.
 exec 1>&2
 PATH=/bin:/sbin:/usr/bin:/usr/sbin
 export PATH
@@ -19,7 +20,7 @@ mount -t tmpfs    tmp  /tmp             2>/dev/null
 mount -t securityfs sec /sys/kernel/security 2>/dev/null
 
 echo "############################################################"
-echo "# krunc M8 - BPF-LSM per-container kill-on-escape (patch-free)"
+echo "# krunc M8 - BPF-LSM per-container escape blocking (patch-free)"
 echo "# kernel : $(uname -r)"
 echo "# LSMs   : $(cat /sys/kernel/security/lsm 2>/dev/null)"
 echo "############################################################"
