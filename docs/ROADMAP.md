@@ -110,24 +110,24 @@ Each is independently verifiable and committed.
   integration would fold the
   loader into the CLI, preferably all-Rust via aya; the in-tree LSM remains the
   mainline form.
-- **M9 — OCI conformance (partial — measured).** The official
+- **M9 — OCI conformance (measured).** The official
   `opencontainers/runtime-tools` `runtimetest` validator runs as a container
   under krunc (harness: `scripts/qemu-conformance-init.sh` + `make-initramfs.sh`
   with `RUNTIMETEST=<binary>`). Against a config within krunc's supported subset it
-  passes **237 of 249** MUST-level checks: hostname, cwd, env, `process.user`,
+  passes **303 of 303** checks (0 failures): hostname, cwd, env, `process.user`,
   capabilities (all five sets), rlimits, `oomScoreAdj`, `noNewPrivs`, namespaces,
-  mounts, `maskedPaths`, `readonlyPaths` all conform. The **12 failures are all the
-  OCI default `/dev` devices/symlinks** (`/dev/null`, `/dev/zero`, `/dev/full`,
-  `/dev/random`, `/dev/urandom`, `/dev/tty`, `/dev/ptmx` + `/dev/fd|stdin|stdout|
-  stderr`), which krunc does not auto-create — a deliberate consequence of its
-  strict "do exactly what's configured" stance (it also no longer auto-mounts the
-  SHOULD default filesystems `/proc`,`/sys`). Whether to provide these
-  runtime-supplied defaults is part of the strict-minimal-vs-spec-complete decision
-  (see the deferred A/B/C fork). Mount options: krunc now implements the flag-based
-  options the spec lists as MUST (`defaults`, `async`, `atime`, `dirsync`,
-  `lazytime`, `iversion`, `loud`, …); the propagation options (`private`/`rprivate`/
-  `rshared`/`rslave`) need a separate `mount(2)` propagation call krunc does not yet
-  make, so they remain rejected (not silently dropped).
+  mounts, `maskedPaths`, `readonlyPaths` all conform — **and the OCI default `/dev`
+  devices/symlinks** (`/dev/null`, `/dev/zero`, `/dev/full`, `/dev/random`,
+  `/dev/urandom`, `/dev/tty`, `/dev/ptmx` + `/dev/fd|stdin|stdout|stderr`), which
+  krunc now supplies itself: when the config mounts a fresh `tmpfs` at `/dev`, the
+  module materialises the default nodes (`krunc_mknod`) and symlinks
+  (`krunc_symlink`) from kernel context while the container init still holds
+  `CAP_MKNOD`, before exec. (When `/dev` is bind-mounted from the host krunc adds
+  nothing — the host's nodes are already present.) Mount options: krunc implements
+  the flag-based options the spec lists as MUST (`defaults`, `async`, `atime`,
+  `dirsync`, `lazytime`, `iversion`, `loud`, …); the propagation options
+  (`private`/`rprivate`/`rshared`/`rslave`) need a separate `mount(2)` propagation
+  call krunc does not yet make, so they remain rejected (not silently dropped).
 - **M10 (done — see below) — containerd e2e.** Real containerd + offline busybox
   OCI image + krunc runtime; `ctr run` and `nerdctl run`. A native Rust
   `containerd-shim-krunc-v2` remains optional future work.
@@ -304,11 +304,13 @@ patch-requiring; `pivot_root` deferred). The next phase, prioritized:
   `bpf`, `ptrace_access_check`, `move_mount`, module load) and make the guarded
   set + per-vector mode configurable from the OCI spec/annotations; drop the
   contrived `file_open` tripwire once the loader is real.
+  *(DONE for the vectors: `sb_mount`/`move_mount`/`bpf`/`ptrace_access_check` are
+  now guarded alongside `userns_create`; CLI integration still pending.)*
 - Run a real OCI image (alpine/nginx) end-to-end via containerd.
 
 **P1 — OCI runtime-spec completeness**
-- Default `/dev` device nodes + symlinks (closes the 12 `runtimetest` MUST
-  failures → 249/249).
+- Default `/dev` device nodes + symlinks — **DONE** (`krunc_mknod`/`krunc_symlink`
+  populate a fresh tmpfs `/dev`; `runtimetest` now passes 303/303, 0 failures).
 - Device cgroup (`linux.resources.devices`); user namespaces + uid/gid mappings;
   OCI seccomp → eBPF translation (instead of rejecting `linux.seccomp`);
   `process.terminal`/console-socket PTY; hooks, `rootfsPropagation`, id-mapped
