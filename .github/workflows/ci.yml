@@ -1,0 +1,61 @@
+name: CI
+
+# Userspace CI: builds, tests, and lints the Rust workspace under `userspace/`
+# (krunc-abi, krunc-oci, krunc-cli, and the cgroup probes). The kernel module and
+# the QEMU integration suite (`scripts/run-checks.sh`) need a CONFIG_RUST kernel
+# built on the test VM and are run there, not in this hosted CI.
+#
+# Note: this project deliberately does NOT use rustfmt (no rustfmt.toml; the code
+# follows a hand-maintained style), so there is no `cargo fmt --check` step.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'userspace/**'
+      - '.github/workflows/ci.yml'
+  pull_request:
+    paths:
+      - 'userspace/**'
+      - '.github/workflows/ci.yml'
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: build • test • clippy
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: userspace
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable) with clippy
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup default stable
+          rustc --version && cargo --version && cargo clippy --version
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            userspace/target
+          key: cargo-${{ runner.os }}-${{ hashFiles('userspace/Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: Build (workspace)
+        run: cargo build --workspace --locked
+
+      - name: Test (workspace)
+        run: cargo test --workspace --locked
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --workspace --locked -- -D warnings
