@@ -262,11 +262,12 @@ it is not production software. Notable simplifications and known limitations:
   of `config.json` (args, env, cwd, root, hostname, namespaces, capabilities,
   cgroups pids/memory/cpu, mounts, masked/read-only paths, read-only rootfs
   (`root.readonly`), `linux.sysctl` (namespaced sysctls only), rlimits, oom score,
-  user) and **rejects** —
+  user, **user namespaces with `linux.uid/gidMappings`**) and supplies the OCI
+  default `/dev` device nodes + symlinks for a fresh tmpfs `/dev`. It **rejects** —
   rather than silently ignoring — any other configured
   property (e.g. `process.terminal`, `process.user.umask`, `linux.seccomp`,
   `linux.devices`, `linux.resources.devices`,
-  `linux.resources.memory.swap`, `hooks`, user-namespace mappings,
+  `linux.resources.memory.swap`, `hooks`,
   id-mapped mounts, and non-flag mount options such as `size=`/`mode=` or
   propagation flags). Unmodeled fields are rejected at parse time
   (`deny_unknown_fields`), not dropped. This follows the runtime-spec `create`

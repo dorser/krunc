@@ -300,31 +300,43 @@ patch-requiring; `pivot_root` deferred). The next phase, prioritized:
 - Fold the BPF-LSM loader into the `krunc` CLI (all-Rust via aya): arm on
   `create`/`start`, **tear down on `delete`** (drop the cgroup id from the map +
   unpin links), per-container pin paths (the fixed path collides on concurrency).
+  *(Still pending — the standalone C loader works; this is the all-Rust/aya
+  lifecycle integration.)*
 - Richer BPF-LSM default policy: guard more real escape vectors (`sb_mount`,
   `bpf`, `ptrace_access_check`, `move_mount`, module load) and make the guarded
   set + per-vector mode configurable from the OCI spec/annotations; drop the
   contrived `file_open` tripwire once the loader is real.
   *(DONE for the vectors: `sb_mount`/`move_mount`/`bpf`/`ptrace_access_check` are
   now guarded alongside `userns_create`; CLI integration still pending.)*
-- Run a real OCI image (alpine/nginx) end-to-end via containerd.
+- Run a real OCI image (alpine/nginx) end-to-end — **DONE**: `krunc run --rootfs`
+  runs the official Alpine Linux minirootfs (real distro, musl, busybox) fully
+  confined (CapEff 0, NoNewPrivs 1); see `scripts/run-realimage.sh`.
 
 **P1 — OCI runtime-spec completeness**
 - Default `/dev` device nodes + symlinks — **DONE** (`krunc_mknod`/`krunc_symlink`
   populate a fresh tmpfs `/dev`; `runtimetest` now passes 303/303, 0 failures).
-- Device cgroup (`linux.resources.devices`); user namespaces + uid/gid mappings;
-  OCI seccomp → eBPF translation (instead of rejecting `linux.seccomp`);
-  `process.terminal`/console-socket PTY; hooks, `rootfsPropagation`, id-mapped
-  mounts, `memory.swap`.
+- User namespaces + uid/gid mappings — **DONE**: the kernel creates the user
+  namespace, the CLI writes `/proc/<pid>/{uid,gid}_map` (the kernel cannot —
+  `kernel_write` needs `write_iter`, which procfs uid_map lacks), and the init
+  switches its fsuid/fsgid to the mapped namespace-root before entering the
+  rootfs. Verified: container is root (uid 0) inside its userns while the host
+  sees it as unprivileged uid 100000 (`scripts/qemu-userns-init.sh`).
+- Device cgroup (`linux.resources.devices`); OCI seccomp → eBPF translation
+  (instead of rejecting `linux.seccomp`); `process.terminal`/console-socket PTY;
+  hooks, `rootfsPropagation`, id-mapped mounts, `memory.swap`.
 
 **P2 — lifecycle & robustness**
-- Container reaping + exit-code/signal propagation (the registry never reaps).
+- Container reaping + exit-code/signal propagation — **DONE**: a `do_exit` kprobe
+  captures the init's wait-status at exit (reliable even after reaping), `state`
+  is zombie-aware, and `krunc state` reports `org.krunc.exitCode`/`exitSignal`.
 - Module-side sysctl allow-list re-validation (defense-in-depth; low value as
   `/dev/krunc` is root-only). Registry data structure + per-open hook cost at scale.
 
 **P3 — engineering quality & infra**
 - CI: run `scripts/run-checks.sh` with a cached pre-built kernel artifact.
-- Commit `Cargo.lock` (done); expand ABI-decoder fuzzing + OCI-translation
-  property tests; pure-Rust elimination of `krunc_helper.c`; doc consolidation.
+- Commit `Cargo.lock` (done); ABI-decoder + OCI-translation fuzzing — **DONE**
+  (the JSON→spec front end is fuzzed for panic-freedom + full-pipeline round-trip);
+  pure-Rust elimination of `krunc_helper.c`; doc consolidation.
 
 **P4 — long-term vision (see `docs/ARCHITECTURE.md`)**
 - In-tree `krunc_domain` LSM (sealed, inherited, monotonic domain object with
