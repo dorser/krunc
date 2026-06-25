@@ -99,7 +99,7 @@ BPF-LSM tripwire run):
 | cgroup v2 `memory` | done | memhog past `memory.max` → memcg OOM kill; `memory.events oom_kill 1` |
 | cgroup v2 `cpu` | done | cpuhog under `cpu.max` throttled; `cpu.stat nr_throttled` climbs |
 | `root.readonly` immutable rootfs | done | `touch /`→`EROFS`; `/tmp` writable; bind-mount rootfs + `MS_REMOUNT`&#124;`MS_BIND`&#124;`MS_RDONLY`, fail-closed |
-| `linux.sysctl` | done | `net.ipv4.ip_forward`=1 in the container netns |
+| `linux.sysctl` (namespaced only) | done | `net.ipv4.ip_forward`=1 in the container netns; host-global names (e.g. `kernel.core_pattern`) are **rejected** |
 | `pivot_root` (replacing chroot) | deferred | immutability achieved via `root.readonly`; no callable in-kernel `pivot_root` on 6.18 |
 | user-ns uid/gid mapping | planned | — |
 | BPF-LSM richer path/mount/syscall policy | planned | extends the patch-free runtime LSM path beyond the VM-verified `file_open` tripwire |

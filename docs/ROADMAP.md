@@ -191,9 +191,13 @@ executed in verified increments, not in one shot.
   before chroot, then remounts `/` with `MS_REMOUNT|MS_BIND|MS_RDONLY`
   non-recursively after submount setup; it is fail-closed, and QEMU verified
   `touch /`→`EROFS` while `/tmp` stays writable. **`linux.sysctl` is now done**:
-  the OCI layer validates names and values, emits `SYSCTLS` `relpath=value`
-  entries, and the module writes `/proc/sys/<relpath>` before readonly-path
-  remounts; QEMU verified `net.ipv4.ip_forward=1` in the container netns.
+  the OCI layer validates names and values, **restricts to namespaced sysctls the
+  container owns** (mirrors runc — `net.*` with a netns, `kernel.shm*`/`kernel.msg*`/
+  `kernel.sem`/`fs.mqueue.*` with an IPC ns; host-global names like
+  `kernel.core_pattern` are rejected to prevent a container->host escape), emits
+  `SYSCTLS` `relpath=value` entries, and the module writes `/proc/sys/<relpath>`
+  before readonly-path remounts; QEMU verified `net.ipv4.ip_forward=1` in the
+  container netns.
   `pivot_root` is deferred on 6.18 because only the syscall entry point exists
   (`__user` pointers, no callable in-kernel helper), and rootfs immutability is
   already achieved by `root.readonly`.

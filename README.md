@@ -259,7 +259,8 @@ it is not production software. Notable simplifications and known limitations:
 - **Config boundary (strict, per runtime-spec).** krunc applies a defined subset
   of `config.json` (args, env, cwd, root, hostname, namespaces, capabilities,
   cgroups pids/memory/cpu, mounts, masked/read-only paths, read-only rootfs
-  (`root.readonly`), `linux.sysctl`, rlimits, oom score, user) and **rejects** —
+  (`root.readonly`), `linux.sysctl` (namespaced sysctls only), rlimits, oom score,
+  user) and **rejects** —
   rather than silently ignoring — any other configured
   property (e.g. `process.terminal`, `process.user.umask`, `linux.seccomp`,
   `linux.devices`, `linux.resources.devices`,
