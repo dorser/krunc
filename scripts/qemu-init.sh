@@ -139,12 +139,23 @@ fi
 echo "[vm] krunc kill oci1   (forktest is parked as PID 1; stop the whole tree)"
 /bin/krunc kill oci1 KILL
 sleep 1
-echo "[vm] krunc state oci1   (after kill, expect: stopped)"
-/bin/krunc state oci1 | grep -E '"status"' | sed 's/^/[vm]   /'
+echo "[vm] krunc state oci1   (after kill, expect: stopped + exit signal 9)"
+/bin/krunc state oci1 | grep -E '"status"|exitSignal|exitCode' | sed 's/^/[vm]   /'
 echo "[vm] krunc list:"
 /bin/krunc list | sed 's/^/[vm]   /'
 echo "[vm] krunc delete oci1"
 /bin/krunc delete oci1
+
+############################################################################
+echo
+echo "===== DEMO 3c: exit-code reaping (create/start a container that exits 42) ====="
+echo "[vm] krunc create rc42 --bundle /bundle-rc42 && start, then read recorded exit code"
+/bin/krunc create rc42 --bundle /bundle-rc42
+/bin/krunc start rc42
+sleep 1
+echo "[vm] krunc state rc42   (expect: stopped + exitCode 42)"
+/bin/krunc state rc42 | grep -E '"status"|exitCode|exitSignal' | sed 's/^/[vm]   /'
+/bin/krunc delete rc42
 
 ############################################################################
 echo

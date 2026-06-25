@@ -77,6 +77,39 @@ if [ -x "$CPUHOG" ]; then
 	chmod +x "$ROOT/bundle/rootfs/bin/cpuhog"
 fi
 
+# Minimal bundle whose entrypoint exits 42, to exercise exit-code reaping: krunc
+# captures the init's wait-status (even as a lingering zombie) and `krunc state`
+# reports `org.krunc.exitCode`. Shares the busybox rootfs; `exit` is a shell
+# builtin so only /bin/sh is needed.
+mkdir -p "$ROOT"/bundle-rc42/rootfs/bin "$ROOT"/bundle-rc42/rootfs/proc
+cp "$BB" "$ROOT/bundle-rc42/rootfs/bin/busybox"
+ln -sf busybox "$ROOT/bundle-rc42/rootfs/bin/sh"
+chmod +x "$ROOT/bundle-rc42/rootfs/bin/busybox"
+cat > "$ROOT/bundle-rc42/config.json" <<'CFG'
+{
+  "ociVersion": "1.0.2-dev",
+  "hostname": "rc42",
+  "process": {
+    "terminal": false,
+    "user": { "uid": 0, "gid": 0 },
+    "args": ["/bin/sh", "-c", "exit 42"],
+    "env": ["PATH=/bin"],
+    "cwd": "/",
+    "noNewPrivileges": true,
+    "capabilities": { "bounding": [] }
+  },
+  "root": { "path": "rootfs", "readonly": false },
+  "linux": {
+    "namespaces": [
+      { "type": "pid" }, { "type": "mount" }, { "type": "uts" }
+    ]
+  },
+  "mounts": [
+    { "destination": "/proc", "type": "proc", "source": "proc" }
+  ]
+}
+CFG
+
 # Optional: BPF-LSM kill-on-escape demo (M8). If the BPF artifacts were built
 # (scripts/build-bpf.sh), stage the loadable LSM object + static loader and a
 # minimal "escape" bundle whose PID 1 opens a tripwire file. The demo init

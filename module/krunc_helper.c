@@ -53,6 +53,8 @@
 #include <linux/mount.h>
 #include <linux/fcntl.h>
 #include <linux/rwsem.h>
+#include <linux/spinlock.h>
+#include <linux/atomic.h>
 
 /* ---- function pointers resolved from kallsyms at module init ---- */
 static pid_t (*p_kernel_clone)(struct kernel_clone_args *args);
@@ -94,6 +96,10 @@ static struct rw_semaphore *p_uts_sem;
 int krunc_set_hostname(const char *name, size_t len);
 int krunc_chroot(const char *path);
 int krunc_kill(pid_t nr, int sig);
+int krunc_task_exit_status(pid_t nr, int *status);
+int krunc_watch_pid(pid_t nr);
+void krunc_unwatch_pid(pid_t nr);
+int krunc_get_exit_code(pid_t nr, int *code);
 void __noreturn krunc_exit(long code);
 int krunc_apply_creds(u64 bset, u64 eff, u64 perm, u64 inh, u64 amb,
 		      u32 uid, u32 gid, int no_new_privs, int caps_present);
@@ -184,6 +190,173 @@ int krunc_kill(pid_t nr, int sig)
 	return ret;
 }
 EXPORT_SYMBOL_GPL(krunc_kill);
+
+/*
+ * Report the liveness/exit status of the task with host-visible pid @nr.
+ *
+ * Returns:
+ *   1  - the task is still alive (running/sleeping/stopped, not a zombie);
+ *        @status is left untouched.
+ *   0  - the task has exited: it is a zombie (EXIT_ZOMBIE) or already dead but
+ *        not yet released. @status (if non-NULL) is set to its wait(2)-style
+ *        status word (task->exit_code), so the caller can record the exit code
+ *        or termination signal even though the task has not been reaped yet.
+ *  -1  - no task with that pid exists (already reaped / never existed).
+ *
+ * This lets krunc report a container whose init has exited but has not yet been
+ * reaped by its parent (a lingering zombie) as STOPPED rather than RUNNING — a
+ * plain kill(pid, 0) liveness probe cannot distinguish a zombie from a live
+ * task — and to capture its exit status for `krunc state`.
+ */
+int krunc_task_exit_status(pid_t nr, int *status)
+{
+	struct pid *pid;
+	struct task_struct *task;
+	int ret;
+
+	pid = p_find_get_pid(nr);
+	if (!pid)
+		return -1;
+	/* get_pid_task() is EXPORT_SYMBOL_GPL; it returns a referenced task or
+	 * NULL under RCU, so the task pointer is safe to dereference here. */
+	task = get_pid_task(pid, PIDTYPE_PID);
+	p_put_pid(pid);
+	if (!task)
+		return -1;
+
+	if (READ_ONCE(task->exit_state)) {
+		if (status)
+			*status = task->exit_code;
+		ret = 0;
+	} else {
+		ret = 1;
+	}
+	put_task_struct(task);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(krunc_task_exit_status);
+
+/*
+ * Eager exit-status capture.
+ *
+ * A container's init exits in its own user context (after execve), long after
+ * krunc's code has gone, and its parent (the short-lived `krunc create` process)
+ * has usually exited too — so by the time `krunc state` runs the init may already
+ * have been reaped, and its exit code can no longer be read from the (now gone)
+ * task. To capture it reliably, krunc registers each container init's pid here
+ * and a kprobe on do_exit() records the exiting task's status word the instant it
+ * terminates. krunc.ko reads it back lazily in `state`.
+ *
+ * The table is tiny and guarded by a spinlock so it is safe to touch from the
+ * kprobe handler (atomic context) — unlike krunc.ko's sleeping-mutex registry.
+ */
+#define KRUNC_MAX_WATCH 64
+static DEFINE_SPINLOCK(krunc_watch_lock);
+static atomic_t krunc_num_watched = ATOMIC_INIT(0);
+static struct krunc_watch_entry {
+	pid_t pid;
+	int   code;
+	bool  in_use;
+	bool  exited;
+} krunc_watch[KRUNC_MAX_WATCH];
+
+/* Begin tracking host-visible pid @nr so its exit status is captured. */
+int krunc_watch_pid(pid_t nr)
+{
+	unsigned long flags;
+	int i, slot = -1;
+
+	spin_lock_irqsave(&krunc_watch_lock, flags);
+	for (i = 0; i < KRUNC_MAX_WATCH; i++) {
+		if (!krunc_watch[i].in_use) {
+			slot = i;
+			break;
+		}
+	}
+	if (slot >= 0) {
+		krunc_watch[slot].pid	 = nr;
+		krunc_watch[slot].code	 = 0;
+		krunc_watch[slot].in_use = true;
+		krunc_watch[slot].exited = false;
+		atomic_inc(&krunc_num_watched);
+	}
+	spin_unlock_irqrestore(&krunc_watch_lock, flags);
+	return slot >= 0 ? 0 : -ENOSPC;
+}
+EXPORT_SYMBOL_GPL(krunc_watch_pid);
+
+/* Stop tracking @nr and free its slot (called on container delete). */
+void krunc_unwatch_pid(pid_t nr)
+{
+	unsigned long flags;
+	int i;
+
+	spin_lock_irqsave(&krunc_watch_lock, flags);
+	for (i = 0; i < KRUNC_MAX_WATCH; i++) {
+		if (krunc_watch[i].in_use && krunc_watch[i].pid == nr) {
+			krunc_watch[i].in_use = false;
+			atomic_dec(&krunc_num_watched);
+		}
+	}
+	spin_unlock_irqrestore(&krunc_watch_lock, flags);
+}
+EXPORT_SYMBOL_GPL(krunc_unwatch_pid);
+
+/* If @nr is tracked and has exited, store its wait-style status word in @code
+ * and return 1; otherwise return 0. */
+int krunc_get_exit_code(pid_t nr, int *code)
+{
+	unsigned long flags;
+	int i, ret = 0;
+
+	spin_lock_irqsave(&krunc_watch_lock, flags);
+	for (i = 0; i < KRUNC_MAX_WATCH; i++) {
+		if (krunc_watch[i].in_use && krunc_watch[i].pid == nr &&
+		    krunc_watch[i].exited) {
+			if (code)
+				*code = krunc_watch[i].code;
+			ret = 1;
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&krunc_watch_lock, flags);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(krunc_get_exit_code);
+
+/* kprobe pre-handler on do_exit(long code): record the status word for any
+ * tracked task at the moment it terminates. Runs system-wide on every exit, so
+ * it bails out immediately (no lock) when nothing is being watched. */
+static int krunc_do_exit_pre(struct kprobe *p, struct pt_regs *regs)
+{
+	pid_t nr;
+	long code;
+	unsigned long flags;
+	int i;
+
+	if (atomic_read(&krunc_num_watched) == 0)
+		return 0;
+
+	nr   = task_pid_nr(current);
+	code = (long)regs->di;	/* x86_64: do_exit's first arg is in RDI */
+
+	spin_lock_irqsave(&krunc_watch_lock, flags);
+	for (i = 0; i < KRUNC_MAX_WATCH; i++) {
+		if (krunc_watch[i].in_use && krunc_watch[i].pid == nr &&
+		    !krunc_watch[i].exited) {
+			krunc_watch[i].code   = (int)code;
+			krunc_watch[i].exited = true;
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&krunc_watch_lock, flags);
+	return 0;
+}
+
+static struct kprobe krunc_exit_kp = {
+	.symbol_name = "do_exit",
+	.pre_handler = krunc_do_exit_pre,
+};
 
 /* Terminate the current task in kernel context (no return-to-userspace fault). */
 void __noreturn krunc_exit(long code)
@@ -455,12 +628,22 @@ static int __init krunc_helper_init(void)
 	KRUNC_RESOLVE(p_set_cred_ucounts, "set_cred_ucounts");
 	KRUNC_RESOLVE(p_uts_sem, "uts_sem");
 
+	/* The do_exit kprobe captures container exit codes. Best-effort: if it
+	 * cannot be registered, liveness/state still work, only the recorded exit
+	 * code is unavailable. */
+	ret = register_kprobe(&krunc_exit_kp);
+	if (ret)
+		pr_warn("krunc_helper: do_exit kprobe not registered (%d); exit codes unavailable\n",
+			ret);
+
 	pr_info("krunc_helper: kernel primitives resolved; krunc.ko may load\n");
 	return 0;
 }
 
 static void __exit krunc_helper_exit(void)
 {
+	if (krunc_exit_kp.addr)
+		unregister_kprobe(&krunc_exit_kp);
 	pr_info("krunc_helper: unloaded\n");
 }
 

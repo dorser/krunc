@@ -102,8 +102,10 @@ impl Device {
         self.ioctl(NR_START, &mut cmd)
     }
 
-    /// Query a domain's state and pid.
-    pub fn state(&self, id: u64) -> io::Result<(KState, i32)> {
+    /// Query a domain's state, pid, and (when stopped) the init's wait-style
+    /// exit-status word. The status word is 0 while running/created or if the
+    /// exit was not observed before the init was reaped.
+    pub fn state(&self, id: u64) -> io::Result<(KState, i32, i32)> {
         let mut cmd = KruncCmd { id, ..Default::default() };
         self.ioctl(NR_STATE, &mut cmd)?;
         let st = match cmd.state {
@@ -111,7 +113,7 @@ impl Device {
             1 => KState::Running,
             _ => KState::Stopped,
         };
-        Ok((st, cmd.pid))
+        Ok((st, cmd.pid, cmd.sig))
     }
 
     /// Signal a domain's init.

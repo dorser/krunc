@@ -58,6 +58,8 @@ has    "sysctl applied (net.ipv4.ip_forward=1)"        "$L" 'net.ipv4.ip_forward
 has    "pids cgroup enforced"                          "$L" 'pids cgroup ENFORCED'
 has    "memory cgroup OOM-kill enforced"               "$L" 'memory cgroup ENFORCED'
 has    "cpu cgroup throttling enforced"                "$L" 'cpu cgroup ENFORCED'
+has    "exited init reaped: signal captured (SIGKILL 9)" "$L" 'org.krunc.exitSignal.*9'
+has    "exited init reaped: exit code captured (42)"     "$L" 'org.krunc.exitCode.*42'
 has    "malformed-spec decoder robust"                 "$L" 'kernel decoder is robust'
 has    "module unloads cleanly"                        "$L" 'unloaded cleanly'
 has    "all demos complete"                            "$L" 'all demos complete'

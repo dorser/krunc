@@ -40,6 +40,10 @@ struct State {
     /// cgroup directory created for this container (for cleanup), if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cgroup: Option<String>,
+    /// OCI state annotations. krunc records the init's exit code or terminating
+    /// signal here (`org.krunc.exitCode` / `org.krunc.exitSignal`) once stopped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    annotations: Option<std::collections::BTreeMap<String, String>>,
 }
 
 fn main() {
@@ -198,6 +202,7 @@ fn create_from_bundle(
         bundle: bundle.to_string_lossy().into_owned(),
         krunc_id: kid,
         cgroup: cgroup_dir,
+        annotations: None,
     };
     save_state(root, &st);
     if let Some(pf) = flags.get("--pid-file") {
@@ -317,7 +322,7 @@ fn wait_for_exit(dev: &Device, pid: i32, kid: u64) -> i32 {
 fn wait_stopped(dev: &Device, kid: u64) {
     loop {
         match dev.state(kid) {
-            Ok((KState::Stopped, _)) => return,
+            Ok((KState::Stopped, _, _)) => return,
             Ok(_) => std::thread::sleep(std::time::Duration::from_millis(100)),
             Err(_) => return,
         }
@@ -469,12 +474,34 @@ fn do_state(root: &str, args: &[String]) {
     let id = args.first().unwrap_or_else(|| die("usage: state <id>"));
     let mut st = load_state(root, id);
     let dev = Device::open().unwrap_or_else(|e| die(format!("open: {e}")));
-    if let Ok((s, pid)) = dev.state(st.krunc_id) {
+    if let Ok((s, pid, exit_status)) = dev.state(st.krunc_id) {
         st.status = status_str(s).to_string();
         st.pid = pid;
+        if s == KState::Stopped {
+            st.annotations = exit_annotations(exit_status);
+        }
         save_state(root, &st);
     }
     println!("{}", serde_json::to_string_pretty(&st).expect("serialize"));
+}
+
+/// Decode a wait(2)-style status word into OCI state annotations recording how
+/// the container's init terminated. A `0` word (clean exit, or an exit that was
+/// reaped before krunc could observe it) is reported as exit code 0.
+fn exit_annotations(status: i32) -> Option<std::collections::BTreeMap<String, String>> {
+    let mut m = std::collections::BTreeMap::new();
+    if libc::WIFSIGNALED(status) {
+        m.insert(
+            "org.krunc.exitSignal".to_string(),
+            libc::WTERMSIG(status).to_string(),
+        );
+    } else {
+        m.insert(
+            "org.krunc.exitCode".to_string(),
+            libc::WEXITSTATUS(status).to_string(),
+        );
+    }
+    Some(m)
 }
 
 fn do_kill(root: &str, args: &[String]) {
@@ -640,5 +667,25 @@ mod tests {
         let json = synth_config("/img/rootfs", &args, "krunc-test", true);
         let cfg = parse_config(&json).expect("synth config must parse");
         assert!(config_to_spec(Path::new("/img"), &cfg).is_err());
+    }
+
+    #[test]
+    fn exit_annotations_decode_code_and_signal() {
+        // A clean exit with code 42 → wait-status word (42 << 8). The CLI must
+        // decode it into org.krunc.exitCode = 42 (and no exitSignal).
+        let a = exit_annotations(42 << 8).expect("annotations");
+        assert_eq!(a.get("org.krunc.exitCode").map(String::as_str), Some("42"));
+        assert!(!a.contains_key("org.krunc.exitSignal"));
+
+        // Termination by SIGKILL (9) → low 7 bits carry the signal. The CLI must
+        // decode it into org.krunc.exitSignal = 9 (and no exitCode).
+        let a = exit_annotations(9).expect("annotations");
+        assert_eq!(a.get("org.krunc.exitSignal").map(String::as_str), Some("9"));
+        assert!(!a.contains_key("org.krunc.exitCode"));
+
+        // A zero word (clean exit 0, or an exit reaped before krunc saw it) is
+        // reported as exit code 0.
+        let a = exit_annotations(0).expect("annotations");
+        assert_eq!(a.get("org.krunc.exitCode").map(String::as_str), Some("0"));
     }
 }

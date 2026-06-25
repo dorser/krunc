@@ -67,6 +67,20 @@ extern "C" {
     fn krunc_set_hostname(name: *const c_char, len: usize) -> c_int;
     fn krunc_chroot(path: *const c_char) -> c_int;
     fn krunc_kill(nr: c_int, sig: c_int) -> c_int;
+    /// Report a task's liveness/exit status: `1` = alive, `0` = exited (a zombie
+    /// or dead but unreaped; `*status` is set to its wait(2)-style status word),
+    /// `-1` = gone. Lets krunc report an exited-but-unreaped init as STOPPED and
+    /// capture its exit code/signal. See `krunc_task_exit_status` in the helper.
+    fn krunc_task_exit_status(nr: c_int, status: *mut c_int) -> c_int;
+    /// Begin tracking `nr` so the helper's `do_exit` kprobe records its exit
+    /// status the instant it terminates (reliable even if the init is reaped
+    /// before `state` is queried). Paired with `krunc_unwatch_pid` on delete.
+    fn krunc_watch_pid(nr: c_int) -> c_int;
+    /// Stop tracking `nr` and free its capture slot.
+    fn krunc_unwatch_pid(nr: c_int);
+    /// If `nr` is tracked and has exited, write its wait-style status word to
+    /// `code` and return `1`; otherwise return `0`.
+    fn krunc_get_exit_code(nr: c_int, code: *mut c_int) -> c_int;
     /// Terminate the current task in kernel context. Used on every
     /// `container_entry` path that does NOT successfully `kernel_execve`, so the
     /// task never "returns to userspace" without a valid user context.
@@ -178,7 +192,8 @@ struct KruncCmd {
     spec_len: u32,
     /// host-visible pid (out for CREATE/STATE).
     pid: i32,
-    /// signal number, for KILL.
+    /// signal number, for KILL; on STATE out it carries the init's wait-style
+    /// exit-status word (0 while running/created or if the exit went unobserved).
     sig: i32,
     /// container state (out for STATE).
     state: u32,
@@ -225,6 +240,11 @@ struct Container {
     hostname: KVec<u8>,
     ctrl: Option<Arc<ContainerControl>>,
     started: bool,
+    /// Cached wait(2)-style exit status of the init, captured the first time the
+    /// task is observed exited (zombie). Persists after the task is reaped (when
+    /// its status can no longer be read) so `state` keeps reporting it. `None`
+    /// while the container is running or if the exit was never observed in time.
+    exit_status: Option<i32>,
 }
 
 kernel::sync::global_lock! {
@@ -315,9 +335,12 @@ fn ioctl_dispatch(cmd: u32, arg: usize) -> Result<isize> {
         }
         NR_START => start_container(c.id)?,
         NR_STATE => {
-            let (state, pid) = container_state(c.id)?;
+            let (state, pid, exit_status) = container_state(c.id)?;
             c.state = state;
             c.pid = pid;
+            // On STATE, `sig` carries the init's wait(2)-style exit-status word
+            // (0 while running/created or if the exit was not observed in time).
+            c.sig = exit_status;
         }
         NR_KILL => {
             let sig = if c.sig != 0 { c.sig } else { SIGKILL };
@@ -349,18 +372,47 @@ fn start_container(id: u64) -> Result {
     Err(ENOENT)
 }
 
-fn container_state(id: u64) -> Result<(u32, i32)> {
-    let g = REGISTRY.lock();
-    for c in g.as_slice() {
+/// Returns `(exited, status)`: `exited` is true once the init has terminated
+/// (a zombie, dead, or already reaped/gone), and `status` carries its wait-style
+/// status word when it was read from a not-yet-reaped zombie. A plain
+/// `kill(pid, 0)` probe cannot tell a zombie from a live task, so this is what
+/// makes STOPPED reporting correct for an exited-but-unreaped init.
+fn probe_exit(pid: i32) -> (bool, Option<i32>) {
+    let mut st: c_int = 0;
+    // SAFETY: FFI call into the helper; `st` is a valid, writable out-pointer.
+    let r = unsafe { krunc_task_exit_status(pid, &mut st) };
+    match r {
+        1 => (false, None),    // alive
+        0 => (true, Some(st)), // exited zombie — status captured before reaping
+        _ => (true, None),     // gone (already reaped)
+    }
+}
+
+fn container_state(id: u64) -> Result<(u32, i32, i32)> {
+    let mut g = REGISTRY.lock();
+    for c in g.iter_mut() {
         if c.id == id {
             let state = if !c.started {
                 ST_CREATED
-            } else if is_alive(c.pid) {
-                ST_RUNNING
             } else {
-                ST_STOPPED
+                let (exited, status) = probe_exit(c.pid);
+                if exited {
+                    // Cache the status the first time we observe the exit, so it
+                    // survives the eventual reap. Prefer the code captured eagerly
+                    // by the do_exit kprobe (reliable even after the task is gone);
+                    // fall back to a still-readable zombie's status word.
+                    if c.exit_status.is_none() {
+                        let mut code: c_int = 0;
+                        // SAFETY: FFI call; `code` is a valid out-pointer.
+                        let got = unsafe { krunc_get_exit_code(c.pid, &mut code) };
+                        c.exit_status = if got == 1 { Some(code) } else { status };
+                    }
+                    ST_STOPPED
+                } else {
+                    ST_RUNNING
+                }
             };
-            return Ok((state, c.pid));
+            return Ok((state, c.pid, c.exit_status.unwrap_or(0)));
         }
     }
     Err(ENOENT)
@@ -391,15 +443,19 @@ fn delete_container(id: u64) -> Result {
         .position(|c| c.id == id)
         .ok_or(ENOENT)?;
     let c = &g.as_slice()[idx];
+    let pid = c.pid;
     if !c.started {
         // never started: release the blocked init so it exits instead of execs.
         if let Some(ctrl) = &c.ctrl {
             ctrl.action.store(ACT_DOOM, Ordering::Release);
         }
-    } else if is_alive(c.pid) {
+    } else if is_alive(pid) {
         // SAFETY: FFI call into the vmlinux helper.
-        unsafe { krunc_kill(c.pid, SIGKILL) };
+        unsafe { krunc_kill(pid, SIGKILL) };
     }
+    // Free the exit-status capture slot for this container's pid.
+    // SAFETY: FFI call into the helper.
+    unsafe { krunc_unwatch_pid(pid) };
     g.remove(idx).map_err(|_| EINVAL)?;
     pr_info!("deleted container id={}\n", id);
     Ok(())
@@ -462,10 +518,10 @@ fn render_status() -> Result<KVec<u8>> {
     for c in guard.as_slice() {
         let state = if !c.started {
             "created"
-        } else if is_alive(c.pid) {
-            "running"
-        } else {
+        } else if probe_exit(c.pid).0 {
             "exited"
+        } else {
+            "running"
         };
         let host = core::str::from_utf8(&c.hostname).unwrap_or("?");
         let line = CString::try_from_fmt(fmt!("{:<5} {:<8} {:<8} {}\n", c.id, c.pid, state, host))?;
@@ -983,6 +1039,10 @@ fn spawn(
     }
 
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    // Track the init's pid so the helper's do_exit kprobe captures its exit
+    // status at the moment it terminates (see `krunc_watch_pid`). Best-effort.
+    // SAFETY: FFI call into the helper with this container's host-visible pid.
+    unsafe { krunc_watch_pid(pid) };
     REGISTRY.lock().push(
         Container {
             id,
@@ -990,6 +1050,7 @@ fn spawn(
             hostname: host_disp,
             ctrl,
             started: !paused,
+            exit_status: None,
         },
         GFP_KERNEL,
     )?;
