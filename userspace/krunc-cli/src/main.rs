@@ -8,6 +8,7 @@
 mod bpflsm;
 mod cgroup;
 mod device;
+mod pty;
 
 use std::collections::HashMap;
 use std::fs;
@@ -288,10 +289,67 @@ fn do_run(root: &str, flags: &HashMap<String, String>, args: &[String]) {
 
     let tmp = std::env::temp_dir().join(format!("krunc-bundle-{id}"));
     fs::create_dir_all(&tmp).unwrap_or_else(|e| die(format!("mkdir bundle: {e}")));
-    let cfg = synth_config(&rootfs.to_string_lossy(), &cmd, &id, terminal);
+    // The spec itself stays `terminal:false`: krunc allocates no PTY in the
+    // kernel. Interactive `-t` is handled entirely by the CLI (a pty relay around
+    // the lifecycle, below), so the container needs no special spec support.
+    let cfg = synth_config(&rootfs.to_string_lossy(), &cmd, &id, false);
     fs::write(tmp.join("config.json"), cfg).unwrap_or_else(|e| die(format!("write config: {e}")));
 
-    run_lifecycle(root, flags, &id, &tmp, Some(tmp.clone()), keep);
+    if terminal {
+        run_lifecycle_pty(root, flags, &id, &tmp, Some(tmp.clone()), keep);
+    } else {
+        run_lifecycle(root, flags, &id, &tmp, Some(tmp.clone()), keep);
+    }
+}
+
+/// `run -t`: allocate a pty, fork, run the container lifecycle in the child with
+/// the pty slave as its stdio (the container inherits it as its terminal), and
+/// relay between the user's terminal and the pty master in the parent. No kernel
+/// support is needed — the container init inherits the create-caller's fds.
+fn run_lifecycle_pty(
+    root: &str,
+    flags: &HashMap<String, String>,
+    id: &str,
+    bundle: &Path,
+    tmp_bundle: Option<PathBuf>,
+    keep: bool,
+) -> ! {
+    let p = pty::open().unwrap_or_else(|e| die(e));
+    let saved = pty::set_raw(0);
+    // SAFETY: single-threaded process; the child only calls async-signal-safe-ish
+    // fd setup then the normal lifecycle (which `exec`s nothing in-process).
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        pty::restore(0, saved);
+        die("fork failed");
+    }
+    if pid == 0 {
+        // Child: become the container's terminal side, then run the lifecycle.
+        pty::wire_slave(&p);
+        run_lifecycle(root, flags, id, bundle, tmp_bundle, keep); // exits with code
+        std::process::exit(127); // unreachable
+    }
+    // Parent: relay until the container's terminal closes, then reap + propagate.
+    // SAFETY: closing our copy of the slave; the child holds its own.
+    unsafe {
+        libc::close(p.slave);
+    }
+    pty::relay(p.master);
+    let mut status = 0;
+    // SAFETY: status is a valid out-param.
+    unsafe {
+        libc::waitpid(pid, &mut status, 0);
+        libc::close(p.master);
+    }
+    pty::restore(0, saved);
+    let code = if libc::WIFEXITED(status) {
+        libc::WEXITSTATUS(status)
+    } else if libc::WIFSIGNALED(status) {
+        128 + libc::WTERMSIG(status)
+    } else {
+        1
+    };
+    exit(code);
 }
 
 /// create → start → wait → (delete + cleanup). `tmp_bundle`, if set, is a

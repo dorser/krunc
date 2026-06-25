@@ -100,6 +100,15 @@ has    "host sees the container init as unprivileged (100000)" "$U" '\[host\][[:
 has    "uid_map written (container 0 -> host 100000)"          "$U" '\[host\][[:space:]]*0[[:space:]]*100000[[:space:]]*65536'
 no_panic "no kernel panic/oops (user-namespace demo)"          "$U"
 
+echo "==> [4] interactive run -t (CLI pty relay)"
+INIT="$REPO/scripts/qemu-pty-init.sh" OUT="$HOME/krunc-checks-pty.cpio.gz" bash "$HERE/make-initramfs.sh" >/dev/null 2>&1
+INITRAMFS="$HOME/krunc-checks-pty.cpio.gz" timeout 200 bash "$HERE/run-qemu.sh" >/tmp/checks-pty.log 2>&1 || true
+P=/tmp/checks-pty.log
+has    "run -t: container stdin is a tty"               "$P" 'PTY-STDIN-IS-TTY'
+has    "run -t: container stdout is a tty"              "$P" 'PTY-STDOUT-IS-TTY'
+has    "run -t: container ran on the pty (exit 0)"      "$P" 'krunc run -t exit code: 0'
+no_panic "no kernel panic/oops (run -t demo)"           "$P"
+
 echo
 if [ "$fails" = 0 ]; then
 	echo "==> ALL CHECKS PASSED"
