@@ -1323,4 +1323,135 @@ mod tests {
         let cfg = parse_config(r#"{"process":{"args":["/x"]},"root":{"path":"r"}}"#).unwrap();
         assert_eq!(cgroup_config(&cfg), CgroupConfig::default());
     }
+
+    /// The OCI config.json is the primary untrusted input to krunc's userspace.
+    /// `parse_config` then `config_to_spec` must NEVER panic on it, no matter how
+    /// malformed — they must always return `Ok`/`Err`. This deterministically
+    /// fuzzes the whole JSON→spec front end with random bytes, byte-mutated valid
+    /// configs, and JSON-token soup, asserting panic-freedom (a panic in the CLI
+    /// is a denial of service on the runtime).
+    #[test]
+    fn config_pipeline_never_panics_on_arbitrary_input() {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        // splitmix64 PRNG (deterministic, no external dependency).
+        let mut state: u64 = 0x0BAD_C0DE_DEAD_BEEF;
+        let mut next = move || {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        };
+        let try_pipeline = |bytes: &[u8]| {
+            catch_unwind(AssertUnwindSafe(|| {
+                // Lossily treat the bytes as text — JSON input is UTF-8 in practice
+                // and parse_config takes &str; invalid UTF-8 simply parse-errors.
+                let s = String::from_utf8_lossy(bytes);
+                if let Ok(cfg) = parse_config(&s) {
+                    let _ = config_to_spec(Path::new("/bundle"), &cfg);
+                }
+            }))
+        };
+
+        // 1. Purely random byte buffers.
+        for _ in 0..20_000 {
+            let len = (next() % 600) as usize;
+            let buf: Vec<u8> = (0..len).map(|_| (next() & 0xff) as u8).collect();
+            assert!(try_pipeline(&buf).is_ok(), "panicked on random bytes");
+        }
+
+        // 2. The valid SAMPLE config with random single-byte mutations — exercises
+        //    the structured paths with subtly-broken inputs.
+        let base = SAMPLE.as_bytes();
+        for _ in 0..20_000 {
+            let mut buf = base.to_vec();
+            let nmut = 1 + (next() % 8) as usize;
+            for _ in 0..nmut {
+                let idx = (next() as usize) % buf.len();
+                buf[idx] = (next() & 0xff) as u8;
+            }
+            assert!(try_pipeline(&buf).is_ok(), "panicked on mutated SAMPLE");
+        }
+
+        // 3. Random soup of JSON tokens — structurally JSON-ish but semantically
+        //    arbitrary, to reach the typed-field validation logic.
+        let toks: [&str; 18] = [
+            "{", "}", "[", "]", ":", ",", "\"process\"", "\"args\"", "\"root\"",
+            "\"path\"", "\"linux\"", "\"namespaces\"", "\"type\"", "\"pid\"",
+            "null", "true", "-1", "1e999",
+        ];
+        for _ in 0..20_000 {
+            let n = (next() % 40) as usize;
+            let mut s = String::new();
+            for _ in 0..n {
+                s.push_str(toks[(next() as usize) % toks.len()]);
+            }
+            assert!(try_pipeline(s.as_bytes()).is_ok(), "panicked on token soup");
+        }
+    }
+
+    /// Every config that translates must produce a spec that the ABI can encode
+    /// and the (mirrored) decoder can read back, with the key fields surviving the
+    /// round trip. This fuzzes a structured-but-varied family of valid configs and
+    /// checks the full JSON→spec→encode→decode pipeline end-to-end.
+    #[test]
+    fn valid_configs_round_trip_through_abi() {
+        use krunc_abi::{decode, Op, OPT_NO_NEW_PRIVS};
+
+        let mut state: u64 = 0xFEED_FACE_CAFE_0001;
+        let mut next = move || {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        };
+        let caps = ["CAP_KILL", "CAP_CHOWN", "CAP_NET_BIND_SERVICE", "CAP_SETUID"];
+
+        for _ in 0..2_000 {
+            let uid = (next() % 70000) as u32;
+            let gid = (next() % 70000) as u32;
+            let nnp = next() & 1 == 0;
+            let ncap = (next() % (caps.len() as u64 + 1)) as usize;
+            let bounding: Vec<String> = caps[..ncap].iter().map(|c| format!("{c:?}")).collect();
+            let nofile = 256 + (next() % 4096);
+            let with_tmpfs = next() & 1 == 0;
+            let mounts = if with_tmpfs {
+                r#"{ "destination": "/tmp", "type": "tmpfs", "source": "tmpfs", "options": ["nosuid"] },"#
+            } else {
+                ""
+            };
+            let json = format!(
+                r#"{{
+                  "ociVersion": "1.0.2-dev",
+                  "hostname": "fuzz-{uid}",
+                  "process": {{
+                    "user": {{ "uid": {uid}, "gid": {gid} }},
+                    "args": ["/bin/app", "--id={gid}"],
+                    "env": ["PATH=/bin"],
+                    "cwd": "/",
+                    "noNewPrivileges": {nnp},
+                    "capabilities": {{ "bounding": [{caps_csv}] }},
+                    "rlimits": [{{ "type": "RLIMIT_NOFILE", "soft": {nofile}, "hard": {nofile} }}]
+                  }},
+                  "root": {{ "path": "rootfs", "readonly": false }},
+                  "linux": {{ "namespaces": [{{ "type": "pid" }}, {{ "type": "mount" }}] }},
+                  "mounts": [{mounts} {{ "destination": "/proc", "type": "proc", "source": "proc" }}]
+                }}"#,
+                caps_csv = bounding.join(", "),
+            );
+
+            let cfg = parse_config(&json).expect("generated config must parse");
+            let spec = config_to_spec(Path::new("/bundle"), &cfg).expect("must translate");
+            let blob = spec.encode(Op::Create).expect("must encode");
+            let (op, decoded) = decode(&blob).expect("must decode");
+            assert_eq!(op, Op::Create);
+            assert_eq!(decoded.uid, uid);
+            assert_eq!(decoded.gid, gid);
+            assert_eq!(decoded.flags & OPT_NO_NEW_PRIVS != 0, nnp);
+            assert_eq!(decoded.argv, vec!["/bin/app".to_string(), format!("--id={gid}")]);
+            assert_eq!(decoded.hostname, format!("fuzz-{uid}"));
+        }
+    }
 }
