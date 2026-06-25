@@ -1,0 +1,14 @@
+[package]
+name = "krunc-bpf"
+version = "0.1.0"
+edition = "2021"
+description = "All-Rust (aya) BPF-LSM loader for krunc: load + attach the per-container escape-blocking LSM program and guard/unguard container cgroups."
+
+[[bin]]
+name = "krunc-bpf"
+path = "src/main.rs"
+
+[dependencies]
+# aya 0.12 is the last line that builds on the VM's Rust 1.78 (0.13+ raise the
+# MSRV). Pure-Rust (no libbpf), so it links into a fully static musl binary.
+aya = "0.12"

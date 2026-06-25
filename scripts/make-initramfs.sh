@@ -34,6 +34,14 @@ cp "$REPO/module/krunc.ko" "$ROOT/krunc.ko"
 cp "$KRUNC_BIN" "$ROOT/bin/krunc"
 chmod +x "$ROOT/init" "$ROOT/bin/busybox" "$ROOT/bin/krunc"
 
+# All-Rust (aya) BPF-LSM loader, if built (scripts/build-cli.sh). The CLI invokes
+# it across the container lifecycle to arm/tear down per-container LSM guarding.
+KRUNC_BPF="$REPO/userspace/target/x86_64-unknown-linux-musl/release/krunc-bpf"
+if [ -x "$KRUNC_BPF" ]; then
+	cp "$KRUNC_BPF" "$ROOT/bin/krunc-bpf"
+	chmod +x "$ROOT/bin/krunc-bpf"
+fi
+
 # example container rootfs (text interface)
 cp "$BB" "$ROOT/containers/demo/bin/busybox"
 ln -sf busybox "$ROOT/containers/demo/bin/sh"
@@ -175,6 +183,13 @@ if [ -f "$REPO/module/krunc_lsm.bpf.o" ] && [ -x "$REPO/module/krunc_lsm_loader"
 	printf 'ESCAPE-SUCCEEDED-BPF-LSM-FAILED\n' > "$ROOT/esc/rootfs/krunc-escape"
 	cp "$REPO/examples/bundle/esc-config.json" "$ROOT/esc/config.json"
 	chmod +x "$ROOT/esc/rootfs/bin/busybox"
+
+	# CLI-driven variant: same escape entrypoint, but BPF-LSM is armed by the
+	# `krunc` CLI itself (org.krunc.bpf-lsm=block annotation) at create and torn
+	# down at delete — no manual loader call. Used by scripts/qemu-aya-cli-init.sh.
+	mkdir -p "$ROOT"/esc-cli
+	cp -a "$ROOT/esc/rootfs" "$ROOT/esc-cli/rootfs"
+	cp "$REPO/examples/bundle/esc-cli-config.json" "$ROOT/esc-cli/config.json"
 fi
 
 # Optional: OCI conformance bundle running the official opencontainers/

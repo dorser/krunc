@@ -5,6 +5,7 @@
 //! to `/dev/krunc`. Per-id state is persisted under `--root` (default
 //! `/run/krunc`) like runc, so each subcommand is a separate process.
 
+mod bpflsm;
 mod cgroup;
 mod device;
 
@@ -16,7 +17,7 @@ use std::process::exit;
 use serde::{Deserialize, Serialize};
 
 use device::{Device, KState};
-use krunc_oci::{cgroup_config, config_to_spec, parse_config, OciConfig};
+use krunc_oci::{bpf_lsm_mode, cgroup_config, config_to_spec, parse_config, OciConfig};
 
 const VERSION: &str = "1.1.0-krunc";
 const OCI_VERSION: &str = "1.0.2-dev";
@@ -40,6 +41,10 @@ struct State {
     /// cgroup directory created for this container (for cleanup), if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cgroup: Option<String>,
+    /// If the container opted into BPF-LSM guarding (`org.krunc.bpf-lsm`
+    /// annotation), the mode it was armed with — so `delete` can un-guard it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bpf_lsm: Option<String>,
     /// OCI state annotations. krunc records the init's exit code or terminating
     /// signal here (`org.krunc.exitCode` / `org.krunc.exitSignal`) once stopped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -208,6 +213,25 @@ fn create_from_bundle(
         }
     };
 
+    // Optional per-container BPF-LSM escape-blocking (opt-in via the
+    // `org.krunc.bpf-lsm` annotation). It guards by cgroup id, so it requires a
+    // cgroup; armed now (at create) so the policy is in force before `start`
+    // releases the entrypoint. Recorded in state so `delete` can un-guard.
+    let bpf_lsm = match bpf_lsm_mode(&cfg).unwrap_or_else(|e| die(e.to_string())) {
+        Some(mode) => {
+            let Some(cg) = cgroup_dir.as_deref() else {
+                let _ = dev.delete(kid);
+                die("org.krunc.bpf-lsm requires a cgroup (set linux.cgroupsPath)");
+            };
+            if let Err(e) = bpflsm::arm(cg, mode.as_arg()) {
+                let _ = dev.delete(kid);
+                die(format!("arming BPF-LSM: {e}"));
+            }
+            Some(mode.as_arg().to_string())
+        }
+        None => None,
+    };
+
     let st = State {
         oci_version: OCI_VERSION.to_string(),
         id: id.to_string(),
@@ -216,6 +240,7 @@ fn create_from_bundle(
         bundle: bundle.to_string_lossy().into_owned(),
         krunc_id: kid,
         cgroup: cgroup_dir,
+        bpf_lsm,
         annotations: None,
     };
     save_state(root, &st);
@@ -561,6 +586,13 @@ fn do_delete(root: &str, flags: &HashMap<String, String>, args: &[String]) {
     let st = load_state(root, id);
     if let Ok(dev) = Device::open() {
         let _ = dev.delete(st.krunc_id);
+    }
+    // Un-guard BPF-LSM before the cgroup goes away (un-guard needs the cgroup
+    // directory to resolve its id). Only if this container opted in.
+    if st.bpf_lsm.is_some() {
+        if let Some(cg) = &st.cgroup {
+            bpflsm::disarm(cg);
+        }
     }
     if let Some(cg) = &st.cgroup {
         cgroup::remove(Path::new(cg));

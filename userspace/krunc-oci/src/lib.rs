@@ -41,6 +41,12 @@ pub struct OciConfig {
     /// Filesystem mounts to perform in the container.
     #[serde(default)]
     pub mounts: Vec<OciMount>,
+    /// OCI annotations: free-form key/value metadata, not applied to the
+    /// container itself. krunc reads `org.krunc.*` keys for runtime-specific
+    /// opt-ins (e.g. `org.krunc.bpf-lsm` = `block`|`kill` to arm the per-container
+    /// BPF-LSM escape-blocking policy).
+    #[serde(default)]
+    pub annotations: HashMap<String, String>,
     /// Any other top-level `config.json` properties krunc does not model. A
     /// non-whitelisted entry here is rejected (the runtime-spec requires the
     /// runtime to apply every configured property or error).
@@ -365,6 +371,40 @@ pub fn parse_config(json: &str) -> Result<OciConfig, OciError> {
     Ok(serde_json::from_str(json)?)
 }
 
+/// The BPF-LSM enforcement mode requested via the `org.krunc.bpf-lsm` annotation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BpfLsmMode {
+    /// Deny escape attempts with `-EPERM`; the container keeps running.
+    Block,
+    /// Deny and additionally `SIGKILL` the container on an escape attempt.
+    Kill,
+}
+
+impl BpfLsmMode {
+    /// The `krunc-bpf guard` mode argument (`block`/`kill`).
+    pub fn as_arg(self) -> &'static str {
+        match self {
+            BpfLsmMode::Block => "block",
+            BpfLsmMode::Kill => "kill",
+        }
+    }
+}
+
+/// Read the optional per-container BPF-LSM opt-in from the config's annotations.
+/// `org.krunc.bpf-lsm` = `block` | `kill` arms the escape-blocking policy; absent
+/// (or any other value) means no BPF-LSM guarding. Returns an error for an
+/// unrecognized value so a typo fails closed rather than silently disabling it.
+pub fn bpf_lsm_mode(cfg: &OciConfig) -> Result<Option<BpfLsmMode>, OciError> {
+    match cfg.annotations.get("org.krunc.bpf-lsm").map(String::as_str) {
+        None => Ok(None),
+        Some("block") => Ok(Some(BpfLsmMode::Block)),
+        Some("kill") => Ok(Some(BpfLsmMode::Kill)),
+        Some(other) => Err(OciError::UnsupportedProperty(format!(
+            "annotation org.krunc.bpf-lsm={other:?} (expected block|kill)"
+        ))),
+    }
+}
+
 /// Resolve `root.path` against the bundle directory (absolute paths kept as-is).
 fn resolve_rootfs(bundle: &Path, root_path: &str) -> String {
     let p = Path::new(root_path);
@@ -642,9 +682,9 @@ pub fn config_to_spec(bundle: &Path, cfg: &OciConfig) -> Result<DomainSpec, OciE
         return Err(OciError::Missing("root.path"));
     }
 
-    // Fail closed on any configured property krunc does not model/apply. `annotations`
-    // is caller metadata (not applied to the container) and is allowed through.
-    reject_unmodeled("", &cfg.extra, &["annotations"])?;
+    // Fail closed on any configured property krunc does not model/apply.
+    // (`annotations` is now a typed field, so it no longer appears in `extra`.)
+    reject_unmodeled("", &cfg.extra, &[])?;
     reject_unmodeled("process", &process.extra, &[])?;
     if let Some(linux) = &cfg.linux {
         reject_unmodeled("linux", &linux.extra, &[])?;
@@ -1369,6 +1409,43 @@ mod tests {
     fn cgroup_config_absent() {
         let cfg = parse_config(r#"{"process":{"args":["/x"]},"root":{"path":"r"}}"#).unwrap();
         assert_eq!(cgroup_config(&cfg), CgroupConfig::default());
+    }
+
+    #[test]
+    fn bpf_lsm_annotation_parsed() {
+        let none = parse_config(r#"{"process":{"args":["/x"]},"root":{"path":"r"}}"#).unwrap();
+        assert_eq!(bpf_lsm_mode(&none).unwrap(), None);
+
+        let block = parse_config(
+            r#"{"process":{"args":["/x"]},"root":{"path":"r"},"annotations":{"org.krunc.bpf-lsm":"block"}}"#,
+        )
+        .unwrap();
+        assert_eq!(bpf_lsm_mode(&block).unwrap(), Some(BpfLsmMode::Block));
+        assert_eq!(bpf_lsm_mode(&block).unwrap().unwrap().as_arg(), "block");
+
+        let kill = parse_config(
+            r#"{"process":{"args":["/x"]},"root":{"path":"r"},"annotations":{"org.krunc.bpf-lsm":"kill"}}"#,
+        )
+        .unwrap();
+        assert_eq!(bpf_lsm_mode(&kill).unwrap(), Some(BpfLsmMode::Kill));
+
+        // A typo must fail closed, not silently disable enforcement.
+        let bad = parse_config(
+            r#"{"process":{"args":["/x"]},"root":{"path":"r"},"annotations":{"org.krunc.bpf-lsm":"on"}}"#,
+        )
+        .unwrap();
+        assert!(bpf_lsm_mode(&bad).is_err());
+    }
+
+    #[test]
+    fn annotations_do_not_trip_unknown_field_rejection() {
+        // annotations is a typed field now; an arbitrary annotation key must be
+        // accepted (not rejected as an unmodeled top-level property).
+        let cfg = parse_config(
+            r#"{"process":{"args":["/x"]},"root":{"path":"rootfs"},"annotations":{"com.example/foo":"bar"}}"#,
+        )
+        .unwrap();
+        assert!(config_to_spec(Path::new("/b"), &cfg).is_ok());
     }
 
     /// The OCI config.json is the primary untrusted input to krunc's userspace.

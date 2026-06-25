@@ -75,6 +75,17 @@ if [ "$BPF_LSM" = 1 ]; then
 	has    "escape blocked, container kept running"       "$B" 'STILL RUNNING .blocked, not killed'
 	has    "container finished normally (not killed)"     "$B" 'finished normally'
 	no_panic "no kernel panic/oops (BPF-LSM demo)"        "$B"
+
+	echo "==> [2b] CLI-driven BPF-LSM (aya loader folded into the lifecycle)"
+	INIT="$REPO/scripts/qemu-aya-cli-init.sh" OUT="$HOME/krunc-checks-ayacli.cpio.gz" bash "$HERE/make-initramfs.sh" >/dev/null 2>&1
+	INITRAMFS="$HOME/krunc-checks-ayacli.cpio.gz" timeout 200 bash "$HERE/run-qemu.sh" >/tmp/checks-ayacli.log 2>&1 || true
+	A=/tmp/checks-ayacli.log
+	has    "CLI armed BPF-LSM from annotation (aya loader)" "$A" 'armed [0-9]+ LSM hooks'
+	has    "CLI guarded the container cgroup"             "$A" 'krunc-bpf: guarding cgroup'
+	absent "CLI-armed escape denied - marker absent"      "$A" 'USERNS-CREATED-MARKER-FAIL'
+	has    "CLI-armed escape blocked, container running"  "$A" 'STILL RUNNING .blocked, not killed'
+	has    "CLI un-guarded the cgroup on delete"          "$A" 'krunc-bpf: unguarded cgroup'
+	no_panic "no kernel panic/oops (CLI BPF-LSM demo)"    "$A"
 else
 	echo "==> [2/2] skipped: kernel has no CONFIG_BPF_LSM (build with KRUNC_BPF_LSM=1)"
 fi
