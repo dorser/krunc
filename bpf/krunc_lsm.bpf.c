@@ -25,8 +25,11 @@
  *     UNPRIVILEGED-reachable privilege-escalation primitive (the starting point of
  *     many container escapes), and, unlike mount/module-load, not blocked by a
  *     capability check before the LSM hook, so guarding it here is meaningful.
+ *   - lsm/sb_mount, lsm/move_mount: mounting / moving mounts (mount-based escapes).
+ *   - lsm/bpf: a guarded container loading its own BPF programs/maps.
+ *   - lsm/ptrace_access_check: cross-process tracing.
  *   - lsm/file_open of a tripwire basename ("krunc-escape"): a controllable demo
- *     hook showing the same cgroup-keyed active-kill mechanism on a file access.
+ *     hook showing the same cgroup-keyed mechanism on a file access.
  *
  * Requires only kernel *config* (CONFIG_BPF_SYSCALL, CONFIG_BPF_LSM,
  * CONFIG_DEBUG_INFO_BTF, and "bpf" in CONFIG_LSM) — consistent with krunc's
@@ -78,6 +81,38 @@ SEC("lsm/userns_create")
 int BPF_PROG(krunc_userns_create, const struct cred *cred)
 {
 	/* deny (and, in KILL mode, kill) a guarded container creating a user ns. */
+	return krunc_enforce(guard_mode());
+}
+
+/* Other real escape/abuse vectors a guarded container has no business using.
+ * krunc's own setup mounts run during `create`, before the loader adds the
+ * container to the `guarded` map, so they are never affected by these hooks. */
+
+SEC("lsm/sb_mount")
+int BPF_PROG(krunc_sb_mount)
+{
+	/* mounting is a classic escape primitive (e.g. remounting over host paths). */
+	return krunc_enforce(guard_mode());
+}
+
+SEC("lsm/move_mount")
+int BPF_PROG(krunc_move_mount)
+{
+	return krunc_enforce(guard_mode());
+}
+
+SEC("lsm/bpf")
+int BPF_PROG(krunc_bpf)
+{
+	/* a guarded container loading its own BPF is a privilege/abuse vector. */
+	return krunc_enforce(guard_mode());
+}
+
+SEC("lsm/ptrace_access_check")
+int BPF_PROG(krunc_ptrace)
+{
+	/* cross-process tracing inside the container's pid ns is allowed; this only
+	 * fires for a guarded container, and denies tracing as a hardening measure. */
 	return krunc_enforce(guard_mode());
 }
 
