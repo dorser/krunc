@@ -103,6 +103,7 @@ int krunc_get_exit_code(pid_t nr, int *code);
 void __noreturn krunc_exit(long code);
 int krunc_apply_creds(u64 bset, u64 eff, u64 perm, u64 inh, u64 amb,
 		      u32 uid, u32 gid, int no_new_privs, int caps_present);
+int krunc_userns_setup_creds(void);
 int krunc_apply_rlimit(unsigned int resource, u64 soft, u64 hard);
 void krunc_set_oom_score_adj(int adj);
 int krunc_mount(const char *dev, const char *dir, const char *fstype,
@@ -425,6 +426,40 @@ int krunc_apply_creds(u64 bset, u64 eff, u64 perm, u64 inh, u64 amb,
 	return 0;
 }
 EXPORT_SYMBOL_GPL(krunc_apply_creds);
+
+/*
+ * For a container running in its own user namespace, set the setup task's
+ * fsuid/fsgid to the namespace's root (container id 0 — e.g. mapped to host
+ * 100000) before it enters the rootfs. The kernel-context init starts as global
+ * root (kuid 0), which is UNMAPPED in a remapping user namespace, so it cannot
+ * traverse the host-owned path into the rootfs. With its fsuid set to the mapped
+ * namespace-root it traverses the host directories via their "other" permission
+ * bits and owns the (correspondingly-owned) rootfs, while its capabilities (full
+ * in the new namespace) are preserved so the privileged setup — chroot, mounts —
+ * still works. The final process.user credentials and capability drop are applied
+ * afterwards by krunc_apply_creds. A no-op-style error is returned if container
+ * id 0 is not mapped (the maps must cover it for setup to be possible).
+ */
+int krunc_userns_setup_creds(void)
+{
+	struct cred *new;
+	kuid_t kuid;
+	kgid_t kgid;
+
+	kuid = p_make_kuid(current_user_ns(), 0);
+	kgid = p_make_kgid(current_user_ns(), 0);
+	if (!uid_valid(kuid) || !gid_valid(kgid))
+		return -EINVAL;
+
+	new = p_prepare_creds();
+	if (!new)
+		return -ENOMEM;
+	new->fsuid = kuid;
+	new->fsgid = kgid;
+	p_commit_creds(new); /* consumes @new */
+	return 0;
+}
+EXPORT_SYMBOL_GPL(krunc_userns_setup_creds);
 
 /* Apply one resource limit (setrlimit) to the current task before exec. */
 int krunc_apply_rlimit(unsigned int resource, u64 soft, u64 hard)

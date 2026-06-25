@@ -100,6 +100,11 @@ extern "C" {
         no_new_privs: c_int,
         caps_present: c_int,
     ) -> c_int;
+    /// For a container in its own user namespace, set the setup task's
+    /// fsuid/fsgid to the namespace's mapped root (container id 0) so it can enter
+    /// the rootfs while still capable; the final creds are applied by
+    /// `krunc_apply_creds`. Returns `-EINVAL` if container id 0 is unmapped.
+    fn krunc_userns_setup_creds() -> c_int;
     /// Mount `fstype` from `dev` onto `dir` in the current task's mount
     /// namespace (e.g. a fresh /proc for the container).
     fn krunc_mount(
@@ -129,6 +134,7 @@ extern "C" {
 
 // clone(2) namespace flags (uapi/linux/sched.h)
 const CLONE_NEWNS: c_ulong = 0x0002_0000;
+const CLONE_NEWUSER: c_ulong = 0x1000_0000;
 const CLONE_NEWUTS: c_ulong = 0x0400_0000;
 const CLONE_NEWIPC: c_ulong = 0x0800_0000;
 const CLONE_NEWPID: c_ulong = 0x2000_0000;
@@ -230,6 +236,7 @@ struct ContainerCtx {
     gid: u32,                  // target gid (process.user.gid)
     mounts: KVec<MountSpec>,   // mounts to perform (exactly config.mounts[], in order)
     sysctls: KVec<KVec<u8>>,   // each "relpath=value"; written under /proc/sys before exec
+    userns: bool,              // container has its own user namespace (CLONE_NEWUSER)
     ctrl: Option<Arc<ContainerControl>>, // Some -> two-phase (created) container
 }
 
@@ -905,7 +912,9 @@ fn decode_spec(buf: &[u8]) -> Result<DecodedSpec> {
             }
             17 => d.mounts = read_mounts_k(&mut sr)?, // MOUNTS
             18 => d.sysctls = read_strvec_k(&mut sr)?, // SYSCTLS
-            // tags 6/7 (uid/gid maps) land in a later milestone.
+            // tags 6/7 (uid/gid maps) are applied by the CLI from userspace, by
+            // writing /proc/<pid>/{uid,gid}_map after create (the kernel cannot:
+            // kernel_write requires write_iter, which procfs's uid_map lacks).
             _ => {}
         }
     }
@@ -1021,6 +1030,7 @@ fn spawn(
             gid,
             mounts,
             sysctls,
+            userns: flags & CLONE_NEWUSER != 0,
             ctrl: ctrl.as_ref().map(|a| a.clone()),
         },
         GFP_KERNEL,
@@ -1260,10 +1270,53 @@ unsafe extern "C" fn container_entry(arg: *mut c_void) -> c_int {
     // SAFETY: by contract `arg` is a leaked `KBox<ContainerCtx>`.
     let ctx = unsafe { <KBox<ContainerCtx> as ForeignOwnable>::from_foreign(arg) };
 
+    // Two-phase: a `created` container blocks here until `start` (or `delete`),
+    // BEFORE any setup runs. This makes the whole rootfs/namespace setup happen at
+    // start, and — crucially — gives userspace the create→start window to write
+    // this task's user-namespace ID maps (/proc/<pid>/{uid,gid}_map) while it is
+    // paused, so they are in place before the id-sensitive setup below (chroot,
+    // mounts, credentials). Doing chroot before the maps were written would fail
+    // (the task's ids are unmapped/overflow in its new user namespace).
+    let mut doomed = false;
+    if let Some(ctrl) = ctx.ctrl.as_ref() {
+        loop {
+            match ctrl.action.load(Ordering::Acquire) {
+                ACT_WAIT => unsafe { msleep(10) },
+                ACT_DOOM => {
+                    doomed = true; // torn down before start
+                    break;
+                }
+                _ => break,
+            }
+        }
+    }
+    if doomed {
+        drop(ctx); // free before exiting
+        // SAFETY: never reached exec; exit cleanly instead of returning to a
+        // non-existent userspace context (which would fault at IP 0).
+        unsafe { krunc_exit(0) };
+    }
+
     if ctx.hostname.len() > 1 {
         let hlen = ctx.hostname.len() - 1; // exclude trailing NUL
         // SAFETY: valid NUL-terminated buffer.
         unsafe { krunc_set_hostname(ctx.hostname.as_ptr() as *const c_char, hlen) };
+    }
+
+    // In a user namespace the init starts as global root (kuid 0), which is
+    // unmapped in a remapping namespace and so cannot traverse the host-owned path
+    // into the rootfs. Switch its fsuid/fsgid to the namespace's mapped root (and
+    // keep capabilities) before any filesystem setup. The user-ns ID maps were
+    // written by userspace during create, so container id 0 is mapped by now.
+    if ctx.userns {
+        // SAFETY: FFI call; operates on `current`, which is in its own user ns.
+        let rc = unsafe { krunc_userns_setup_creds() };
+        if rc != 0 {
+            pr_err!("krunc: user-ns setup creds failed: {} (is container id 0 mapped?)\n", rc);
+            drop(ctx);
+            // SAFETY: never reached exec; exit cleanly (fail closed).
+            unsafe { krunc_exit(rc as c_long) };
+        }
     }
 
     // For a read-only rootfs: make the mount tree private and turn the rootfs into
@@ -1305,27 +1358,6 @@ unsafe extern "C" fn container_entry(arg: *mut c_void) -> c_int {
         drop(ctx); // free before exiting (see krunc_exit)
         // SAFETY: this task never reached exec; exit cleanly instead of returning.
         unsafe { krunc_exit(cr as c_long) };
-    }
-
-    // Two-phase: a created container blocks here until start (or delete).
-    let mut doomed = false;
-    if let Some(ctrl) = ctx.ctrl.as_ref() {
-        loop {
-            match ctrl.action.load(Ordering::Acquire) {
-                ACT_WAIT => unsafe { msleep(10) },
-                ACT_DOOM => {
-                    doomed = true; // torn down before start
-                    break;
-                }
-                _ => break,
-            }
-        }
-    }
-    if doomed {
-        drop(ctx); // free before exiting
-        // SAFETY: never reached exec; exit cleanly instead of returning to a
-        // non-existent userspace context (which would fault at IP 0).
-        unsafe { krunc_exit(0) };
     }
 
     // Make the container's whole mount tree private *before* we mount anything,

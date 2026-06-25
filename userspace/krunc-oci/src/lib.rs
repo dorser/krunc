@@ -376,6 +376,26 @@ fn resolve_rootfs(bundle: &Path, root_path: &str) -> String {
     resolved.to_string_lossy().into_owned()
 }
 
+/// Translate OCI `uid/gidMappings` into the ABI [`IdMap`] form. Each mapping must
+/// cover at least one id (`size > 0`); an empty list yields no maps. The ABI
+/// encoder bounds the count (`MAX_MAPS`).
+fn translate_id_maps(maps: &[LinuxIdMapping]) -> Result<Vec<IdMap>, OciError> {
+    let mut out = Vec::with_capacity(maps.len());
+    for m in maps {
+        if m.size == 0 {
+            return Err(OciError::UnsupportedProperty(
+                "uid/gidMappings entry with size 0".into(),
+            ));
+        }
+        out.push(IdMap {
+            container_id: m.container_id,
+            host_id: m.host_id,
+            size: m.size,
+        });
+    }
+    Ok(out)
+}
+
 /// Map an OCI namespace type string to its `CLONE_NEW*` flag.
 fn ns_flag(ns_type: &str) -> Result<u32, OciError> {
     Ok(match ns_type {
@@ -634,8 +654,8 @@ pub fn config_to_spec(bundle: &Path, cfg: &OciConfig) -> Result<DomainSpec, OciE
     }
 
     let mut namespaces = 0u32;
-    let uid_maps: Vec<IdMap> = Vec::new();
-    let gid_maps: Vec<IdMap> = Vec::new();
+    let mut uid_maps: Vec<IdMap> = Vec::new();
+    let mut gid_maps: Vec<IdMap> = Vec::new();
     let mut masked_paths = Vec::new();
     let mut readonly_paths = Vec::new();
     let mut sysctls: Vec<String> = Vec::new();
@@ -648,18 +668,20 @@ pub fn config_to_spec(bundle: &Path, cfg: &OciConfig) -> Result<DomainSpec, OciE
             }
             namespaces |= ns_flag(&ns.ns_type)?;
         }
-        // krunc does not write uid_map/gid_map (kernel-side ID mapping is not yet
-        // implemented), so it cannot apply user-namespace ID mappings. Reject them
-        // rather than silently running the workload with unmapped (overflow)
-        // credentials — the runtime-spec requires erroring on a property that
-        // cannot be applied. (A bare `user` namespace with no mappings is still
-        // created as specified.)
-        if !linux.uid_mappings.is_empty() {
-            return Err(OciError::UnsupportedProperty("linux.uidMappings".into()));
+        // linux.uid/gidMappings: the kernel module writes /proc/<pid>/{uid,gid}_map
+        // for the container's user namespace. Mappings are only meaningful with a
+        // user namespace, so require one (per the runtime-spec, a property that
+        // cannot be applied must error, not be silently ignored). A bare `user`
+        // namespace with no mappings is still created as specified.
+        if (!linux.uid_mappings.is_empty() || !linux.gid_mappings.is_empty())
+            && namespaces & NS_USER == 0
+        {
+            return Err(OciError::Unsupported(
+                "uid/gidMappings without a user namespace",
+            ));
         }
-        if !linux.gid_mappings.is_empty() {
-            return Err(OciError::UnsupportedProperty("linux.gidMappings".into()));
-        }
+        uid_maps = translate_id_maps(&linux.uid_mappings)?;
+        gid_maps = translate_id_maps(&linux.gid_mappings)?;
         masked_paths = linux.masked_paths.clone();
         readonly_paths = linux.readonly_paths.clone();
         // Translate linux.sysctl into "<relpath>=<value>" entries (the sysctl name
@@ -1113,24 +1135,49 @@ mod tests {
     }
 
     #[test]
-    fn id_mappings_rejected() {
-        // krunc does not write uid_map/gid_map, so user-namespace ID mappings
-        // must be rejected rather than silently dropped (which would run the
-        // workload with unmapped, overflow credentials).
-        let uid = parse_config(
-            r#"{"process":{"args":["/x"]},"root":{"path":"r"},"linux":{"namespaces":[{"type":"user"}],"uidMappings":[{"containerID":0,"hostID":100000,"size":65536}]}}"#,
+    fn id_mappings_translated() {
+        // With a user namespace, uid/gidMappings are now translated into the ABI
+        // (the kernel writes /proc/<pid>/{uid,gid}_map). Verify they survive.
+        let cfg = parse_config(
+            r#"{"process":{"args":["/x"]},"root":{"path":"r"},"linux":{"namespaces":[{"type":"user"}],
+                "uidMappings":[{"containerID":0,"hostID":100000,"size":65536}],
+                "gidMappings":[{"containerID":0,"hostID":100000,"size":65536}]}}"#,
+        )
+        .unwrap();
+        let spec = config_to_spec(Path::new("/b"), &cfg).unwrap();
+        assert_eq!(spec.namespaces & NS_USER, NS_USER);
+        assert_eq!(spec.uid_maps.len(), 1);
+        assert_eq!(spec.uid_maps[0].container_id, 0);
+        assert_eq!(spec.uid_maps[0].host_id, 100000);
+        assert_eq!(spec.uid_maps[0].size, 65536);
+        assert_eq!(spec.gid_maps.len(), 1);
+        assert_eq!(spec.gid_maps[0].host_id, 100000);
+    }
+
+    #[test]
+    fn id_mappings_without_user_namespace_rejected() {
+        // uid/gidMappings are only meaningful with a user namespace; without one
+        // krunc errors rather than silently ignoring them.
+        let cfg = parse_config(
+            r#"{"process":{"args":["/x"]},"root":{"path":"r"},"linux":{"namespaces":[{"type":"pid"}],
+                "uidMappings":[{"containerID":0,"hostID":100000,"size":65536}]}}"#,
         )
         .unwrap();
         assert!(matches!(
-            config_to_spec(Path::new("/b"), &uid),
-            Err(OciError::UnsupportedProperty(_))
+            config_to_spec(Path::new("/b"), &cfg),
+            Err(OciError::Unsupported(_))
         ));
-        let gid = parse_config(
-            r#"{"process":{"args":["/x"]},"root":{"path":"r"},"linux":{"namespaces":[{"type":"user"}],"gidMappings":[{"containerID":0,"hostID":100000,"size":65536}]}}"#,
+    }
+
+    #[test]
+    fn id_mapping_size_zero_rejected() {
+        let cfg = parse_config(
+            r#"{"process":{"args":["/x"]},"root":{"path":"r"},"linux":{"namespaces":[{"type":"user"}],
+                "uidMappings":[{"containerID":0,"hostID":100000,"size":0}]}}"#,
         )
         .unwrap();
         assert!(matches!(
-            config_to_spec(Path::new("/b"), &gid),
+            config_to_spec(Path::new("/b"), &cfg),
             Err(OciError::UnsupportedProperty(_))
         ));
     }

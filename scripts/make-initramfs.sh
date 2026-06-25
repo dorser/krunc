@@ -110,7 +110,53 @@ cat > "$ROOT/bundle-rc42/config.json" <<'CFG'
 }
 CFG
 
-# Optional: BPF-LSM kill-on-escape demo (M8). If the BPF artifacts were built
+# Bundle exercising USER NAMESPACES + uid/gid mappings: container uid/gid 0 maps
+# to host 100000 (an unprivileged host id). The entrypoint prints its in-container
+# ids; the demo init then checks the HOST view of the same task to prove the
+# kernel wrote /proc/<pid>/{uid,gid}_map (host sees uid 100000). Static busybox so
+# rootfs files (host-root-owned, hence "nobody" in the unmapped portion) need no
+# interpreter; busybox is mode 0755 so the mapped root can still exec it.
+mkdir -p "$ROOT"/bundle-userns/rootfs/bin "$ROOT"/bundle-userns/rootfs/proc \
+         "$ROOT"/bundle-userns/rootfs/tmp
+cp "$BB" "$ROOT/bundle-userns/rootfs/bin/busybox"
+ln -sf busybox "$ROOT/bundle-userns/rootfs/bin/sh"
+chmod +x "$ROOT/bundle-userns/rootfs/bin/busybox"
+for app in $("$BB" --list 2>/dev/null); do
+	[ "$app" = busybox ] && continue
+	ln -sf busybox "$ROOT/bundle-userns/rootfs/bin/$app"
+done
+# Own the rootfs by the MAPPED host range (container uid/gid 0 -> host 100000),
+# as a real rootless runtime would (via chown or idmapped mounts). Otherwise the
+# files are owned by host uid 0, which is unmapped inside the container's user
+# namespace, so the container init cannot traverse/chroot into them.
+sudo chown -R 100000:100000 "$ROOT/bundle-userns/rootfs"
+cat > "$ROOT/bundle-userns/config.json" <<'CFG'
+{
+  "ociVersion": "1.0.2-dev",
+  "hostname": "userns",
+  "process": {
+    "terminal": false,
+    "user": { "uid": 0, "gid": 0 },
+    "args": ["/bin/sh", "-c", "echo userns-inside uid=$(id -u) gid=$(id -g); grep -E '^Uid|^Gid' /proc/self/status; echo USERNS-RAN-OK; sleep 3"],
+    "env": ["PATH=/bin"],
+    "cwd": "/",
+    "noNewPrivileges": true,
+    "capabilities": { "bounding": [] }
+  },
+  "root": { "path": "rootfs", "readonly": false },
+  "linux": {
+    "namespaces": [
+      { "type": "user" }, { "type": "pid" }, { "type": "mount" }, { "type": "uts" }
+    ],
+    "uidMappings": [ { "containerID": 0, "hostID": 100000, "size": 65536 } ],
+    "gidMappings": [ { "containerID": 0, "hostID": 100000, "size": 65536 } ]
+  },
+  "mounts": [
+    { "destination": "/proc", "type": "proc", "source": "proc" }
+  ]
+}
+CFG
+
 # (scripts/build-bpf.sh), stage the loadable LSM object + static loader and a
 # minimal "escape" bundle whose PID 1 opens a tripwire file. The demo init
 # (scripts/qemu-bpflsm-init.sh) guards the container's cgroup, so the open is
@@ -230,5 +276,9 @@ sudo mknod -m 666 "$ROOT/bundle/rootfs/dev/null" c 1 3
 sudo mknod -m 666 "$ROOT/bundle/rootfs/dev/zero" c 1 5
 
 # pack (root, to preserve nodes/ownership)
+# Ensure the initramfs root is world-traversable: mktemp -d makes it 0700, which
+# would block a user-namespaced container's init (an unprivileged, *mapped* uid)
+# from traversing "/" to reach its bundle/rootfs. Real bundle paths are 0755.
+sudo chmod 755 "$ROOT"
 ( cd "$ROOT" && sudo find . | sudo cpio -o -H newc --quiet ) | gzip -9 > "$OUT"
 echo "==> initramfs: $OUT ($(du -h "$OUT" | cut -f1))"

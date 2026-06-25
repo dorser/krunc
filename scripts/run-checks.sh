@@ -79,6 +79,16 @@ else
 	echo "==> [2/2] skipped: kernel has no CONFIG_BPF_LSM (build with KRUNC_BPF_LSM=1)"
 fi
 
+echo "==> [3] user-namespace + uid/gid mapping demo"
+INIT="$REPO/scripts/qemu-userns-init.sh" OUT="$HOME/krunc-checks-userns.cpio.gz" bash "$HERE/make-initramfs.sh" >/dev/null 2>&1
+INITRAMFS="$HOME/krunc-checks-userns.cpio.gz" timeout 200 bash "$HERE/run-qemu.sh" >/tmp/checks-userns.log 2>&1 || true
+U=/tmp/checks-userns.log
+has    "container is root (uid 0) inside its user namespace"   "$U" 'userns-inside uid=0 gid=0'
+has    "container entrypoint ran under the user namespace"     "$U" 'USERNS-RAN-OK'
+has    "host sees the container init as unprivileged (100000)" "$U" '\[host\][[:space:]]*Uid:[[:space:]]*100000'
+has    "uid_map written (container 0 -> host 100000)"          "$U" '\[host\][[:space:]]*0[[:space:]]*100000[[:space:]]*65536'
+no_panic "no kernel panic/oops (user-namespace demo)"          "$U"
+
 echo
 if [ "$fails" = 0 ]; then
 	echo "==> ALL CHECKS PASSED"

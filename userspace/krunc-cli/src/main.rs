@@ -178,6 +178,20 @@ fn create_from_bundle(
     let dev = Device::open().unwrap_or_else(|e| die(format!("open /dev/krunc: {e}")));
     let (kid, pid) = dev.create(&spec).unwrap_or_else(|e| die(format!("create: {e}")));
 
+    // Apply user-namespace ID mappings (linux.uid/gidMappings) from userspace: the
+    // kernel module creates the user namespace (CLONE_NEWUSER) but cannot write the
+    // child's procfs uid_map (kernel_write needs write_iter, which uid_map lacks),
+    // so — exactly as runc does — the CLI writes /proc/<pid>/{uid,gid}_map here. The
+    // CLI is privileged (root in init_user_ns), so range maps are permitted; the
+    // container is paused before it applies its creds, so the maps are in place in
+    // time. If this fails we must not run with unmapped credentials: tear down.
+    if !spec.uid_maps.is_empty() || !spec.gid_maps.is_empty() {
+        if let Err(e) = write_id_maps(pid, &spec.uid_maps, &spec.gid_maps) {
+            let _ = dev.delete(kid);
+            die(format!("applying user-namespace ID maps: {e}"));
+        }
+    }
+
     // cgroup placement (userspace configures; the kernel enforces).
     let cg = cgroup_config(&cfg);
     let cgroup_dir = match cgroup::Cgroup::create(id, &cg) {
@@ -392,6 +406,29 @@ fn prepare_rootfs(bundle: &Path, cfg: &mut OciConfig) {
             }
         }
     }
+}
+
+/// Write a container's user-namespace ID maps from userspace (the privileged CLI
+/// in the parent user namespace). Each `/proc/<pid>/{uid,gid}_map` accepts the
+/// whole map in a single write; lines are `"<containerID> <hostID> <size>"`.
+fn write_id_maps(
+    pid: i32,
+    uid_maps: &[krunc_abi::IdMap],
+    gid_maps: &[krunc_abi::IdMap],
+) -> std::io::Result<()> {
+    fn render(maps: &[krunc_abi::IdMap]) -> String {
+        maps.iter()
+            .map(|m| format!("{} {} {}", m.container_id, m.host_id, m.size))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+    if !uid_maps.is_empty() {
+        fs::write(format!("/proc/{pid}/uid_map"), render(uid_maps))?;
+    }
+    if !gid_maps.is_empty() {
+        fs::write(format!("/proc/{pid}/gid_map"), render(gid_maps))?;
+    }
+    Ok(())
 }
 
 /// A short, unique container id (used when `--name`/`<id>` is omitted).
