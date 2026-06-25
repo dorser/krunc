@@ -144,6 +144,10 @@ if [ -n "$RUNTIMETEST" ] && [ -x "$RUNTIMETEST" ]; then
   },
   "mounts": [
     { "destination": "/proc", "type": "proc", "source": "proc" },
+    { "destination": "/dev", "type": "tmpfs", "source": "tmpfs",
+      "options": ["nosuid"] },
+    { "destination": "/dev/pts", "type": "devpts", "source": "devpts",
+      "options": ["nosuid", "noexec"] },
     { "destination": "/tmp", "type": "tmpfs", "source": "tmpfs",
       "options": ["nosuid", "nodev"] }
   ]

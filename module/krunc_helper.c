@@ -71,6 +71,10 @@ static struct dentry *(*p_start_creating_path)(int dfd, const char *pathname,
 static void (*p_end_creating_path)(struct path *path, struct dentry *dentry);
 static struct dentry *(*p_vfs_mkdir)(struct mnt_idmap *idmap, struct inode *dir,
 				     struct dentry *dentry, umode_t mode);
+static int (*p_vfs_mknod)(struct mnt_idmap *idmap, struct inode *dir,
+			  struct dentry *dentry, umode_t mode, dev_t dev);
+static int (*p_vfs_symlink)(struct mnt_idmap *idmap, struct inode *dir,
+			    struct dentry *dentry, const char *oldname);
 static void (*p_path_put)(const struct path *path);
 static void (*p_do_exit)(long code);
 static struct pid *(*p_find_get_pid)(pid_t nr);
@@ -98,6 +102,8 @@ void krunc_set_oom_score_adj(int adj);
 int krunc_mount(const char *dev, const char *dir, const char *fstype,
 		unsigned long flags);
 int krunc_mkdir(const char *path, umode_t mode);
+int krunc_mknod(const char *path, umode_t mode, unsigned int maj, unsigned int min);
+int krunc_symlink(const char *path, const char *target);
 int krunc_write_file(const char *path, const char *data, size_t len);
 pid_t krunc_spawn(int (*fn)(void *), void *arg, unsigned long flags);
 int krunc_execve(const char *filename, const char *const *argv,
@@ -343,6 +349,49 @@ int krunc_write_file(const char *path, const char *data, size_t len)
 }
 EXPORT_SYMBOL_GPL(krunc_write_file);
 
+/* Create a device node (@mode carries S_IFCHR/S_IFBLK | perms) at @path with
+ * device number MKDEV(@maj, @min), in the current task's mount namespace. Used
+ * to materialise the OCI default /dev nodes (null/zero/full/random/urandom/tty)
+ * from kernel context before exec, while still privileged (vfs_mknod requires
+ * CAP_MKNOD for char/block nodes). Mirrors do_mknodat(): vfs_mknod is the
+ * int-returning form, so it does NOT take ownership of @dentry — we hand the
+ * ORIGINAL dentry to end_creating_path (exactly as the kernel does). */
+int krunc_mknod(const char *path, umode_t mode, unsigned int maj, unsigned int min)
+{
+	struct dentry *dentry;
+	struct path parent;
+	int err;
+
+	dentry = p_start_creating_path(AT_FDCWD, path, &parent, 0);
+	if (IS_ERR(dentry))
+		return PTR_ERR(dentry);
+	err = p_vfs_mknod(mnt_idmap(parent.mnt), d_inode(parent.dentry), dentry,
+			  mode, MKDEV(maj, min));
+	p_end_creating_path(&parent, dentry);
+	return err;
+}
+EXPORT_SYMBOL_GPL(krunc_mknod);
+
+/* Create a symbolic link at @path pointing to @target, in the current task's
+ * mount namespace. Used for the OCI default /dev symlinks (fd, stdin, stdout,
+ * stderr → /proc/self/fd/...). Like vfs_mknod, vfs_symlink is int-returning and
+ * does not consume @dentry, so the ORIGINAL dentry goes to end_creating_path. */
+int krunc_symlink(const char *path, const char *target)
+{
+	struct dentry *dentry;
+	struct path parent;
+	int err;
+
+	dentry = p_start_creating_path(AT_FDCWD, path, &parent, 0);
+	if (IS_ERR(dentry))
+		return PTR_ERR(dentry);
+	err = p_vfs_symlink(mnt_idmap(parent.mnt), d_inode(parent.dentry),
+			    dentry, target);
+	p_end_creating_path(&parent, dentry);
+	return err;
+}
+EXPORT_SYMBOL_GPL(krunc_symlink);
+
 /* ---- kallsyms bootstrap + symbol resolution ---- */
 
 static unsigned long (*p_kallsyms_lookup_name)(const char *name);
@@ -389,6 +438,8 @@ static int __init krunc_helper_init(void)
 	KRUNC_RESOLVE(p_start_creating_path, "start_creating_path");
 	KRUNC_RESOLVE(p_end_creating_path, "end_creating_path");
 	KRUNC_RESOLVE(p_vfs_mkdir, "vfs_mkdir");
+	KRUNC_RESOLVE(p_vfs_mknod, "vfs_mknod");
+	KRUNC_RESOLVE(p_vfs_symlink, "vfs_symlink");
 	KRUNC_RESOLVE(p_path_put, "path_put");
 	KRUNC_RESOLVE(p_do_exit, "do_exit");
 	KRUNC_RESOLVE(p_find_get_pid, "find_get_pid");

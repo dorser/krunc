@@ -97,6 +97,12 @@ extern "C" {
     /// Create directory `path` (one level) in the current task's mount namespace
     /// so a nested mountpoint can be materialized inside a just-mounted parent.
     fn krunc_mkdir(path: *const c_char, mode: u16) -> c_int;
+    /// Create a device node at `path` (`mode` = S_IFCHR|perms) with number
+    /// MKDEV(`maj`, `min`), for the OCI default /dev nodes (null/zero/tty/...).
+    fn krunc_mknod(path: *const c_char, mode: u16, maj: u32, min: u32) -> c_int;
+    /// Create a symbolic link at `path` pointing to `target`, for the OCI
+    /// default /dev symlinks (fd, stdin, stdout, stderr → /proc/self/fd/...).
+    fn krunc_symlink(path: *const c_char, target: *const c_char) -> c_int;
     /// Write `data` (`len` bytes) to the file at `path` (e.g. a /proc/sys sysctl).
     fn krunc_write_file(path: *const c_char, data: *const c_char, len: usize) -> c_int;
     /// Apply one resource limit (`setrlimit`) to the current task before exec.
@@ -1118,6 +1124,73 @@ fn apply_mounts(mounts: &KVec<MountSpec>) {
     }
 }
 
+/// Populate the OCI default device nodes and symlinks under `/dev`.
+///
+/// The OCI runtime-spec (config-linux.md "Default Devices" / "Default Runtime
+/// Linux Symlinks") requires the runtime to supply /dev/null, zero, full,
+/// random, urandom, tty (and ptmx) plus the /dev/{fd,stdin,stdout,stderr}
+/// symlinks. krunc creates them itself, from kernel context, while the
+/// container's init is still privileged (device-node creation needs CAP_MKNOD)
+/// and after the container's mounts are in place.
+///
+/// Done only when the config mounts a fresh `tmpfs` at `/dev` (the case where
+/// krunc owns the device tree). When `/dev` is bind-mounted from the host, the
+/// host's nodes are already present and krunc adds nothing — this keeps the
+/// behaviour predictable and never writes nodes into a host-shared mount.
+fn apply_default_devices(mounts: &KVec<MountSpec>) {
+    let mut fresh_dev = false;
+    for i in 0..mounts.len() {
+        let m = &mounts[i];
+        if m.destination.as_slice() == b"/dev\0" && m.fs_type.as_slice() == b"tmpfs\0" {
+            fresh_dev = true;
+            break;
+        }
+    }
+    if !fresh_dev {
+        return;
+    }
+
+    const S_IFCHR: u16 = 0o0020000;
+    // (path, major, minor) — mode is S_IFCHR | 0o666 for every default node,
+    // matching the OCI default set and runc's permissions.
+    let nodes: [(&core::ffi::CStr, u32, u32); 6] = [
+        (c"/dev/null", 1, 3),
+        (c"/dev/zero", 1, 5),
+        (c"/dev/full", 1, 7),
+        (c"/dev/random", 1, 8),
+        (c"/dev/urandom", 1, 9),
+        (c"/dev/tty", 5, 0),
+    ];
+    for (path, maj, min) in nodes {
+        // SAFETY: NUL-terminated literal path; runs in the container's mount ns
+        // while still holding CAP_MKNOD. An already-present node (-EEXIST) is fine.
+        let rc =
+            unsafe { krunc_mknod(path.as_ptr() as *const c_char, S_IFCHR | 0o666, maj, min) };
+        if rc != 0 && rc != EEXIST.to_errno() {
+            pr_err!("krunc: default device {:?} failed: {}\n", path, rc);
+        }
+    }
+
+    // Default symlinks. /dev/ptmx -> pts/ptmx only resolves when the config also
+    // mounts a devpts at /dev/pts; the dangling link is otherwise harmless.
+    let links: [(&core::ffi::CStr, &core::ffi::CStr); 5] = [
+        (c"/dev/fd", c"/proc/self/fd"),
+        (c"/dev/stdin", c"/proc/self/fd/0"),
+        (c"/dev/stdout", c"/proc/self/fd/1"),
+        (c"/dev/stderr", c"/proc/self/fd/2"),
+        (c"/dev/ptmx", c"pts/ptmx"),
+    ];
+    for (path, target) in links {
+        // SAFETY: both are NUL-terminated literal C strings; container mount ns.
+        let rc = unsafe {
+            krunc_symlink(path.as_ptr() as *const c_char, target.as_ptr() as *const c_char)
+        };
+        if rc != 0 && rc != EEXIST.to_errno() {
+            pr_err!("krunc: default symlink {:?} failed: {}\n", path, rc);
+        }
+    }
+}
+
 /// The container's PID 1, run in kernel context inside the new namespaces.
 ///
 /// # Safety
@@ -1215,6 +1288,11 @@ unsafe extern "C" fn container_entry(arg: *mut c_void) -> c_int {
     // them up here. Only the configured mounts are performed (krunc adds none).
     apply_mounts(&ctx.mounts);
 
+    // Supply the OCI default /dev device nodes + symlinks (when the config gave
+    // us a fresh tmpfs /dev), from kernel context while still privileged. The
+    // confined workload cannot mknod once capabilities are dropped, so — as with
+    // the mounts above — the kernel materialises them here.
+    apply_default_devices(&ctx.mounts);
     // Apply sysctls (config.json `linux.sysctl`) now: after /proc is mounted but
     // *before* read-only-paths confinement, which may remount /proc/sys read-only.
     // Done while still privileged, in the container's namespaces. Each entry is a
