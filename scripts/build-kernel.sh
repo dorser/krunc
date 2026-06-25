@@ -53,7 +53,7 @@ if [ "${KRUNC_BPF_LSM:-0}" = 1 ]; then
 	echo "==> KRUNC_BPF_LSM=1: enabling BPF-LSM + BTF + ftrace direct calls"
 	scripts/config \
 		--enable BPF --enable BPF_SYSCALL --enable BPF_JIT --enable BPF_JIT_ALWAYS_ON \
-		--enable BPF_LSM --enable BPF_EVENTS \
+		--enable BPF_LSM --enable BPF_EVENTS --enable CGROUP_BPF \
 		--enable DEBUG_INFO_BTF --enable DEBUG_INFO_DWARF4 \
 		--disable DEBUG_INFO_BTF_MODULES \
 		--enable FUNCTION_TRACER --enable DYNAMIC_FTRACE \

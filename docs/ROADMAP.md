@@ -329,9 +329,17 @@ patch-requiring; `pivot_root` deferred). The next phase, prioritized:
   rootfs. Verified: container is root (uid 0) inside its userns while the host
   sees it as unprivileged uid 100000 (`scripts/qemu-userns-init.sh`).
 - Interactive terminal — **`krunc run -t` DONE** (CLI-side pty relay; no kernel
-  PTY needed). Device cgroup (`linux.resources.devices`); the containerd
-  `create` + `--console-socket` `SCM_RIGHTS` PTY handoff; `hooks`,
-  `rootfsPropagation`, id-mapped mounts, `memory.swap`.
+  PTY needed). The containerd `create` + `--console-socket` `SCM_RIGHTS` PTY
+  handoff; `hooks`, `rootfsPropagation`, id-mapped mounts, `memory.swap`.
+- Device cgroup (`linux.resources.devices`) — **kernel + BPF prototyped; blocked
+  on the BPF loader.** The kernel now builds with `CONFIG_CGROUP_BPF`, and a
+  `BPF_PROG_TYPE_CGROUP_DEVICE` program (cgroup-id-keyed rules map, last-match-wins)
+  loads, attaches, and is set correctly — but aya **0.12** (the last release that
+  builds on the VM's Rust 1.78) cannot *pin* a cgroup-device link, so the
+  attachment is torn down the instant the short-lived `krunc-bpf` process exits and
+  enforcement never runs. (LSM links pin fine; cgroup-device links don't, in
+  0.12.) Completing it needs a newer aya (newer rustc) or a small libbpf-C loader
+  like `krunc_lsm_loader.c` (libbpf can `bpf_link__pin` a cgroup link).
 - **Known infeasible patch-free** (would require the abandoned in-tree patch):
   *OCI seccomp* — `struct seccomp_filter` is opaque and the kernel-context init
   has no user mm to feed `seccomp(2)`/`seccomp_set_mode_filter`; *`pivot_root`* —
