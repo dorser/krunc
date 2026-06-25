@@ -29,7 +29,6 @@ conformance/krunc-conformance
 
 # rust build output
 userspace/target/
-Cargo.lock
 
 # generated BPF artifacts (built on the VM)
 bpf/vmlinux.h

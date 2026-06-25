@@ -291,3 +291,41 @@ executed in verified increments, not in one shot.
   (`pivot_root` remains deferred); M7 user-ns id mapping; richer BPF-LSM policy
   beyond the VM-verified escape blocking; M9 conformance; a native Rust
   `containerd-shim-krunc-v2`; and the full `Domain` typestate object + domainfd.
+
+## Backlog (post-v1)
+The M0–M10 roadmap above is complete (seccomp/Landlock removed for being
+patch-requiring; `pivot_root` deferred). The next phase, prioritized:
+
+**P0 — make the new capabilities real (not demos)**
+- Fold the BPF-LSM loader into the `krunc` CLI (all-Rust via aya): arm on
+  `create`/`start`, **tear down on `delete`** (drop the cgroup id from the map +
+  unpin links), per-container pin paths (the fixed path collides on concurrency).
+- Richer BPF-LSM default policy: guard more real escape vectors (`sb_mount`,
+  `bpf`, `ptrace_access_check`, `move_mount`, module load) and make the guarded
+  set + per-vector mode configurable from the OCI spec/annotations; drop the
+  contrived `file_open` tripwire once the loader is real.
+- Run a real OCI image (alpine/nginx) end-to-end via containerd.
+
+**P1 — OCI runtime-spec completeness**
+- Default `/dev` device nodes + symlinks (closes the 12 `runtimetest` MUST
+  failures → 249/249).
+- Device cgroup (`linux.resources.devices`); user namespaces + uid/gid mappings;
+  OCI seccomp → eBPF translation (instead of rejecting `linux.seccomp`);
+  `process.terminal`/console-socket PTY; hooks, `rootfsPropagation`, id-mapped
+  mounts, `memory.swap`.
+
+**P2 — lifecycle & robustness**
+- Container reaping + exit-code/signal propagation (the registry never reaps).
+- Module-side sysctl allow-list re-validation (defense-in-depth; low value as
+  `/dev/krunc` is root-only). Registry data structure + per-open hook cost at scale.
+
+**P3 — engineering quality & infra**
+- CI: run `scripts/run-checks.sh` with a cached pre-built kernel artifact.
+- Commit `Cargo.lock` (done); expand ABI-decoder fuzzing + OCI-translation
+  property tests; pure-Rust elimination of `krunc_helper.c`; doc consolidation.
+
+**P4 — long-term vision (see `docs/ARCHITECTURE.md`)**
+- In-tree `krunc_domain` LSM (sealed, inherited, monotonic domain object with
+  cred-blob inheritance) — the mainline-credible form that obviates the helper
+  module + external BPF loader.
+- `Domain<Unsealed/Sealed>` typestate + `domainfd`; `pivot_root` replacing chroot.
