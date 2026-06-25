@@ -297,17 +297,22 @@ The M0–M10 roadmap above is complete (seccomp/Landlock removed for being
 patch-requiring; `pivot_root` deferred). The next phase, prioritized:
 
 **P0 — make the new capabilities real (not demos)**
-- Fold the BPF-LSM loader into the `krunc` CLI (all-Rust via aya): arm on
-  `create`/`start`, **tear down on `delete`** (drop the cgroup id from the map +
-  unpin links), per-container pin paths (the fixed path collides on concurrency).
-  *(Still pending — the standalone C loader works; this is the all-Rust/aya
-  lifecycle integration.)*
+- Fold the BPF-LSM loader into the `krunc` CLI (all-Rust via aya) — **DONE**: the
+  new `krunc-bpf` crate (aya 0.12, static-musl) loads the prebuilt BPF-LSM object,
+  attaches every LSM program, and pins the links + `guarded` map to bpffs
+  (`init`), then `guard`/`unguard` add/remove a container's cgroup id. The CLI
+  arms it at `create` when the bundle sets the `org.krunc.bpf-lsm` = `block`|`kill`
+  annotation, and tears it down at `delete` — per-container, opt-in, no manual
+  loader call. Verified end-to-end (`scripts/qemu-aya-cli-init.sh`,
+  run-checks `[2b]`). (The C loader `krunc_lsm_loader` remains as the standalone
+  reference.)
 - Richer BPF-LSM default policy: guard more real escape vectors (`sb_mount`,
   `bpf`, `ptrace_access_check`, `move_mount`, module load) and make the guarded
   set + per-vector mode configurable from the OCI spec/annotations; drop the
   contrived `file_open` tripwire once the loader is real.
   *(DONE for the vectors: `sb_mount`/`move_mount`/`bpf`/`ptrace_access_check` are
-  now guarded alongside `userns_create`; CLI integration still pending.)*
+  now guarded alongside `userns_create`. Per-container mode (`block`/`kill`) is now
+  configurable via the `org.krunc.bpf-lsm` annotation.)*
 - Run a real OCI image (alpine/nginx) end-to-end — **DONE**: `krunc run --rootfs`
   runs the official Alpine Linux minirootfs (real distro, musl, busybox) fully
   confined (CapEff 0, NoNewPrivs 1); see `scripts/run-realimage.sh`.
