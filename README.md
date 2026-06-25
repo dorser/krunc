@@ -189,6 +189,7 @@ scripts/
   run-containerd.sh    boot a guest where real containerd/nerdctl drive krunc
   qemu-containerd-init.sh    in-VM init that starts containerd with krunc as runtime
   run-test.sh          rebuild module + cli + initramfs + run QEMU (fast loop)
+  run-checks.sh        build + boot the demos and ASSERT every outcome (regression check)
 docs/
   ARCHITECTURE.md      the krunc_domain object design (v2 target)
   SECURITY.md          threat model, two pillars, honest limits
