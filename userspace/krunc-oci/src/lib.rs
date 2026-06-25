@@ -663,13 +663,25 @@ pub fn config_to_spec(bundle: &Path, cfg: &OciConfig) -> Result<DomainSpec, OciE
         masked_paths = linux.masked_paths.clone();
         readonly_paths = linux.readonly_paths.clone();
         // Translate linux.sysctl into "<relpath>=<value>" entries (the sysctl name
-        // with `.` -> `/`), validating each name so it cannot escape /proc/sys and
-        // each value so it is a single safe line. Sorted for a deterministic spec.
-        let mut entries: Vec<(String, String)> = linux
-            .sysctl
-            .iter()
-            .map(|(k, v)| Ok((sysctl_relpath(k)?, sysctl_value(v)?.to_string())))
-            .collect::<Result<Vec<_>, OciError>>()?;
+        // with `.` -> `/`). Only sysctls confined to a kernel namespace the
+        // container OWNS are allowed (mirrors runc): the container init applies
+        // them while still uid 0 in the host's init_user_ns, so a host-global
+        // sysctl (e.g. `kernel.core_pattern`, `kernel.modprobe`) would change HOST
+        // state (a classic container->host-root escape). Such names are rejected
+        // per the runtime-spec rather than applied. Names are validated so they
+        // cannot escape /proc/sys; values are single safe lines. Sorted for a
+        // deterministic spec.
+        let has_ipc_ns = namespaces & NS_IPC != 0;
+        let has_net_ns = namespaces & NS_NET != 0;
+        let mut entries: Vec<(String, String)> = Vec::with_capacity(linux.sysctl.len());
+        for (k, v) in &linux.sysctl {
+            if !sysctl_namespaced(k, has_ipc_ns, has_net_ns) {
+                return Err(OciError::UnsupportedProperty(format!(
+                    "linux.sysctl {k:?} (not in a kernel namespace the container owns)"
+                )));
+            }
+            entries.push((sysctl_relpath(k)?, sysctl_value(v)?.to_string()));
+        }
         entries.sort();
         sysctls = entries.into_iter().map(|(p, v)| format!("{p}={v}")).collect();
     }
@@ -755,6 +767,25 @@ pub fn config_to_spec(bundle: &Path, cfg: &OciConfig) -> Result<DomainSpec, OciE
     };
     spec.validate()?;
     Ok(spec)
+}
+
+/// Whether an OCI sysctl is confined to a kernel namespace the container OWNS, so
+/// setting it cannot affect the host. Mirrors runc's safe set: the IPC-namespaced
+/// sysctls (`kernel.sem`, `kernel.shm*`, `kernel.msg*`, `fs.mqueue.*`) require an
+/// IPC namespace; `net.*` requires a network namespace. Everything else (e.g.
+/// `kernel.core_pattern`, `kernel.modprobe`, `kernel.kptr_restrict`) is
+/// host-global and must be rejected — the container init writes sysctls while
+/// still privileged in the host's init_user_ns, so a global write would be a
+/// container->host escape.
+fn sysctl_namespaced(name: &str, has_ipc_ns: bool, has_net_ns: bool) -> bool {
+    if name.starts_with("net.") {
+        return has_net_ns;
+    }
+    let ipc = name == "kernel.sem"
+        || name.starts_with("kernel.shm")
+        || name.starts_with("kernel.msg")
+        || name.starts_with("fs.mqueue.");
+    ipc && has_ipc_ns
 }
 
 /// Convert an OCI sysctl name (e.g. `net.ipv4.ip_forward`) into a path relative
@@ -1013,25 +1044,59 @@ mod tests {
 
     #[test]
     fn sysctl_applied_and_path_safe() {
-        // linux.sysctl is modeled: names become /proc/sys-relative paths.
+        // net.* is allowed only with a network namespace; then names become
+        // /proc/sys-relative paths.
         let cfg = parse_config(
-            r#"{"process":{"args":["/x"],"cwd":"/"},"root":{"path":"r"},"linux":{"sysctl":{"net.ipv4.ip_forward":"1"}}}"#,
+            r#"{"process":{"args":["/x"],"cwd":"/"},"root":{"path":"r"},"linux":{"namespaces":[{"type":"network"}],"sysctl":{"net.ipv4.ip_forward":"1"}}}"#,
         )
         .unwrap();
         let spec = config_to_spec(Path::new("/b"), &cfg).unwrap();
         assert_eq!(spec.sysctls, vec!["net/ipv4/ip_forward=1".to_string()]);
+        // an IPC-namespaced sysctl is allowed with an IPC namespace.
+        let ipc = parse_config(
+            r#"{"process":{"args":["/x"],"cwd":"/"},"root":{"path":"r"},"linux":{"namespaces":[{"type":"ipc"}],"sysctl":{"kernel.shmmax":"4096"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            config_to_spec(Path::new("/b"), &ipc).unwrap().sysctls,
+            vec!["kernel/shmmax=4096".to_string()]
+        );
         // a path-traversal sysctl name is rejected (cannot escape /proc/sys).
         let evil = parse_config(
-            r#"{"process":{"args":["/x"],"cwd":"/"},"root":{"path":"r"},"linux":{"sysctl":{"../secret":"x"}}}"#,
+            r#"{"process":{"args":["/x"],"cwd":"/"},"root":{"path":"r"},"linux":{"namespaces":[{"type":"network"}],"sysctl":{"../secret":"x"}}}"#,
         )
         .unwrap();
         assert!(config_to_spec(Path::new("/b"), &evil).is_err());
         // a value with a newline (write-injection attempt) is rejected.
         let nl = parse_config(
-            "{\"process\":{\"args\":[\"/x\"],\"cwd\":\"/\"},\"root\":{\"path\":\"r\"},\"linux\":{\"sysctl\":{\"kernel.foo\":\"a\\nb\"}}}",
+            "{\"process\":{\"args\":[\"/x\"],\"cwd\":\"/\"},\"root\":{\"path\":\"r\"},\"linux\":{\"namespaces\":[{\"type\":\"ipc\"}],\"sysctl\":{\"kernel.sem\":\"a\\nb\"}}}",
         )
         .unwrap();
         assert!(config_to_spec(Path::new("/b"), &nl).is_err());
+    }
+
+    #[test]
+    fn sysctl_host_global_rejected() {
+        // A host-global (non-namespaced) sysctl must be rejected: the container
+        // init applies it while still privileged in the host's init_user_ns, so a
+        // write would change HOST state (e.g. kernel.core_pattern -> root escape).
+        for bad in [
+            r#"{"process":{"args":["/x"],"cwd":"/"},"root":{"path":"r"},"linux":{"namespaces":[{"type":"network"},{"type":"ipc"}],"sysctl":{"kernel.core_pattern":"|/evil"}}}"#,
+            r#"{"process":{"args":["/x"],"cwd":"/"},"root":{"path":"r"},"linux":{"namespaces":[{"type":"ipc"}],"sysctl":{"kernel.modprobe":"/evil"}}}"#,
+            // net.* without a network namespace would hit the host's net sysctls.
+            r#"{"process":{"args":["/x"],"cwd":"/"},"root":{"path":"r"},"linux":{"sysctl":{"net.ipv4.ip_forward":"1"}}}"#,
+            // an IPC sysctl without an IPC namespace.
+            r#"{"process":{"args":["/x"],"cwd":"/"},"root":{"path":"r"},"linux":{"sysctl":{"kernel.shmmax":"4096"}}}"#,
+        ] {
+            let cfg = parse_config(bad).unwrap();
+            assert!(
+                matches!(
+                    config_to_spec(Path::new("/b"), &cfg),
+                    Err(OciError::UnsupportedProperty(_))
+                ),
+                "must reject: {bad}"
+            );
+        }
     }
 
     #[test]
