@@ -200,6 +200,17 @@ if [ -d "$IMAGES" ]; then
 	echo "==> bundled images: $(ls "$ROOT/images" | tr '\n' ' ')"
 fi
 
+# Optional: a real Alpine Linux rootfs (extracted alpine-minirootfs) staged at
+# /alpine, to demonstrate krunc running a genuine distribution image end-to-end
+# (see scripts/qemu-realimage-init.sh). `cp -a` preserves the device nodes and
+# symlinks the official image ships; the cpio pack below runs as root.
+ALPINE_ROOTFS="${ALPINE_ROOTFS:-}"
+if [ -n "$ALPINE_ROOTFS" ] && [ -d "$ALPINE_ROOTFS" ]; then
+	mkdir -p "$ROOT/alpine"
+	sudo cp -a "$ALPINE_ROOTFS"/. "$ROOT/alpine"/
+	echo "==> bundled real image: Alpine rootfs ($(du -sh "$ALPINE_ROOTFS" | cut -f1))"
+fi
+
 # Optional: extra files overlaid onto the initramfs root (e.g. containerd +
 # nerdctl binaries and a runtime config for the real higher-level-runtime image).
 EXTRA_DIR="${EXTRA_DIR:-}"
