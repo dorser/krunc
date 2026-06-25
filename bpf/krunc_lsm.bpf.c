@@ -1,13 +1,19 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
  * krunc_lsm.bpf.c - a BPF_PROG_TYPE_LSM program implementing per-container
- * "kill-on-escape" for krunc, attached at runtime (NO kernel source patch).
+ * per-container "escape blocking" for krunc, attached at runtime (NO kernel
+ * source patch).
  *
- * This is krunc's Pillar-2 (lifetime enforcement) active response: krunc applies
- * the namespaces/caps/cgroups/rootfs confinement *at creation*; this BPF-LSM
- * program then continuously guards the running container and KILLS it the moment
- * it attempts a forbidden ("escape") action — something a passive deny (EPERM)
- * cannot do.
+ * This is krunc's Pillar-2 (lifetime enforcement): krunc applies the
+ * namespaces/caps/cgroups/rootfs confinement *at creation*; this BPF-LSM program
+ * then continuously guards the running container and responds the moment it
+ * attempts a forbidden ("escape") action. The response is per-container policy:
+ *   - DENY (default): deny the operation with -EPERM; the container keeps running
+ *     (the graceful, Landlock/SELinux-style behavior).
+ *   - KILL: additionally SIGKILL the offending container (fail-stop — treat a
+ *     container caught attempting an escape as compromised; the seccomp
+ *     SCMP_ACT_KILL_PROCESS posture).
+ * The loader selects the mode per container (the `guarded` map value).
  *
  * Scope: a container is guarded iff its cgroup id is present in the `guarded`
  * map. The krunc loader inserts the container's cgroup id between `create` and
@@ -34,7 +40,10 @@
 
 char LICENSE[] SEC("license") = "GPL";
 
-/* cgroup ids krunc has asked us to guard (key = cgroup id, value = 1). */
+/* Guarded cgroups: key = cgroup id, value = enforcement mode for that container.
+ * The loader picks the mode; absence from the map = unguarded (policy ignores it). */
+#define KRUNC_MODE_DENY 1 /* block: deny the operation (-EPERM); container keeps running */
+#define KRUNC_MODE_KILL 2 /* block + SIGKILL the offending container (fail-stop) */
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 1024);
@@ -42,26 +51,34 @@ struct {
 	__type(value, __u8);
 } guarded SEC(".maps");
 
-/* The tripwire basename whose open triggers the kill. */
+/* The tripwire basename guarded by the file_open hook. */
 #define KRUNC_TRIPWIRE "krunc-escape"
 
-static __always_inline int cgroup_is_guarded(void)
+/* The enforcement mode for the current task's container (0 = unguarded). */
+static __always_inline __u8 guard_mode(void)
 {
 	__u64 cgid = bpf_get_current_cgroup_id();
+	__u8 *m = bpf_map_lookup_elem(&guarded, &cgid);
 
-	return bpf_map_lookup_elem(&guarded, &cgid) != NULL;
+	return m ? *m : 0;
+}
+
+/* Enforce the policy on a detected escape attempt: always deny (-EPERM); also
+ * SIGKILL the container in KILL mode. Returns 0 (allow) when unguarded. */
+static __always_inline int krunc_enforce(__u8 mode)
+{
+	if (mode == 0)
+		return 0;
+	if (mode >= KRUNC_MODE_KILL)
+		bpf_send_signal(9 /* SIGKILL */);
+	return -1 /* -EPERM */;
 }
 
 SEC("lsm/userns_create")
 int BPF_PROG(krunc_userns_create, const struct cred *cred)
 {
-	if (!cgroup_is_guarded())
-		return 0;
-
-	/* Active response: kill the container trying to create a user namespace,
-	 * and deny the operation. */
-	bpf_send_signal(9 /* SIGKILL */);
-	return -1 /* -EPERM */;
+	/* deny (and, in KILL mode, kill) a guarded container creating a user ns. */
+	return krunc_enforce(guard_mode());
 }
 
 SEC("lsm/file_open")
@@ -69,8 +86,9 @@ int BPF_PROG(krunc_file_open, struct file *file)
 {
 	const unsigned char *name;
 	char buf[16] = {};
+	__u8 mode = guard_mode();
 
-	if (!cgroup_is_guarded())
+	if (mode == 0)
 		return 0;
 
 	name = BPF_CORE_READ(file, f_path.dentry, d_name.name);
@@ -83,7 +101,6 @@ int BPF_PROG(krunc_file_open, struct file *file)
 	if (bpf_strncmp(buf, sizeof(KRUNC_TRIPWIRE) - 1, KRUNC_TRIPWIRE) != 0)
 		return 0;
 
-	/* Active response: kill the offending container task, and deny the op. */
-	bpf_send_signal(9 /* SIGKILL */);
-	return -1 /* -EPERM */;
+	/* deny (and, in KILL mode, kill) the tripwire access. */
+	return krunc_enforce(mode);
 }

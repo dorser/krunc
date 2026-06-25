@@ -68,10 +68,11 @@ if [ "$BPF_LSM" = 1 ]; then
 	INIT="$REPO/scripts/qemu-bpflsm-init.sh" OUT="$HOME/krunc-checks-bpf.cpio.gz" bash "$HERE/make-initramfs.sh" >/dev/null 2>&1
 	INITRAMFS="$HOME/krunc-checks-bpf.cpio.gz" timeout 200 bash "$HERE/run-qemu.sh" >/tmp/checks-bpf.log 2>&1 || true
 	B=/tmp/checks-bpf.log
-	has    "BPF-LSM hooks armed on the container cgroup" "$B" 'kill-on-escape hooks armed'
-	absent "escape (userns create) blocked - marker absent" "$B" 'USERNS-CREATED-MARKER-FAIL'
-	has    "escaping container terminated (stopped)"     "$B" '"status": "stopped"'
-	no_panic "no kernel panic/oops (BPF-LSM demo)"       "$B"
+	has    "BPF-LSM hooks armed (block mode)"             "$B" 'block mode; [0-9]+ hooks armed'
+	absent "escape (userns create) denied - marker absent" "$B" 'USERNS-CREATED-MARKER-FAIL'
+	has    "escape blocked, container kept running"       "$B" 'STILL RUNNING .blocked, not killed'
+	has    "container finished normally (not killed)"     "$B" 'finished normally'
+	no_panic "no kernel panic/oops (BPF-LSM demo)"        "$B"
 else
 	echo "==> [2/2] skipped: kernel has no CONFIG_BPF_LSM (build with KRUNC_BPF_LSM=1)"
 fi

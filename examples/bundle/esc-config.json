@@ -5,7 +5,7 @@
     "user": { "uid": 0, "gid": 0 },
     "args": [
       "/bin/sh", "-c",
-      "echo '[container] PID 1 alive; creating a user namespace via unshare -U (BPF-LSM should kill+deny)'; exec /bin/busybox unshare -U /bin/busybox echo USERNS-CREATED-MARKER-FAIL"
+      "echo '[container] PID 1 alive; attempting unshare -U (BPF-LSM block mode should DENY)'; if /bin/busybox unshare -U /bin/busybox echo USERNS-CREATED-MARKER-FAIL; then echo '[container] unshare SUCCEEDED - BPF-LSM did NOT block (FAIL)'; else echo '[container] unshare(CLONE_NEWUSER) DENIED by BPF-LSM (EPERM); container STILL RUNNING (blocked, not killed)'; fi; echo '[container] entrypoint finished normally (survived the blocked escape)'"
     ],
     "cwd": "/",
     "noNewPrivileges": true

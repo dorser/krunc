@@ -25,13 +25,29 @@
 
 int main(int argc, char **argv)
 {
-	if (argc != 4) {
-		fprintf(stderr, "usage: %s <bpf.o> <cgroup-dir> <link-pin>\n", argv[0]);
+	if (argc != 4 && argc != 5) {
+		fprintf(stderr,
+			"usage: %s <bpf.o> <cgroup-dir> <link-pin> [block|kill]\n"
+			"  block (default): deny escapes with -EPERM, container keeps running\n"
+			"  kill           : also SIGKILL the container on an escape attempt\n",
+			argv[0]);
 		return 2;
 	}
 	const char *obj_path = argv[1];
 	const char *cgroup_dir = argv[2];
 	const char *pin_path = argv[3];
+	const char *mode_arg = (argc == 5) ? argv[4] : "block";
+
+	/* enforcement mode stored as the `guarded` map value (see krunc_lsm.bpf.c). */
+	__u8 mode;
+	if (strcmp(mode_arg, "block") == 0) {
+		mode = 1; /* KRUNC_MODE_DENY */
+	} else if (strcmp(mode_arg, "kill") == 0) {
+		mode = 2; /* KRUNC_MODE_KILL */
+	} else {
+		fprintf(stderr, "invalid mode '%s' (expected block|kill)\n", mode_arg);
+		return 2;
+	}
 
 	struct stat st;
 	if (stat(cgroup_dir, &st)) {
@@ -79,13 +95,12 @@ int main(int argc, char **argv)
 		fprintf(stderr, "map 'guarded' not found\n");
 		return 1;
 	}
-	__u8 one = 1;
-	if (bpf_map_update_elem(mapfd, &cgid, &one, BPF_ANY)) {
+	if (bpf_map_update_elem(mapfd, &cgid, &mode, BPF_ANY)) {
 		fprintf(stderr, "map update: %s\n", strerror(errno));
 		return 1;
 	}
 
-	printf("krunc_lsm: guarding cgroup %s (id %llu); %d kill-on-escape hooks armed\n",
-	       cgroup_dir, (unsigned long long)cgid, n_attached);
+	printf("krunc_lsm: guarding cgroup %s (id %llu) in %s mode; %d hooks armed\n",
+	       cgroup_dir, (unsigned long long)cgid, mode_arg, n_attached);
 	return 0;
 }

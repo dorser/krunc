@@ -36,29 +36,31 @@ echo "==> krunc create esc --bundle /esc   (creates cgroup, blocks before exec)"
 CG=/sys/fs/cgroup/krunc/esc
 echo "[vm] container cgroup: $CG (id $(stat -c %i "$CG" 2>/dev/null))"
 
-# 2. Arm the BPF-LSM kill-on-escape for THIS container's cgroup only.
+# 2. Arm the BPF-LSM escape-blocking for THIS container's cgroup only, in BLOCK
+#    mode (deny the escape with -EPERM; the container keeps running). Pass "kill"
+#    instead for the fail-stop posture (deny + SIGKILL the container).
 echo
-echo "==> arm BPF-LSM on the container cgroup"
-/bin/krunc_lsm_loader /krunc_lsm.bpf.o "$CG" /sys/fs/bpf/krunc_lsm \
+echo "==> arm BPF-LSM on the container cgroup (block mode)"
+/bin/krunc_lsm_loader /krunc_lsm.bpf.o "$CG" /sys/fs/bpf/krunc_lsm block \
 	|| { echo "[vm] loader FAILED"; sleep 1; poweroff -f; }
 
-# 3. Start the container -> its PID 1 calls unshare(CLONE_NEWUSER) -> BPF-LSM kills it.
+# 3. Start the container -> its PID 1 tries unshare(CLONE_NEWUSER) -> BPF-LSM
+#    denies it (EPERM); the container survives and finishes normally.
 echo
-echo "==> krunc start esc   (entrypoint creates a user namespace)"
+echo "==> krunc start esc   (entrypoint attempts to create a user namespace)"
 /bin/krunc start esc
 sleep 1
 
-# 4. Verdict. The container must be stopped, and the post-escape marker
-#    ("USERNS-CREATED-MARKER-FAIL") must NOT have been printed above (it prints
-#    only if unshare(CLONE_NEWUSER) was allowed, i.e. the BPF-LSM did not
-#    deny+kill).
+# 4. Verdict. The escape marker ("USERNS-CREATED-MARKER-FAIL") must NOT appear
+#    (the user namespace was denied), and the container must report that it was
+#    DENIED yet STILL RUNNING (block, not kill).
 echo
 echo "==> verdict"
 echo "[vm] krunc state esc:"
 /bin/krunc state esc 2>/dev/null | grep -E '"status"|"id"' | sed 's/^/[vm]   /'
-echo "[vm] PASS = status 'stopped' AND no 'USERNS-CREATED' marker printed above"
-echo "[vm]        (the container's PID 1 was SIGKILL'd at unshare(CLONE_NEWUSER),"
-echo "[vm]        so the user namespace was never created). A marker line = FAIL."
+echo "[vm] PASS = no 'USERNS-CREATED' marker above (escape denied) AND the"
+echo "[vm]        container printed 'STILL RUNNING' + 'finished normally' (it was"
+echo "[vm]        blocked with -EPERM, not killed). Use 'kill' mode for fail-stop."
 /bin/krunc delete esc 2>/dev/null
 
 echo
